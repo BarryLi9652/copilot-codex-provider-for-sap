@@ -179,6 +179,32 @@ export class AppServerSession {
     return this.listModelsInternal();
   }
 
+  public getClient(): AppServerSessionClient {
+    if (this.disposed) {
+      throw new CodexError("cancelled", { action: "getAppServerClient" });
+    }
+    if (
+      this.initializedClient === undefined
+      || this.initializedGeneration === undefined
+      || this.initializedClient.isClosed === true
+    ) {
+      throw new CodexError("process", { action: "getAppServerClient" });
+    }
+    return this.initializedClient;
+  }
+
+  public async request<T>(
+    method: string,
+    params?: unknown,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const { client, generation } = await this.requireInitializedClient();
+    this.assertCurrentClient(client, generation, method);
+    const response = await client.request<T>(method, params, signal);
+    this.assertCurrentClient(client, generation, method);
+    return response;
+  }
+
   public dispose(): Promise<void> {
     if (this.disposePromise !== undefined) {
       return this.disposePromise;

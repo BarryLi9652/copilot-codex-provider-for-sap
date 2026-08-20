@@ -19,6 +19,7 @@ type SupervisorClearTimeout = (timer: SupervisorTimer) => void;
 
 export interface ProcessSupervisorOptions {
   configuredExecutable?: string;
+  locator?: ExecutableLocator;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   platform?: NodeJS.Platform;
@@ -112,7 +113,7 @@ export class ProcessSupervisor {
     this.clearTimeout = options.clearTimeout ?? ((timer) => clearTimeout(timer));
     this.logger = options.logger;
     this.requestTimeoutMs = options.requestTimeoutMs;
-    this.locator = new ExecutableLocator({
+    this.locator = options.locator ?? new ExecutableLocator({
       configuredExecutable: options.configuredExecutable,
       env: this.env,
       platform: options.platform,
