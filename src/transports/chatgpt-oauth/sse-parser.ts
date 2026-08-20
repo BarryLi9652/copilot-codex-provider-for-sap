@@ -85,19 +85,81 @@ const findUsage = (payload: JsonRecord): JsonRecord | undefined => {
 };
 
 export class ResponsesSseParser {
-  private readonly decoder = new TextDecoder();
+  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private pending = "";
   private completed = false;
+  private finalized = false;
+  private decoderFailed = false;
   private readonly functionCalls = new Map<string, FunctionCallState>();
+  private readonly emittedFunctionCallIdentities = new Set<string>();
 
   public constructor(private readonly logger?: ResponsesSseLogger) {}
 
   public push(chunk: Uint8Array | string): readonly TransportEvent[] {
-    this.pending += typeof chunk === "string"
-      ? chunk
-      : this.decoder.decode(chunk, { stream: true });
+    if (this.finalized || this.decoderFailed) {
+      return [];
+    }
 
+    if (typeof chunk === "string") {
+      this.pending += chunk;
+      return this.drainFrames();
+    }
+
+    let decoded = "";
+    for (let index = 0; index < chunk.length; index += 1) {
+      try {
+        decoded += this.decoder.decode(chunk.subarray(index, index + 1), { stream: true });
+      } catch {
+        this.pending += decoded;
+        const events = this.drainFrames();
+        this.pending = "";
+        this.decoderFailed = true;
+        this.report("chatgpt.sse.malformed_utf8", undefined);
+        return events;
+      }
+    }
+
+    this.pending += decoded;
+    return this.drainFrames();
+  }
+
+  public finish(): readonly TransportEvent[] {
+    if (this.finalized) {
+      return [];
+    }
+
+    this.finalized = true;
+    if (this.decoderFailed) {
+      return [];
+    }
+
+    try {
+      this.pending += this.decoder.decode();
+    } catch {
+      const events = this.drainFrames();
+      this.pending = "";
+      this.decoderFailed = true;
+      this.report("chatgpt.sse.malformed_utf8", undefined);
+      return events;
+    }
+
+    const events = this.drainFrames();
+    if (this.pending.length > 0) {
+      const finalFrame = this.pending;
+      this.pending = "";
+      events.push(...this.parseFrame(finalFrame));
+    }
+
+    return events;
+  }
+
+  public end(): readonly TransportEvent[] {
+    return this.finish();
+  }
+
+  private drainFrames(): TransportEvent[] {
     const events: TransportEvent[] = [];
+
     while (true) {
       const frame = findFrameEnd(this.pending);
       if (frame === undefined) {
@@ -114,18 +176,20 @@ export class ResponsesSseParser {
 
   private parseFrame(frame: string): readonly TransportEvent[] {
     const parsed = parseFrame(frame);
+    if (parsed.data === undefined || parsed.data.length === 0) {
+      return [];
+    }
+
     if (parsed.data?.trim() === "[DONE]") {
       return this.emitCompleted();
     }
 
     let payload: unknown;
-    if (parsed.data !== undefined && parsed.data.length > 0) {
-      try {
-        payload = JSON.parse(parsed.data) as unknown;
-      } catch {
-        this.report("chatgpt.sse.malformed_event", parsed.eventName);
-        return [];
-      }
+    try {
+      payload = JSON.parse(parsed.data) as unknown;
+    } catch {
+      this.report("chatgpt.sse.malformed_event", parsed.eventName);
+      return [];
     }
 
     const eventName = parsed.eventName ?? (isRecord(payload) ? stringValue(payload.type) : undefined);
@@ -287,6 +351,12 @@ export class ResponsesSseParser {
       return [];
     }
 
+    const identities = this.functionCallIdentities(details.itemId, details.callId);
+    if (identities.some((identity) => this.emittedFunctionCallIdentities.has(identity))) {
+      this.deleteFunctionCall(details.itemId, details.callId);
+      return [];
+    }
+
     let input: unknown;
     try {
       input = JSON.parse(details.argumentsText) as unknown;
@@ -295,8 +365,18 @@ export class ResponsesSseParser {
       return [];
     }
 
+    for (const identity of identities) {
+      this.emittedFunctionCallIdentities.add(identity);
+    }
     this.deleteFunctionCall(details.itemId, details.callId);
     return [{ type: "tool-call", callId: details.callId, name: details.name, input }];
+  }
+
+  private functionCallIdentities(itemId: string | undefined, callId: string): readonly string[] {
+    return [
+      `call:${callId}`,
+      ...(itemId === undefined ? [] : [`item:${itemId}`]),
+    ];
   }
 
   private findFunctionCall(

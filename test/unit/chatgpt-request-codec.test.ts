@@ -17,7 +17,7 @@ const model: CodexModel = {
 const request: CodexRequest = {
   requestId: "request-1",
   modelId: model.id,
-  instructions: "Be precise.",
+  instructions: "System instruction.",
   toolMode: "required",
   tools: [{
     name: "get_abap_object_lines",
@@ -27,6 +27,18 @@ const request: CodexRequest = {
       properties: { uri: { type: "string" } },
       required: ["uri"],
     },
+  }, {
+    name: "write_abap_object",
+    description: "Write ABAP lines",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uri: { type: "string" },
+        lines: { type: "array", items: { type: "string" } },
+      },
+      required: ["uri", "lines"],
+      additionalProperties: false,
+    },
   }],
   messages: [
     {
@@ -34,6 +46,13 @@ const request: CodexRequest = {
       parts: [
         { kind: "text", text: "Read this object." },
         { kind: "image", mimeType: "image/png", data: new Uint8Array([0, 1, 2, 255]) },
+      ],
+    },
+    {
+      role: "assistant",
+      parts: [
+        { kind: "text", text: "I found the object." },
+        { kind: "image", mimeType: "image/webp", data: new Uint8Array([5, 6]) },
       ],
     },
     {
@@ -56,7 +75,7 @@ test("encodes Responses flags, every tool schema, multimodal input, and exact to
   const body = buildResponsesRequest(request, model);
 
   assert.equal(body.model, "gpt-5-codex");
-  assert.equal(body.instructions, "Be precise.");
+  assert.equal(body.instructions, "System instruction.");
   assert.equal(body.store, false);
   assert.equal(body.stream, true);
   assert.equal(body.parallel_tool_calls, true);
@@ -67,6 +86,20 @@ test("encodes Responses flags, every tool schema, multimodal input, and exact to
     description: "Read ABAP lines",
     parameters: { type: "object", properties: { uri: { type: "string" } }, required: ["uri"] },
     strict: false,
+  }, {
+    type: "function",
+    name: "write_abap_object",
+    description: "Write ABAP lines",
+    parameters: {
+      type: "object",
+      properties: {
+        uri: { type: "string" },
+        lines: { type: "array", items: { type: "string" } },
+      },
+      required: ["uri", "lines"],
+      additionalProperties: false,
+    },
+    strict: false,
   }]);
 
   assert.deepEqual(body.input, [
@@ -76,6 +109,14 @@ test("encodes Responses flags, every tool schema, multimodal input, and exact to
       content: [
         { type: "input_text", text: "Read this object." },
         { type: "input_image", image_url: "data:image/png;base64,AAEC/w==" },
+      ],
+    },
+    {
+      type: "message",
+      role: "assistant",
+      content: [
+        { type: "output_text", text: "I found the object." },
+        { type: "input_image", image_url: "data:image/webp;base64,BQY=" },
       ],
     },
     {
