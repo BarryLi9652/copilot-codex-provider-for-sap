@@ -631,3 +631,61 @@ test("rejects start when the child exits before deferred spawn completion", asyn
     }
   }
 });
+
+test("allows stderr to close before client construction while RPC remains usable", async () => {
+  const child = new FakeChild("any", new PassThrough(), 0, true);
+  child.stdin.on("data", (chunk: Buffer) => {
+    const request = JSON.parse(chunk.toString()) as { id: number };
+    child.stdout?.write(`${JSON.stringify({ id: request.id, result: { ok: true } })}\n`);
+  });
+  const { supervisor } = injectedSupervisor(() => child);
+  const starting = supervisor.start();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  child.stderr.emit("close");
+  child.completeSpawn();
+
+  const client = await starting;
+  assert.equal(client.isClosed, false);
+  assert.deepEqual(await client.request<{ ok: boolean }>("ping", {}), { ok: true });
+
+  await supervisor.stop();
+  assert.notEqual(child.exitCode, null);
+  assert.equal(child.listenerCount("close"), 0);
+  assert.equal(child.stderr.listenerCount("data"), 0);
+  assert.equal(child.stderr.listenerCount("error"), 0);
+  assert.equal(child.stderr.listenerCount("close"), 0);
+});
+
+test("queues direct starts behind active stop and coalesces replacement generations", async () => {
+  const firstChild = new FakeChild("never");
+  let stopResolved = false;
+  let spawnedBeforeStopResolved = false;
+  const { supervisor, children } = injectedSupervisor((count) => {
+    if (count > 1 && !stopResolved) {
+      spawnedBeforeStopResolved = true;
+    }
+    return count === 1 ? firstChild : new FakeChild("any");
+  });
+  const first = await supervisor.start();
+  const stopping = supervisor.stop().then(() => {
+    stopResolved = true;
+  });
+  const starting = supervisor.start();
+  const startingAgain = supervisor.start();
+
+  assert.equal(children.length, 1);
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  assert.equal(children.length, 1);
+  firstChild.exit();
+
+  const [replacement, replacementAgain] = await Promise.all([starting, startingAgain]);
+  await stopping;
+  assert.equal(replacement, replacementAgain);
+  assert.equal(spawnedBeforeStopResolved, false);
+  assert.equal(children.length, 2);
+  assert.notEqual(first, replacement);
+  assert.notEqual(firstChild.exitCode, null);
+
+  await supervisor.stop();
+  assert.equal((children[1] as FakeChild).exitCode, 0);
+});

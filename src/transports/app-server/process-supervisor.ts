@@ -91,6 +91,7 @@ export class ProcessSupervisor {
   private currentRecord: ChildRecord | undefined;
   private nextGeneration = 1;
   private startPromise: Promise<JsonlRpcClient> | undefined;
+  private startAfterStopPromise: Promise<JsonlRpcClient> | undefined;
   private stopPromise: Promise<void> | undefined;
   private consecutiveFailures = 0;
   private breakerOpen = false;
@@ -122,6 +123,25 @@ export class ProcessSupervisor {
   }
 
   public start(): Promise<JsonlRpcClient> {
+    if (this.startAfterStopPromise !== undefined) {
+      return this.startAfterStopPromise;
+    }
+    const activeStop = this.stopPromise;
+    if (activeStop !== undefined) {
+      let operation!: Promise<JsonlRpcClient>;
+      operation = activeStop.then(() => {
+        if (this.startAfterStopPromise === operation) {
+          this.startAfterStopPromise = undefined;
+        }
+        return this.start();
+      }).finally(() => {
+        if (this.startAfterStopPromise === operation) {
+          this.startAfterStopPromise = undefined;
+        }
+      });
+      this.startAfterStopPromise = operation;
+      return operation;
+    }
     const record = this.currentRecord;
     if (this.startPromise !== undefined) {
       if (
@@ -216,6 +236,9 @@ export class ProcessSupervisor {
         throw processError("replaceCodex");
       }
     }
+    if (this.stopPromise !== undefined) {
+      throw processError("startCodex");
+    }
 
     let executable: string;
     try {
@@ -223,6 +246,10 @@ export class ProcessSupervisor {
     } catch (cause) {
       this.recordFailure();
       throw cause instanceof CodexError ? cause : processError("selectCodex", cause);
+    }
+
+    if (this.stopPromise !== undefined) {
+      throw processError("startCodex");
     }
 
     let child: ChildProcess;
@@ -252,7 +279,6 @@ export class ProcessSupervisor {
         || record.childClosed
         || record.stdinClosed
         || record.stdoutClosed
-        || record.stderrClosed
       ) {
         throw processError("startCodex");
       }
