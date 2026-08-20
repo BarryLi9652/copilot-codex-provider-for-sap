@@ -1,0 +1,53 @@
+{
+  "name": "copilot-codex-provider-for-sap",
+  "displayName": "Copilot Codex Provider for SAP",
+  "description": "Use Codex through ChatGPT OAuth or a local Codex App Server in GitHub Copilot Chat, with SAP ABAP tooling support.",
+  "version": "0.1.0",
+  "publisher": "leonbwang",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onLanguageModelChatProvider:copilot-codex.chatgpt-oauth",
+    "onLanguageModelChatProvider:copilot-codex.local-cli"
+  ],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "copilot-codex.chatgpt-oauth",
+        "displayName": "Codex · ChatGPT OAuth"
+      },
+      {
+        "vendor": "copilot-codex.local-cli",
+        "displayName": "Codex · Local CLI"
+      }
+    ]
+  },
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Machine Learning"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('out',{recursive:true,force:true})\"",
+    "compile": "npm run clean && tsc -p .",
+    "typecheck": "tsc -p . --noEmit",
+    "test:unit": "npm run compile && node --test \"out/test/unit/**/*.test.js\"",
+    "test:integration": "npm run compile && node --test \"out/test/integration/**/*.test.js\"",
+    "test:extension": "npm run compile && node out/test/extension/run-test.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "check": "npm run typecheck && npm test",
+    "package": "npm run check && npm run test:extension && vsce package --no-dependencies --out dist/copilot-codex-provider-for-sap-0.1.0.vsix",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^6.0.3"
+  }
+}

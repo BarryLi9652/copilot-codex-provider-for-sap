@@ -1,2 +1,7 @@
 .worktrees/
-
+.npm-cache/
+.vscode-test/
+node_modules/
+out/
+dist/
+*.vsix

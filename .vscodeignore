@@ -1,0 +1,10 @@
+.vscode/**
+.vscode-test/**
+.npm-cache/**
+test/**
+src/**
+.editorconfig
+.gitignore
+.npmrc
+tsconfig.json
+npm-debug.log
