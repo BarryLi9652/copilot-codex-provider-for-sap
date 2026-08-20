@@ -23,6 +23,17 @@ export interface LoopbackServerOptions {
   timeoutMs?: number;
 }
 
+export class LoopbackError extends Error {
+  public readonly code = "callback_close_failed" as const;
+  public readonly primaryError: Error | undefined;
+
+  public constructor(message: string, cause?: unknown, primaryError?: Error) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "LoopbackError";
+    this.primaryError = primaryError;
+  }
+}
+
 const staticPage = (heading: string, message: string): string => {
   const escapeHtml = (value: string): string =>
     value
@@ -68,6 +79,14 @@ const serverError = (message: string, cause?: unknown): Error => {
   return error;
 };
 
+const asError = (value: unknown, fallback: string): Error =>
+  value instanceof Error ? value : serverError(fallback, value);
+
+const closeError = (cause: unknown): LoopbackError =>
+  cause instanceof LoopbackError
+    ? cause
+    : new LoopbackError("The OAuth callback server could not be closed.", cause);
+
 export class LoopbackCallbackServer implements LoopbackServer {
   private readonly ports: readonly number[];
   private readonly timeoutMs: number;
@@ -109,7 +128,7 @@ export class LoopbackCallbackServer implements LoopbackServer {
         rejectCallback = callbackReject;
       });
 
-      const closeServer = (reason?: Error): Promise<void> => {
+      const closeServer = (): Promise<void> => {
         if (closePromise) {
           return closePromise;
         }
@@ -117,20 +136,73 @@ export class LoopbackCallbackServer implements LoopbackServer {
         if (timeout) {
           clearTimeout(timeout);
         }
-        if (!callbackSettled) {
-          callbackSettled = true;
-          rejectCallback(reason ?? serverError("OAuth callback server closed."));
-        }
         closePromise = new Promise<void>((closeResolve, closeReject) => {
           server.close((error) => {
             if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
-              closeReject(error);
+              closeReject(closeError(error));
               return;
             }
             closeResolve();
           });
         });
         return closePromise;
+      };
+
+      const settleCallbackAfterClose = async (
+        callbackUrl: string | undefined,
+        primaryError: Error | undefined,
+      ): Promise<void> => {
+        try {
+          await closeServer();
+        } catch (error) {
+          const failure = closeError(error);
+          rejectCallback(
+            primaryError === undefined
+              ? failure
+              : new LoopbackError(failure.message, failure, primaryError),
+          );
+          return;
+        }
+        if (primaryError === undefined) {
+          resolveCallback(callbackUrl as string);
+        } else {
+          rejectCallback(primaryError);
+        }
+      };
+
+      const runTerminal = (
+        callbackUrl: string | undefined,
+        primaryError: Error | undefined,
+      ): void => {
+        void settleCallbackAfterClose(callbackUrl, primaryError).catch((error: unknown) => {
+          rejectCallback(closeError(error));
+        });
+      };
+
+      const closeHandle = async (reason?: Error): Promise<void> => {
+        let failure: LoopbackError | undefined;
+        try {
+          await closeServer();
+        } catch (error) {
+          failure = closeError(error);
+        }
+
+        if (!callbackSettled) {
+          callbackSettled = true;
+          if (failure) {
+            rejectCallback(
+              reason === undefined
+                ? failure
+                : new LoopbackError(failure.message, failure, reason),
+            );
+          } else {
+            rejectCallback(reason ?? serverError("OAuth callback server closed."));
+          }
+        }
+
+        if (failure) {
+          throw failure;
+        }
       };
 
       const acceptCallback = (request: IncomingMessage, response: ServerResponse): void => {
@@ -170,9 +242,8 @@ export class LoopbackCallbackServer implements LoopbackServer {
         }
 
         callbackSettled = true;
-        resolveCallback(callbackUrl.toString());
         writeResponse(response, 200, "OAuth callback received", "You may close this window.");
-        void closeServer();
+        runTerminal(callbackUrl.toString(), undefined);
       };
 
       const server: Server = createServer(acceptCallback);
@@ -181,17 +252,19 @@ export class LoopbackCallbackServer implements LoopbackServer {
           reject(error);
           return;
         }
-        if (!closed) {
-          void closeServer(error).catch(() => undefined);
+        if (!closed && !callbackSettled) {
+          callbackSettled = true;
+          runTerminal(undefined, asError(error, "OAuth callback server failed."));
         }
       });
       server.once("listening", () => {
         const address = server.address();
         if (typeof address !== "object" || address === null) {
-          void closeServer(serverError("OAuth callback listener did not expose an address.")).catch(
-            () => undefined,
+          const listenerError = serverError("OAuth callback listener did not expose an address.");
+          void closeServer().then(
+            () => reject(listenerError),
+            (error: unknown) => reject(new LoopbackError(listenerError.message, error, listenerError)),
           );
-          reject(serverError("OAuth callback listener did not expose an address."));
           return;
         }
         actualPort = address.port;
@@ -200,15 +273,14 @@ export class LoopbackCallbackServer implements LoopbackServer {
           port: actualPort,
           redirectUri,
           callback,
-          close: closeServer,
+          close: closeHandle,
         };
         timeout = setTimeout(() => {
           const error = serverError("OAuth callback server timed out.");
-          if (!callbackSettled) {
+          if (!callbackSettled && !closed) {
             callbackSettled = true;
-            rejectCallback(error);
+            runTerminal(undefined, error);
           }
-          void closeServer(error).catch(() => undefined);
         }, this.timeoutMs);
         resolve(handle);
       });

@@ -7,6 +7,7 @@ import {
   type SecretStore,
 } from "../../src/transports/chatgpt-oauth/oauth-store.js";
 import {
+  OAuthError,
   OAuthManager,
   type OAuthFetch,
   type OAuthHttpResponse,
@@ -15,6 +16,19 @@ import type {
   LoopbackServer,
   LoopbackServerHandle,
 } from "../../src/transports/chatgpt-oauth/loopback-server.js";
+
+const waitForCondition = async (
+  condition: () => boolean,
+  description: string,
+): Promise<void> => {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (condition()) {
+      return;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for ${description}.`);
+};
 
 class MemorySecretStore implements SecretStore {
   public value: string | undefined;
@@ -43,8 +57,13 @@ class FakeLoopbackHandle implements LoopbackServerHandle {
   public readonly redirectUri = "http://localhost:1455/auth/callback";
   public readonly callback: Promise<string>;
   public closed = false;
+  public closeCalls = 0;
+  public closeStarted = false;
+  public closeError: Error | undefined;
   private resolveCallback!: (url: string) => void;
   private rejectCallback!: (error: Error) => void;
+  private closeGate: Promise<void> | undefined;
+  private releaseCloseGate: (() => void) | undefined;
 
   public constructor() {
     this.callback = new Promise<string>((resolve, reject) => {
@@ -61,7 +80,23 @@ class FakeLoopbackHandle implements LoopbackServerHandle {
     this.rejectCallback(error);
   }
 
+  public deferClose(): void {
+    this.closeGate = new Promise<void>((resolve) => {
+      this.releaseCloseGate = resolve;
+    });
+  }
+
+  public releaseClose(): void {
+    this.releaseCloseGate?.();
+  }
+
   public async close(): Promise<void> {
+    this.closeCalls += 1;
+    this.closeStarted = true;
+    await this.closeGate;
+    if (this.closeError) {
+      throw this.closeError;
+    }
     this.closed = true;
   }
 }
@@ -72,6 +107,33 @@ class FakeLoopbackServer implements LoopbackServer {
   public async start(): Promise<LoopbackServerHandle> {
     const handle = new FakeLoopbackHandle();
     this.handles.push(handle);
+    return handle;
+  }
+}
+
+class DeferredStartLoopbackServer implements LoopbackServer {
+  public starts = 0;
+  public readonly handles: FakeLoopbackHandle[] = [];
+  public readonly firstStart: Promise<void>;
+  private releaseFirstStart!: () => void;
+
+  public constructor() {
+    this.firstStart = new Promise<void>((resolve) => {
+      this.releaseFirstStart = resolve;
+    });
+  }
+
+  public release(): void {
+    this.releaseFirstStart();
+  }
+
+  public async start(): Promise<LoopbackServerHandle> {
+    this.starts += 1;
+    const handle = new FakeLoopbackHandle();
+    this.handles.push(handle);
+    if (this.starts === 1) {
+      await this.firstStart;
+    }
     return handle;
   }
 }
@@ -88,6 +150,25 @@ const session = (overrides: Partial<OAuthSession> = {}): OAuthSession => ({
   expiresAt: 2_000,
   ...overrides,
 });
+
+const completeManualSignIn = async (
+  manager: OAuthManager,
+  code: string,
+): Promise<OAuthSession> => {
+  let authorizeUrl = "";
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const state = new URL(authorizeUrl).searchParams.get("state");
+  assert.ok(state);
+  const callback = manager.completeManualCallback(
+    `http://localhost:1455/auth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+  );
+  const [result] = await Promise.all([signIn, callback]);
+  return result;
+};
 
 test("callback state mismatch rejects before token exchange", async () => {
   const secrets = new MemorySecretStore();
@@ -220,6 +301,299 @@ test("expiry within sixty seconds uses one refresh request for concurrent caller
     refreshToken: "refresh-old",
     expiresAt: 3_601_000,
   });
+});
+
+test("forced refresh shares one request for concurrent callers", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 10_000 }));
+  let refreshCalls = 0;
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const fetch: OAuthFetch = async (_url, init) => {
+    refreshCalls += 1;
+    assert.equal(new URLSearchParams(String(init?.body)).get("grant_type"), "refresh_token");
+    await refreshReleased;
+    return response({ access_token: "access-forced", expires_in: 3_600 });
+  };
+  const manager = new OAuthManager(secrets, { fetch, now: () => 1_000 });
+
+  const first = manager.getAccessToken(true);
+  const second = manager.getAccessToken(true);
+  await waitForCondition(() => refreshCalls === 1, "one forced refresh request");
+
+  releaseRefresh();
+  assert.deepEqual(await Promise.all([first, second]), [
+    { token: "access-forced" },
+    { token: "access-forced" },
+  ]);
+  assert.equal(refreshCalls, 1);
+});
+
+test("a new sign-in prevents an old refresh success from replacing the new account", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  let refreshStarted!: () => void;
+  const refreshStartedSignal = new Promise<void>((resolve) => {
+    refreshStarted = resolve;
+  });
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const loopback = new FakeLoopbackServer();
+  const fetch: OAuthFetch = async (_url, init) => {
+    const fields = new URLSearchParams(String(init?.body));
+    if (fields.get("grant_type") === "refresh_token") {
+      refreshStarted();
+      await refreshReleased;
+      return response({ access_token: "access-account-a", expires_in: 3_600 });
+    }
+    return response({
+      access_token: "access-account-b",
+      refresh_token: "refresh-account-b",
+      expires_in: 3_600,
+    });
+  };
+  const manager = new OAuthManager(secrets, {
+    fetch,
+    loopbackServer: loopback,
+    now: () => 1_000,
+  });
+
+  const staleRefresh = manager.getAccessToken();
+  await refreshStartedSignal;
+  const accountB = await completeManualSignIn(manager, "account-b-code");
+  assert.equal(accountB.accessToken, "access-account-b");
+  assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
+
+  releaseRefresh();
+  await assert.rejects(
+    staleRefresh,
+    (error: unknown) =>
+      error instanceof OAuthError && error.code === "callback_closed",
+  );
+  assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
+  assert.deepEqual(await manager.getAccessToken(), { token: "access-account-b" });
+});
+
+test("a new sign-in prevents an old invalid_grant from clearing the new account", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  let refreshStarted!: () => void;
+  const refreshStartedSignal = new Promise<void>((resolve) => {
+    refreshStarted = resolve;
+  });
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const loopback = new FakeLoopbackServer();
+  const fetch: OAuthFetch = async (_url, init) => {
+    const fields = new URLSearchParams(String(init?.body));
+    if (fields.get("grant_type") === "refresh_token") {
+      refreshStarted();
+      await refreshReleased;
+      return response({ error: "invalid_grant" }, 400);
+    }
+    return response({
+      access_token: "access-account-b",
+      refresh_token: "refresh-account-b",
+      expires_in: 3_600,
+    });
+  };
+  const manager = new OAuthManager(secrets, {
+    fetch,
+    loopbackServer: loopback,
+    now: () => 1_000,
+  });
+
+  const staleRefresh = manager.getAccessToken();
+  await refreshStartedSignal;
+  const accountB = await completeManualSignIn(manager, "account-b-code");
+  assert.equal(accountB.accessToken, "access-account-b");
+  assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
+
+  releaseRefresh();
+  await assert.rejects(
+    staleRefresh,
+    (error: unknown) =>
+      error instanceof OAuthError && error.code === "callback_closed",
+  );
+  assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
+  assert.deepEqual(await manager.getAccessToken(), { token: "access-account-b" });
+});
+
+test("concurrent sign-in reserves one slot before loopback start resolves", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new DeferredStartLoopbackServer();
+  const manager = new OAuthManager(secrets, { loopbackServer: loopback });
+  let browserCalls = 0;
+
+  const first = manager.signIn(async () => {
+    browserCalls += 1;
+    return true;
+  });
+  await waitForCondition(() => loopback.starts === 1, "first loopback start");
+  const second = manager.signIn(async () => {
+    browserCalls += 1;
+    return true;
+  });
+
+  try {
+    assert.equal(loopback.starts, 1);
+    assert.equal(browserCalls, 0);
+    await assert.rejects(
+      second,
+      (error: unknown) =>
+        error instanceof OAuthError && error.code === "sign_in_in_progress",
+    );
+  } finally {
+    loopback.release();
+    for (const handle of loopback.handles) {
+      handle.reject(new Error("test cleanup"));
+    }
+    await Promise.allSettled([first, second]);
+  }
+});
+
+test("successful callback waits for loopback close to settle", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new FakeLoopbackServer();
+  const manager = new OAuthManager(secrets, {
+    loopbackServer: loopback,
+    fetch: async () =>
+      response({ access_token: "access-new", refresh_token: "refresh-new", expires_in: 3_600 }),
+  });
+  let authorizeUrl = "";
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const state = new URL(authorizeUrl).searchParams.get("state");
+  assert.ok(state);
+  const handle = loopback.handles[0];
+  assert.ok(handle);
+  handle.deferClose();
+
+  let signInSettled = false;
+  void signIn.then(
+    () => {
+      signInSettled = true;
+    },
+    () => {
+      signInSettled = true;
+    },
+  );
+  const callback = manager.completeManualCallback(
+    `http://localhost:1455/auth/callback?code=code&state=${encodeURIComponent(state)}`,
+  );
+  try {
+    await waitForCondition(() => handle.closeStarted, "loopback close start");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signInSettled, false);
+  } finally {
+    handle.releaseClose();
+  }
+  await callback;
+  await signIn;
+  assert.equal(signInSettled, true);
+});
+
+test("loopback close failure is surfaced as a typed OAuth error", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new FakeLoopbackServer();
+  const manager = new OAuthManager(secrets, {
+    loopbackServer: loopback,
+    fetch: async () =>
+      response({ access_token: "access-new", refresh_token: "refresh-new", expires_in: 3_600 }),
+  });
+  let authorizeUrl = "";
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const state = new URL(authorizeUrl).searchParams.get("state");
+  assert.ok(state);
+  const handle = loopback.handles[0];
+  assert.ok(handle);
+  handle.closeError = new Error("synthetic close failure");
+  const callback = manager.completeManualCallback(
+    `http://localhost:1455/auth/callback?code=code&state=${encodeURIComponent(state)}`,
+  );
+
+  await assert.rejects(
+    callback,
+    (error: unknown) =>
+      error instanceof OAuthError && (error.code as string) === "callback_close_failed",
+  );
+  await assert.rejects(
+    signIn,
+    (error: unknown) =>
+      error instanceof OAuthError && (error.code as string) === "callback_close_failed",
+  );
+  assert.equal(handle.closeCalls, 1);
+});
+
+test("callback failure preserves the primary error and records close failure", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new FakeLoopbackServer();
+  const manager = new OAuthManager(secrets, { loopbackServer: loopback });
+  let authorizeUrl = "";
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const handle = loopback.handles[0];
+  assert.ok(handle);
+  handle.closeError = new Error("synthetic close failure");
+  const callback = manager.completeManualCallback(
+    "http://localhost:1455/auth/callback?code=code&state=wrong-state",
+  );
+
+  await assert.rejects(
+    callback,
+    (error: unknown) => {
+      if (!(error instanceof OAuthError) || error.code !== "callback_state_mismatch") {
+        return false;
+      }
+      const cleanup = (error as OAuthError & { cleanupError?: unknown }).cleanupError;
+      return cleanup instanceof OAuthError && (cleanup.code as string) === "callback_close_failed";
+    },
+  );
+  await assert.rejects(
+    signIn,
+    (error: unknown) => error instanceof OAuthError && error.code === "callback_state_mismatch",
+  );
+  assert.equal(handle.closeCalls, 1);
+});
+
+test("loopback callback rejection still awaits close and reports timeout cleanup", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new FakeLoopbackServer();
+  const manager = new OAuthManager(secrets, { loopbackServer: loopback });
+  const signIn = manager.signIn(async () => true);
+  await waitForCondition(() => loopback.handles.length === 1, "loopback handle");
+  const handle = loopback.handles[0];
+  assert.ok(handle);
+  handle.closeError = new Error("synthetic close failure");
+  handle.reject(new Error("OAuth callback server timed out."));
+
+  await assert.rejects(
+    signIn,
+    (error: unknown) => {
+      if (!(error instanceof OAuthError) || error.code !== "callback_timeout") {
+        return false;
+      }
+      const cleanup = (error as OAuthError & { cleanupError?: unknown }).cleanupError;
+      return cleanup instanceof OAuthError && (cleanup.code as string) === "callback_close_failed";
+    },
+  );
+  assert.equal(handle.closeCalls, 1);
 });
 
 test("invalid_grant clears the extension session", async () => {

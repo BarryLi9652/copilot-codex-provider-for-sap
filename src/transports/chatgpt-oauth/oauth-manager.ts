@@ -15,6 +15,7 @@ import {
 import { createOAuthState, createPkcePair } from "./pkce.js";
 import {
   LoopbackCallbackServer,
+  LoopbackError,
   type LoopbackServer,
   type LoopbackServerHandle,
 } from "./loopback-server.js";
@@ -54,6 +55,7 @@ export type OAuthErrorCode =
   | "callback_invalid"
   | "callback_state_mismatch"
   | "callback_timeout"
+  | "callback_close_failed"
   | "oauth_failed"
   | "sign_in_in_progress"
   | "token_exchange_failed"
@@ -61,24 +63,34 @@ export type OAuthErrorCode =
 
 export class OAuthError extends Error {
   public readonly code: OAuthErrorCode;
+  public cleanupError: OAuthError | undefined;
 
   public constructor(code: OAuthErrorCode, message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "OAuthError";
     this.code = code;
+    this.cleanupError = undefined;
   }
 }
 
 interface ActiveSignIn {
+  readonly generation: number;
   readonly state: string;
   readonly verifier: string;
-  readonly redirectUri: string;
-  readonly server: LoopbackServerHandle;
+  server: LoopbackServerHandle | undefined;
+  redirectUri: string | undefined;
+  closePromise: Promise<OAuthError | undefined> | undefined;
   readonly promise: Promise<OAuthSession>;
   readonly resolve: (session: OAuthSession) => void;
   readonly reject: (error: Error) => void;
   callbackClaimed: boolean;
+  terminal: boolean;
   settled: boolean;
+}
+
+interface RefreshFlight {
+  readonly generation: number;
+  readonly promise: Promise<OAuthSession>;
 }
 
 const defaultFetch: OAuthFetch = async (url, init) => {
@@ -129,7 +141,8 @@ export class OAuthManager {
   private readonly expirySkewMs: number;
   private activeSignIn: ActiveSignIn | undefined;
   private session: OAuthSession | undefined;
-  private refreshPromise: Promise<OAuthSession> | undefined;
+  private refreshPromise: RefreshFlight | undefined;
+  private storageQueue: Promise<void> = Promise.resolve();
   private lifecycle = 0;
 
   public constructor(
@@ -150,27 +163,43 @@ export class OAuthManager {
 
     const pair = createPkcePair();
     const state = createOAuthState();
-    const server = await this.loopbackServer.start();
     const pending = deferred<OAuthSession>();
     const active: ActiveSignIn = {
+      generation: ++this.lifecycle,
       state,
       verifier: pair.verifier,
-      redirectUri: server.redirectUri,
-      server,
+      server: undefined,
+      redirectUri: undefined,
+      closePromise: undefined,
       promise: pending.promise,
       resolve: pending.resolve,
       reject: pending.reject,
       callbackClaimed: false,
+      terminal: false,
       settled: false,
     };
     this.activeSignIn = active;
 
-    void server.callback.then(
-      (url) => this.completeCallback(active, url).catch(() => undefined),
-      (error: unknown) => {
-        this.failActive(active, this.loopbackError(error));
-      },
-    );
+    let server: LoopbackServerHandle;
+    try {
+      server = await this.loopbackServer.start();
+      active.server = server;
+      active.redirectUri = server.redirectUri;
+    } catch (error) {
+      await this.rejectActive(
+        active,
+        new OAuthError("oauth_failed", "The OAuth callback server could not be started.", error),
+      );
+      return active.promise;
+    }
+
+    if (active.terminal || this.activeSignIn !== active) {
+      void this.observeCallback(active);
+      await this.closeActiveServer(active);
+      return active.promise;
+    }
+
+    void this.observeCallback(active);
 
     try {
       const opened = await openExternal(this.buildAuthorizeUrl(active, pair.challenge));
@@ -188,8 +217,7 @@ export class OAuthManager {
               "browser_open_failed",
               "The browser could not be opened for ChatGPT sign-in.",
             );
-      this.failActive(active, publicError);
-      await server.close(publicError).catch(() => undefined);
+      await this.rejectActive(active, publicError);
     }
 
     return active.promise;
@@ -203,11 +231,19 @@ export class OAuthManager {
         "There is no active ChatGPT sign-in to complete.",
       );
     }
+    if (active.server === undefined || active.redirectUri === undefined || active.terminal) {
+      throw new OAuthError(
+        "callback_closed",
+        "The ChatGPT sign-in callback is not ready.",
+      );
+    }
     return this.completeCallback(active, url);
   }
 
   public async getAccessToken(forceRefresh = false): Promise<OAuthCredentials> {
+    const generation = this.lifecycle;
     const stored = await this.store.load();
+    this.assertGeneration(generation);
     if (!stored) {
       this.session = undefined;
       throw new OAuthError("auth_required", "ChatGPT authentication is required.");
@@ -220,18 +256,20 @@ export class OAuthManager {
       return this.credentialsFrom(stored);
     }
 
-    const generation = this.lifecycle;
-    if (!this.refreshPromise) {
+    let flight = this.refreshPromise;
+    if (flight?.generation !== generation) {
       const refresh = this.refreshSession(stored, generation);
-      this.refreshPromise = refresh;
+      flight = { generation, promise: refresh };
+      this.refreshPromise = flight;
       void refresh.finally(() => {
-        if (this.refreshPromise === refresh) {
+        if (this.refreshPromise === flight) {
           this.refreshPromise = undefined;
         }
       }).catch(() => undefined);
     }
 
-    const refreshed = await this.refreshPromise;
+    const refreshed = await flight.promise;
+    this.assertGeneration(generation);
     return this.credentialsFrom(refreshed);
   }
 
@@ -241,16 +279,18 @@ export class OAuthManager {
       "callback_closed",
       "ChatGPT sign-in was cancelled.",
     );
-    if (active) {
-      this.failActive(active, cancellation);
-      await active.server.close(cancellation).catch(() => undefined);
-    }
     this.lifecycle += 1;
     this.session = undefined;
-    await this.store.clear();
+    if (active) {
+      await this.rejectActive(active, cancellation);
+    }
+    await this.enqueueStorage(() => this.store.clear());
   }
 
   private buildAuthorizeUrl(active: ActiveSignIn, challenge: string): string {
+    if (active.redirectUri === undefined) {
+      throw new OAuthError("callback_closed", "The ChatGPT sign-in callback is not ready.");
+    }
     const query = new URLSearchParams({
       client_id: CHATGPT_CODEX_PROFILE.clientId,
       response_type: "code",
@@ -268,10 +308,14 @@ export class OAuthManager {
     active: ActiveSignIn,
     url: string,
   ): Promise<OAuthSession> {
-    if (this.activeSignIn !== active || active.settled) {
+    if (this.activeSignIn !== active || active.settled || active.terminal) {
       throw new OAuthError("callback_closed", "The OAuth callback is no longer active.");
     }
-    if (active.callbackClaimed) {
+    if (
+      active.callbackClaimed ||
+      active.server === undefined ||
+      active.redirectUri === undefined
+    ) {
       throw new OAuthError("callback_closed", "The OAuth callback was already handled.");
     }
     active.callbackClaimed = true;
@@ -282,29 +326,38 @@ export class OAuthManager {
         code,
         active.redirectUri,
         active.verifier,
+        active.generation,
       );
-      await this.store.save(session);
+      this.assertActiveGeneration(active);
+      await this.saveIfCurrent(session, active.generation);
+      this.assertActiveGeneration(active);
       this.session = session;
+      const closeError = await this.closeActiveServer(active);
+      if (closeError !== undefined) {
+        throw closeError;
+      }
+      this.assertActiveGeneration(active);
       this.settleActive(active, session);
-      await active.server.close().catch(() => undefined);
       return session;
     } catch (error) {
       const publicError = asError(
         error,
         new OAuthError("oauth_failed", "ChatGPT OAuth sign-in failed."),
       );
-      this.failActive(active, publicError);
-      await active.server.close(publicError).catch(() => undefined);
-      throw publicError;
+      throw await this.rejectActive(active, publicError);
     }
   }
 
   private validateCallback(active: ActiveSignIn, callbackUrl: string): string {
     let parsed: URL;
     let expected: URL;
+    const redirectUri = active.redirectUri;
+    if (redirectUri === undefined) {
+      throw new OAuthError("callback_invalid", "The OAuth callback URL was invalid.");
+    }
     try {
       parsed = new URL(callbackUrl);
-      expected = new URL(active.redirectUri);
+      expected = new URL(redirectUri);
     } catch {
       throw new OAuthError("callback_invalid", "The OAuth callback URL was invalid.");
     }
@@ -339,6 +392,7 @@ export class OAuthManager {
     code: string,
     redirectUri: string,
     verifier: string,
+    generation: number,
   ): Promise<OAuthSession> {
     const payload = await this.postToken({
       grant_type: "authorization_code",
@@ -346,7 +400,8 @@ export class OAuthManager {
       redirect_uri: redirectUri,
       client_id: CHATGPT_CODEX_PROFILE.clientId,
       code_verifier: verifier,
-    });
+    }, generation);
+    this.assertGeneration(generation);
     return this.sessionFromTokenResponse(payload, true);
   }
 
@@ -358,18 +413,21 @@ export class OAuthManager {
       grant_type: "refresh_token",
       refresh_token: previous.refreshToken,
       client_id: CHATGPT_CODEX_PROFILE.clientId,
-    });
-    if (generation !== this.lifecycle) {
-      throw new OAuthError("callback_closed", "ChatGPT authentication changed during refresh.");
-    }
+    }, generation);
+    this.assertGeneration(generation);
 
     const session = this.sessionFromTokenResponse(payload, false, previous);
-    await this.store.save(session);
+    this.assertGeneration(generation);
+    await this.saveIfCurrent(session, generation);
+    this.assertGeneration(generation);
     this.session = session;
     return session;
   }
 
-  private async postToken(fields: Record<string, string>): Promise<Record<string, unknown>> {
+  private async postToken(
+    fields: Record<string, string>,
+    generation?: number,
+  ): Promise<Record<string, unknown>> {
     let response: OAuthHttpResponse;
     try {
       response = await this.fetchToken(CHATGPT_CODEX_PROFILE.tokenUrl, {
@@ -391,7 +449,11 @@ export class OAuthManager {
     const payload = await this.readJson(response);
     if (!response.ok) {
       if (isInvalidGrant(payload)) {
-        await this.clearCredentials();
+        if (generation !== undefined) {
+          await this.clearCredentialsIfCurrent(generation);
+        } else {
+          await this.clearCredentials();
+        }
         throw new OAuthError(
           "auth_required",
           "ChatGPT authentication is required again.",
@@ -472,10 +534,31 @@ export class OAuthManager {
     };
   }
 
+  private async observeCallback(active: ActiveSignIn): Promise<void> {
+    const server = active.server;
+    if (server === undefined) {
+      return;
+    }
+
+    try {
+      const url = await server.callback;
+      if (active.terminal) {
+        return;
+      }
+      await this.completeCallback(active, url);
+    } catch (error) {
+      if (active.terminal) {
+        return;
+      }
+      await this.rejectActive(active, this.loopbackError(error));
+    }
+  }
+
   private settleActive(active: ActiveSignIn, session: OAuthSession): void {
     if (active.settled) {
       return;
     }
+    active.terminal = true;
     active.settled = true;
     if (this.activeSignIn === active) {
       this.activeSignIn = undefined;
@@ -487,6 +570,7 @@ export class OAuthManager {
     if (active.settled) {
       return;
     }
+    active.terminal = true;
     active.settled = true;
     if (this.activeSignIn === active) {
       this.activeSignIn = undefined;
@@ -494,7 +578,114 @@ export class OAuthManager {
     active.reject(error);
   }
 
+  private async rejectActive(
+    active: ActiveSignIn,
+    primaryError: OAuthError,
+  ): Promise<OAuthError> {
+    if (active.settled) {
+      return primaryError;
+    }
+    active.terminal = true;
+    const cleanupError = await this.closeActiveServer(active, primaryError);
+    const failure = this.withCleanupFailure(primaryError, cleanupError);
+    this.failActive(active, failure);
+    return failure;
+  }
+
+  private async closeActiveServer(
+    active: ActiveSignIn,
+    reason?: Error,
+  ): Promise<OAuthError | undefined> {
+    if (active.closePromise !== undefined) {
+      return active.closePromise;
+    }
+    const server = active.server;
+    if (server === undefined) {
+      return undefined;
+    }
+    active.closePromise = (async () => {
+      try {
+        await server.close(reason);
+        return undefined;
+      } catch (error) {
+        return this.closeOAuthError(error);
+      }
+    })();
+    return active.closePromise;
+  }
+
+  private closeOAuthError(error: unknown): OAuthError {
+    if (error instanceof OAuthError && error.code === "callback_close_failed") {
+      return error;
+    }
+    return new OAuthError(
+      "callback_close_failed",
+      "The ChatGPT OAuth callback server could not be closed.",
+      error,
+    );
+  }
+
+  private withCleanupFailure(
+    primaryError: OAuthError,
+    cleanupError: OAuthError | undefined,
+  ): OAuthError {
+    if (cleanupError !== undefined && primaryError !== cleanupError) {
+      primaryError.cleanupError = cleanupError;
+    }
+    return primaryError;
+  }
+
+  private assertGeneration(generation: number): void {
+    if (this.lifecycle !== generation) {
+      throw new OAuthError(
+        "callback_closed",
+        "ChatGPT authentication changed during the OAuth operation.",
+      );
+    }
+  }
+
+  private assertActiveGeneration(active: ActiveSignIn): void {
+    if (
+      this.activeSignIn !== active ||
+      active.terminal ||
+      this.lifecycle !== active.generation
+    ) {
+      throw new OAuthError(
+        "callback_closed",
+        "ChatGPT authentication changed during the OAuth operation.",
+      );
+    }
+  }
+
+  private async saveIfCurrent(session: OAuthSession, generation: number): Promise<void> {
+    this.assertGeneration(generation);
+    await this.enqueueStorage(async () => {
+      this.assertGeneration(generation);
+      await this.store.save(session);
+      this.assertGeneration(generation);
+    });
+  }
+
+  private enqueueStorage<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.storageQueue.then(operation, operation);
+    this.storageQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   private loopbackError(error: unknown): OAuthError {
+    if (error instanceof LoopbackError) {
+      const cleanupError = this.closeOAuthError(error);
+      if (error.primaryError !== undefined) {
+        return this.withCleanupFailure(
+          this.loopbackError(error.primaryError),
+          cleanupError,
+        );
+      }
+      return cleanupError;
+    }
     if (error instanceof Error && error.message.includes("timed out")) {
       return new OAuthError("callback_timeout", "ChatGPT OAuth callback timed out.");
     }
@@ -504,6 +695,14 @@ export class OAuthManager {
   private async clearCredentials(): Promise<void> {
     this.lifecycle += 1;
     this.session = undefined;
-    await this.store.clear();
+    await this.enqueueStorage(() => this.store.clear());
+  }
+
+  private async clearCredentialsIfCurrent(generation: number): Promise<void> {
+    this.assertGeneration(generation);
+    this.lifecycle += 1;
+    this.session = undefined;
+    await this.enqueueStorage(() => this.store.clear());
+    this.assertGeneration(generation + 1);
   }
 }

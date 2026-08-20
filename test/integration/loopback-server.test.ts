@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { request } from "node:http";
+import { createServer, type Server } from "node:net";
 
 import { LoopbackCallbackServer } from "../../src/transports/chatgpt-oauth/loopback-server.js";
 
@@ -18,6 +19,23 @@ const requestUrl = (url: string, method = "GET"): Promise<{ status: number; body
     });
     clientRequest.on("error", reject);
     clientRequest.end();
+  });
+
+const listenOn = (server: Server, port: number): Promise<void> =>
+  new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve());
+  });
+
+const closeNetServer = (server: Server): Promise<void> =>
+  new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
   });
 
 test("loopback callback accepts only the exact GET path and closes after one callback", async () => {
@@ -66,4 +84,38 @@ test("loopback callback timeout closes the listener without contacting OAuth", a
   await assert.rejects(
     requestUrl(`http://127.0.0.1:${handle.port}/auth/callback?code=late&state=late`),
   );
+});
+
+test("default production ports fall back from 1455 to 1457", async () => {
+  const holder = createServer();
+  let handle: Awaited<ReturnType<LoopbackCallbackServer["start"]>> | undefined;
+  try {
+    try {
+      await listenOn(holder, 1455);
+    } catch (error) {
+      throw new Error(
+        `Could not hold production fallback port 1455 for the test: ${String(error)}`,
+        { cause: error },
+      );
+    }
+
+    try {
+      handle = await new LoopbackCallbackServer({ timeoutMs: 2_000 }).start();
+    } catch (error) {
+      throw new Error(
+        `Production fallback failed to use port 1457 while 1455 was held: ${String(error)}`,
+        { cause: error },
+      );
+    }
+    assert.equal(handle.port, 1457);
+
+    const callback = handle.callback;
+    await handle.close();
+    await assert.rejects(callback, /closed/i);
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+    await closeNetServer(holder);
+  }
 });
