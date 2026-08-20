@@ -25,10 +25,47 @@ const model: CodexModel = {
   },
 };
 
+interface TrackableCancellation {
+  token: vscode.CancellationToken;
+  cancel(): void;
+  disposeCount(): number;
+}
+
+function createTrackableCancellation(): TrackableCancellation {
+  let cancellationRequested = false;
+  let listener: (() => unknown) | undefined;
+  let disposalCount = 0;
+  const token = {
+    get isCancellationRequested(): boolean {
+      return cancellationRequested;
+    },
+    onCancellationRequested(callback: () => unknown): { dispose(): void } {
+      listener = callback;
+      return {
+        dispose: () => {
+          disposalCount += 1;
+          listener = undefined;
+        },
+      };
+    },
+  } as unknown as vscode.CancellationToken;
+
+  return {
+    token,
+    cancel: () => {
+      cancellationRequested = true;
+      listener?.();
+    },
+    disposeCount: () => disposalCount,
+  };
+}
+
 async function streamsTextAndToolCalls(): Promise<void> {
+  let receivedRequest: CodexRequest | undefined;
   const transport: CodexTransport = {
     listModels: async () => [model],
-    generate: async function* (_request: CodexRequest): AsyncIterable<TransportEvent> {
+    generate: async function* (request: CodexRequest): AsyncIterable<TransportEvent> {
+      receivedRequest = request;
       yield { type: "text-delta", text: "hello" };
       yield {
         type: "tool-call",
@@ -82,6 +119,47 @@ async function streamsTextAndToolCalls(): Promise<void> {
     "get_abap_object_lines",
     { uri: "adt://DEV/zcl_demo" },
   ));
+  assert.equal(receivedRequest?.toolMode, "auto");
+}
+
+async function disposesResponseCancellationListenerOnRequestBuildFailure(): Promise<void> {
+  const expected = new Error("request build failed");
+  const cancellation = createTrackableCancellation();
+  let generateCalls = 0;
+  const provider = new CodexLanguageModelProvider({
+    listModels: async () => [model],
+    generate: (): AsyncIterable<TransportEvent> => {
+      generateCalls += 1;
+      throw new Error("generate must not be called");
+    },
+    dispose: async () => undefined,
+  }, {
+    requestIdFactory: () => {
+      throw expected;
+    },
+  });
+
+  await assert.rejects(
+    provider.provideLanguageModelChatResponse(
+      {
+        id: model.id,
+        name: model.name,
+        family: model.family,
+        version: model.version,
+        maxInputTokens: model.maxInputTokens,
+        maxOutputTokens: model.maxOutputTokens,
+        capabilities: { imageInput: false, toolCalling: true },
+      },
+      [],
+      { toolMode: vscode.LanguageModelChatToolMode.Auto },
+      { report: () => undefined },
+      cancellation.token,
+    ),
+    (error: unknown) => error === expected,
+  );
+
+  assert.equal(generateCalls, 0);
+  assert.equal(cancellation.disposeCount(), 1);
 }
 
 async function preservesStableMessageParts(): Promise<void> {
@@ -213,6 +291,79 @@ async function cachesModelDiscovery(): Promise<void> {
   assert.deepEqual(second, first);
 }
 
+async function keepsSharedModelDiscoveryAliveWhenFirstCallerCancels(): Promise<void> {
+  const firstCancellation = createTrackableCancellation();
+  const secondCancellation = createTrackableCancellation();
+  let listCalls = 0;
+  let loaderSignal: AbortSignal | undefined;
+  let resolveListStarted: (() => void) | undefined;
+  const listStarted = new Promise<void>((resolve) => {
+    resolveListStarted = resolve;
+  });
+  let resolveModels: ((models: readonly CodexModel[]) => void) | undefined;
+  const transport: CodexTransport = {
+    listModels: (_options, signal) => {
+      listCalls += 1;
+      loaderSignal = signal;
+      return new Promise<readonly CodexModel[]>((resolve) => {
+        resolveModels = resolve;
+        resolveListStarted?.();
+      });
+    },
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, "test-vendor");
+  const firstPromise = provider.provideLanguageModelChatInformation(
+    { silent: true },
+    firstCancellation.token,
+  );
+  const secondPromise = provider.provideLanguageModelChatInformation(
+    { silent: false },
+    secondCancellation.token,
+  );
+  await listStarted;
+
+  const timedOut = Symbol("timed out");
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    firstCancellation.cancel();
+    const firstResult = await Promise.race([
+      firstPromise,
+      new Promise<readonly vscode.LanguageModelChatInformation[] | typeof timedOut>((resolve) => {
+        timeout = setTimeout(() => resolve(timedOut), 250);
+      }),
+    ]);
+
+    resolveModels?.([model]);
+    const [firstModels, secondModels] = await Promise.all([firstPromise, secondPromise]);
+
+    assert.notEqual(firstResult, timedOut, "cancelled caller did not stop waiting");
+    assert.deepEqual(firstModels, []);
+    assert.deepEqual(secondModels, [{
+      id: "gpt-test",
+      name: "GPT Test",
+      family: "gpt",
+      version: "1",
+      maxInputTokens: 1_000,
+      maxOutputTokens: 500,
+      capabilities: { imageInput: false, toolCalling: true },
+    }]);
+    assert.equal(listCalls, 1);
+    assert.equal(loaderSignal?.aborted, false);
+    assert.equal(firstCancellation.disposeCount(), 1);
+    assert.equal(secondCancellation.disposeCount(), 1);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+    resolveModels?.([model]);
+    await Promise.allSettled([firstPromise, secondPromise]);
+  }
+}
+
 async function countsTokens(): Promise<void> {
   const provider = new CodexLanguageModelProvider({
     listModels: async () => [model],
@@ -233,7 +384,10 @@ async function countsTokens(): Promise<void> {
   };
 
   assert.equal(await provider.provideTokenCount(modelInfo, "", cancellation.token), 1);
-  assert.equal(await provider.provideTokenCount(modelInfo, "😀", cancellation.token), 1);
+  const astralAndAscii = "😀😀a";
+  assert.equal(astralAndAscii.length, 5);
+  assert.equal([...astralAndAscii].length, 3);
+  assert.equal(await provider.provideTokenCount(modelInfo, astralAndAscii, cancellation.token), 2);
   const message: vscode.LanguageModelChatRequestMessage = {
     role: vscode.LanguageModelChatMessageRole.Assistant,
     name: undefined,
@@ -321,6 +475,8 @@ export async function runProviderTests(): Promise<void> {
     ["provider streams text and tool calls as Copilot response parts", streamsTextAndToolCalls],
     ["provider preserves stable Copilot message parts and required tools", preservesStableMessageParts],
     ["provider caches model discovery and maps the normalized capabilities", cachesModelDiscovery],
+    ["provider keeps shared discovery alive when the first caller cancels", keepsSharedModelDiscoveryAliveWhenFirstCallerCancels],
+    ["provider disposes response cancellation listeners on request-build failure", disposesResponseCancellationListenerOnRequestBuildFailure],
     ["provider counts UTF-16 text and serialized tool metadata with a minimum of one", countsTokens],
     ["provider returns quietly when transport cancellation is requested", handlesCancellation],
     ["provider preserves typed transport errors for Copilot", preservesTypedTransportErrors],

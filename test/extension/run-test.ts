@@ -3,12 +3,15 @@ import * as path from "node:path";
 
 import { downloadAndUnzipVSCode } from "@vscode/test-electron";
 
+const VS_CODE_VERSION = "1.131.0";
+
 async function main(): Promise<void> {
   const projectRoot = path.resolve(__dirname, "../../..");
   const cachePath = path.join(projectRoot, ".vscode-test");
   const extensionDevelopmentPath = projectRoot;
   const extensionTestsPath = path.resolve(__dirname, "suite/index.js");
   const executable = await downloadAndUnzipVSCode({
+    version: VS_CODE_VERSION,
     cachePath,
     extensionDevelopmentPath,
   });

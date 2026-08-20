@@ -29,6 +29,31 @@ const isAbortError = (error: unknown): boolean =>
   error instanceof DOMException && error.name === "AbortError" ||
   error instanceof Error && error.name === "AbortError";
 
+function waitForCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+  if (signal.aborted) {
+    return Promise.resolve(undefined);
+  }
+
+  return new Promise<T | undefined>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(undefined);
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 const mapModel = (model: CodexModel): vscode.LanguageModelChatInformation => ({
   id: model.id,
   name: model.name,
@@ -64,8 +89,14 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const binding = toAbortSignal(token);
     try {
-      const models = await this.modelCache.get(() =>
-        this.transport.listModels({ silent: options.silent }, binding.signal));
+      const models = await waitForCancellation(
+        this.modelCache.get(() =>
+          this.transport.listModels({ silent: options.silent }, new AbortController().signal)),
+        binding.signal,
+      );
+      if (models === undefined) {
+        return [];
+      }
       return models.map(mapModel);
     } catch (error: unknown) {
       if (binding.signal.aborted || isCancelledError(error) || isAbortError(error)) {
@@ -85,15 +116,15 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     token: vscode.CancellationToken,
   ): Promise<void> {
     const binding = toAbortSignal(token);
-    const request = toCodexRequest({
-      requestId: this.requestIdFactory(),
-      model,
-      messages,
-      options,
-      instructions: this.instructions,
-    });
 
     try {
+      const request = toCodexRequest({
+        requestId: this.requestIdFactory(),
+        model,
+        messages,
+        options,
+        instructions: this.instructions,
+      });
       for await (const event of this.transport.generate(request, binding.signal)) {
         if (binding.signal.aborted) {
           return;
