@@ -210,7 +210,8 @@ App Server 进程按需启动并长期复用；每个 Copilot 生成链使用独
 
 - 使用 Authorization Code + PKCE。
 - 每次登录生成新的 verifier、challenge 和随机 state，并严格验证回调 state。
-- 通过 VS Code URI handler 接收回调。
+- 在扩展宿主上启动仅绑定 `127.0.0.1` 的短生命周期 loopback 回调服务器，优先使用 Codex 已登记的 `http://localhost:1455/auth/callback`，端口占用时尝试 `1457`。
+- 回调服务器在成功、失败、取消或五分钟超时后立即关闭；远程扩展宿主无法接收浏览器 localhost 回调时，允许用户粘贴完整回调 URL，并继续执行相同的 state 校验和 code exchange。
 - Access token、refresh token 和必要的到期元数据仅保存到 VS Code `SecretStorage`。
 - Token 即将过期时单飞刷新，避免并发刷新覆盖。
 - `invalid_grant`、撤销或不可恢复的 401 会清除本扩展凭据并要求重新登录。
