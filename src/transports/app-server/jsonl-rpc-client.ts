@@ -518,22 +518,24 @@ export class JsonlRpcClient {
     }
   }
 
+  private removeOwnedListeners(): void {
+    this.input.removeListener("error", this.handleStreamError);
+    this.input.removeListener("finish", this.handleInputEnd);
+    this.input.removeListener("close", this.handleInputEnd);
+    this.input.removeListener("drain", this.handleDrain);
+    this.output.removeListener("data", this.handleData);
+    this.output.removeListener("error", this.handleStreamError);
+    this.output.removeListener("end", this.handleEnd);
+    this.output.removeListener("close", this.handleEnd);
+    this.output.removeListener("drain", this.handleDrain);
+  }
+
   private terminate(error: CodexError): void {
     if (this.closed) {
       return;
     }
     this.closed = true;
-    this.input.removeAllListeners("data");
-    this.input.removeAllListeners("error");
-    this.input.removeAllListeners("end");
-    this.input.removeAllListeners("finish");
-    this.input.removeAllListeners("close");
-    this.input.removeAllListeners("drain");
-    this.output.removeAllListeners("data");
-    this.output.removeAllListeners("error");
-    this.output.removeAllListeners("end");
-    this.output.removeAllListeners("close");
-    this.output.removeAllListeners("drain");
+    this.removeOwnedListeners();
 
     for (const pending of this.pendingRequests.values()) {
       this.cleanupPending(pending);

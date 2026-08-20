@@ -13,6 +13,10 @@ export type SpawnProcess = (
   options: SpawnOptions,
 ) => ChildProcess;
 
+type SupervisorTimer = ReturnType<typeof setTimeout>;
+type SupervisorSetTimeout = (callback: () => void, milliseconds: number) => SupervisorTimer;
+type SupervisorClearTimeout = (timer: SupervisorTimer) => void;
+
 export interface ProcessSupervisorOptions {
   configuredExecutable?: string;
   env?: NodeJS.ProcessEnv;
@@ -22,6 +26,8 @@ export interface ProcessSupervisorOptions {
   requestTimeoutMs?: number;
   killGraceMs?: number;
   forceKillWaitMs?: number;
+  setTimeout?: SupervisorSetTimeout;
+  clearTimeout?: SupervisorClearTimeout;
   logger?: SafeLogger;
   spawnProcess?: SpawnProcess;
 }
@@ -47,10 +53,18 @@ interface ChildRecord {
   readonly onSpawn: () => void;
   readonly onSpawnError: (cause: Error) => void;
   readonly onExitBeforeSpawn: () => void;
-  readonly onStaleError: (cause: Error) => void;
+  readonly onChildClose: () => void;
+  readonly onStdoutClose: () => void;
+  readonly onStderrClose: () => void;
+  readonly onLateChildError: (cause: Error) => void;
+  readonly onLateStdoutError: (cause: Error) => void;
+  readonly onLateStderrError: (cause: Error) => void;
   spawnSettled: boolean;
   exitObserved: boolean;
-  staleErrorAttached: boolean;
+  teardownSinksAttached: boolean;
+  childClosed: boolean;
+  stdoutClosed: boolean;
+  stderrClosed: boolean;
   state: "starting" | "running" | "terminating" | "stuck" | "exited";
   intentionalTermination: boolean;
   failureRecorded: boolean;
@@ -63,6 +77,8 @@ export class ProcessSupervisor {
   private readonly safeCwd: string;
   private readonly killGraceMs: number;
   private readonly forceKillWaitMs: number;
+  private readonly setTimeout: SupervisorSetTimeout;
+  private readonly clearTimeout: SupervisorClearTimeout;
   private readonly logger: SafeLogger | undefined;
   private readonly requestTimeoutMs: number | undefined;
   private readonly locator: ExecutableLocator;
@@ -85,6 +101,9 @@ export class ProcessSupervisor {
     if (!Number.isFinite(this.forceKillWaitMs) || this.forceKillWaitMs <= 0) {
       throw new RangeError("forceKillWaitMs must be positive");
     }
+    this.setTimeout = options.setTimeout ?? ((callback, milliseconds) =>
+      setTimeout(callback, milliseconds));
+    this.clearTimeout = options.clearTimeout ?? ((timer) => clearTimeout(timer));
     this.logger = options.logger;
     this.requestTimeoutMs = options.requestTimeoutMs;
     this.locator = new ExecutableLocator({
@@ -222,7 +241,13 @@ export class ProcessSupervisor {
     this.currentRecord = record;
     try {
       await record.spawnPromise;
-      if (record.exitObserved || record.state === "exited") {
+      if (
+        this.currentRecord !== record
+        || record.exitObserved
+        || record.state !== "starting"
+        || record.intentionalTermination
+        || record.terminationPromise !== undefined
+      ) {
         throw processError("startCodex");
       }
       if (child.stdin === null || child.stdout === null) {
@@ -314,8 +339,9 @@ export class ProcessSupervisor {
         onExitBeforeSpawn();
       }
       this.recordFailure(record);
+      this.attachTeardownSinks(record);
       record.client?.close(processError("appServerExit"));
-      this.detachRecordListeners(record);
+      this.detachNormalListeners(record);
       record.resolveExit();
       if (this.currentRecord === record) {
         this.currentRecord = undefined;
@@ -326,7 +352,6 @@ export class ProcessSupervisor {
         return;
       }
       this.recordFailure(record);
-      record.client?.close(processError("appServerProcess", cause));
       void this.terminateRecord(record, processError("appServerProcess", cause), false)
         .catch(() => undefined);
     };
@@ -342,11 +367,31 @@ export class ProcessSupervisor {
         return;
       }
       this.recordFailure(record);
-      record.client?.close(processError("appServerStderr", cause));
       void this.terminateRecord(record, processError("appServerStderr", cause), false)
         .catch(() => undefined);
     };
-    const onStaleError = (_cause: Error): void => undefined;
+    const onChildClose = (): void => {
+      record.childClosed = true;
+      child.removeListener("error", onLateChildError);
+      child.removeListener("close", onChildClose);
+      child.stdout?.removeListener("error", onLateStdoutError);
+      child.stdout?.removeListener("close", onStdoutClose);
+      child.stderr?.removeListener("error", onLateStderrError);
+      child.stderr?.removeListener("close", onStderrClose);
+    };
+    const onStdoutClose = (): void => {
+      record.stdoutClosed = true;
+      child.stdout?.removeListener("error", onLateStdoutError);
+      child.stdout?.removeListener("close", onStdoutClose);
+    };
+    const onStderrClose = (): void => {
+      record.stderrClosed = true;
+      child.stderr?.removeListener("error", onLateStderrError);
+      child.stderr?.removeListener("close", onStderrClose);
+    };
+    const onLateChildError = (_cause: Error): void => undefined;
+    const onLateStdoutError = (_cause: Error): void => undefined;
+    const onLateStderrError = (_cause: Error): void => undefined;
 
     record = {
       generation,
@@ -363,10 +408,18 @@ export class ProcessSupervisor {
       onSpawn,
       onSpawnError,
       onExitBeforeSpawn,
-      onStaleError,
+      onChildClose,
+      onStdoutClose,
+      onStderrClose,
+      onLateChildError,
+      onLateStdoutError,
+      onLateStderrError,
       spawnSettled: false,
       exitObserved: false,
-      staleErrorAttached: false,
+      teardownSinksAttached: false,
+      childClosed: false,
+      stdoutClosed: false,
+      stderrClosed: false,
       state: "starting",
       intentionalTermination: false,
       failureRecorded: false,
@@ -387,7 +440,7 @@ export class ProcessSupervisor {
     return record;
   }
 
-  private detachRecordListeners(record: ChildRecord): void {
+  private detachNormalListeners(record: ChildRecord): void {
     const child = record.child;
     child.removeListener("spawn", record.onSpawn);
     child.removeListener("error", record.onError);
@@ -396,10 +449,25 @@ export class ProcessSupervisor {
     child.removeListener("exit", record.onExitBeforeSpawn);
     child.stderr?.removeListener("data", record.onStderr);
     child.stderr?.removeListener("error", record.onStderrError);
-    if (!record.staleErrorAttached) {
-      record.staleErrorAttached = true;
-      child.on("error", record.onStaleError);
-      child.stderr?.on("error", record.onStaleError);
+  }
+
+  private attachTeardownSinks(record: ChildRecord): void {
+    if (record.teardownSinksAttached) {
+      return;
+    }
+    record.teardownSinksAttached = true;
+    const child = record.child;
+    if (!record.childClosed) {
+      child.on("error", record.onLateChildError);
+      child.on("close", record.onChildClose);
+    }
+    if (child.stdout !== null && !record.stdoutClosed) {
+      child.stdout.on("error", record.onLateStdoutError);
+      child.stdout.on("close", record.onStdoutClose);
+    }
+    if (child.stderr !== null && !record.stderrClosed) {
+      child.stderr.on("error", record.onLateStderrError);
+      child.stderr.on("close", record.onStderrClose);
     }
   }
 
@@ -413,6 +481,7 @@ export class ProcessSupervisor {
     }
     record.intentionalTermination ||= intentional;
     record.state = "terminating";
+    this.attachTeardownSinks(record);
     record.client?.close(reason);
     const operation = this.performTermination(record);
     record.terminationPromise = operation;
@@ -457,10 +526,32 @@ export class ProcessSupervisor {
   }
 
   private async exitOrTimeout(exitPromise: Promise<void>, milliseconds: number): Promise<boolean> {
-    return Promise.race([
-      exitPromise.then(() => true),
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), milliseconds)),
-    ]);
+    let timer: SupervisorTimer | undefined;
+    let settled = false;
+    return new Promise<boolean>((resolve) => {
+      const finish = (result: boolean): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== undefined) {
+          this.clearTimeout(timer);
+          timer = undefined;
+        }
+        resolve(result);
+      };
+      void exitPromise.then(
+        () => finish(true),
+        () => finish(false),
+      );
+      timer = this.setTimeout(() => finish(false), milliseconds);
+      const unref = (timer as unknown as { unref?: () => void }).unref;
+      unref?.call(timer);
+      if (settled) {
+        this.clearTimeout(timer);
+        timer = undefined;
+      }
+    });
   }
 
   private recordFailure(record?: ChildRecord): void {

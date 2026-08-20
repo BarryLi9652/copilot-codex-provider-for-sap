@@ -30,7 +30,7 @@ class FakeChild extends EventEmitter {
   public readonly stdout: PassThrough | null;
   public readonly stderr = new PassThrough();
   public readonly killCalls: Array<NodeJS.Signals | number | undefined> = [];
-  public pid = 30_000;
+  public pid: number | undefined = 30_000;
   public exitCode: number | null = null;
   public signalCode: NodeJS.Signals | null = null;
   public exitedAt: number | undefined;
@@ -39,9 +39,18 @@ class FakeChild extends EventEmitter {
     private readonly killMode: KillMode = "any",
     stdout: PassThrough | null = new PassThrough(),
     private readonly killDelayMs = 0,
+    deferSpawn = false,
   ) {
     super();
     this.stdout = stdout;
+    if (deferSpawn) {
+      this.pid = undefined;
+    }
+  }
+
+  public completeSpawn(): void {
+    this.pid = 30_000;
+    this.emit("spawn");
   }
 
   public kill(signal?: NodeJS.Signals | number): boolean {
@@ -62,7 +71,28 @@ class FakeChild extends EventEmitter {
     this.signalCode = signal;
     this.exitedAt = Date.now();
     this.emit("exit", code, signal);
+    this.stdout?.emit("close");
+    this.stderr.emit("close");
+    this.emit("close");
   }
+}
+
+interface ManualTimer {
+  readonly callback: () => void;
+}
+
+class ManualTimers {
+  public created = 0;
+  public readonly active = new Set<ManualTimer>();
+  public readonly setTimeout = (callback: () => void, _milliseconds: number): ReturnType<typeof setTimeout> => {
+    const timer: ManualTimer = { callback };
+    this.created += 1;
+    this.active.add(timer);
+    return timer as unknown as ReturnType<typeof setTimeout>;
+  };
+  public readonly clearTimeout = (timer: ReturnType<typeof setTimeout>): void => {
+    this.active.delete(timer as unknown as ManualTimer);
+  };
 }
 
 const asChildProcess = (child: FakeChild): ChildProcess => child as unknown as ChildProcess;
@@ -220,15 +250,20 @@ test("records only stderr metadata and never includes stderr content in diagnost
 test("does not let an old child error close or clear a newer generation", async () => {
   const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
   const first = await supervisor.start();
-  await supervisor.stop();
-  const second = await supervisor.restart();
   const oldChild = children[0] as FakeChild;
+  const stopping = supervisor.stop();
   oldChild.emit("error", new Error("late old child error"));
   oldChild.stderr.emit("data", "late old stderr");
   assert.doesNotThrow(() => {
     oldChild.stderr.emit("error", new Error("late old stderr error"));
+    oldChild.stdout?.emit("error", new Error("late old stdout error"));
   });
   oldChild.emit("exit", 1, null);
+  oldChild.stdout?.emit("close");
+  oldChild.stderr.emit("close");
+  oldChild.emit("close");
+  await stopping;
+  const second = await supervisor.restart();
 
   assert.equal(await supervisor.start(), second);
   assert.equal(second.isClosed, false);
@@ -334,4 +369,72 @@ test("handles a child error as a generation-owned failure and permits one restar
   assert.notEqual(first, second);
   assert.equal(children.length, 2);
   await asFixRoundSupervisor(supervisor).dispose();
+});
+
+test("rejects a start that races with stop before spawn completes", async () => {
+  const firstChild = new FakeChild("any", new PassThrough(), 0, true);
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? firstChild : new FakeChild("any"));
+  const starting = supervisor.start();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  const stopping = supervisor.stop();
+  firstChild.completeSpawn();
+
+  try {
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof CodexError && error.code === "process",
+    );
+    await stopping;
+  } finally {
+    await stopping.catch(() => undefined);
+  }
+
+  assert.equal(children.length, 1);
+  assert.deepEqual(firstChild.killCalls, [undefined]);
+  assert.notEqual(firstChild.exitCode, null);
+  assert.equal(firstChild.stdout?.listenerCount("data"), 0);
+  const replacement = await supervisor.start();
+  assert.equal(children.length, 2);
+  await supervisor.stop();
+  assert.equal(replacement.isClosed, true);
+});
+
+test("contains late child, stdout, and stderr errors during teardown and removes temporary sinks", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const client = await supervisor.start();
+  const child = children[0] as FakeChild;
+  const stopping = supervisor.stop();
+
+  assert.doesNotThrow(() => {
+    child.emit("error", new Error("late child error"));
+    child.stdout?.emit("error", new Error("late stdout error"));
+    child.stderr.emit("error", new Error("late stderr error"));
+  });
+  await stopping;
+
+  assert.equal(client.isClosed, true);
+  assert.equal(child.listenerCount("error"), 0);
+  assert.equal(child.listenerCount("close"), 0);
+  assert.equal(child.stdout?.listenerCount("error"), 0);
+  assert.equal(child.stdout?.listenerCount("close"), 0);
+  assert.equal(child.stderr.listenerCount("error"), 0);
+  assert.equal(child.stderr.listenerCount("close"), 0);
+});
+
+test("clears the exit wait timer when a child exits normally", async () => {
+  const timers = new ManualTimers();
+  const timerOptions = {
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  } as unknown as Partial<ConstructorParameters<typeof ProcessSupervisor>[0]>;
+  const child = new FakeChild("any");
+  const { supervisor } = injectedSupervisor(() => child, timerOptions);
+  await supervisor.start();
+  const stopping = supervisor.stop();
+  child.exit();
+  await stopping;
+
+  assert.equal(timers.created, 1);
+  assert.equal(timers.active.size, 0);
 });

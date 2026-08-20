@@ -312,6 +312,43 @@ test("termination rejects queued writes and removes all owned stream listeners",
   serverOutput.destroy();
 });
 
+test("termination preserves external listeners on caller-provided streams", async () => {
+  const serverOutput = new PassThrough();
+  const input = new ControlledWritable();
+  const externalListener = (): void => undefined;
+  const events = ["data", "error", "end", "finish", "close", "drain"];
+  for (const event of events) {
+    input.on(event, externalListener);
+    serverOutput.on(event, externalListener);
+  }
+  const baseline = new Map(
+    events.flatMap((event) => [
+      [`input:${event}`, input.listenerCount(event)] as const,
+      [`output:${event}`, serverOutput.listenerCount(event)] as const,
+    ]),
+  );
+  const client = new JsonlRpcClient(
+    { input: input as unknown as Writable, output: serverOutput },
+    { requestTimeoutMs: Number.POSITIVE_INFINITY },
+  );
+  const pending = client.request("external-listeners", {});
+  client.dispose();
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  for (const event of events) {
+    assert.equal(input.listenerCount(event), baseline.get(`input:${event}`), `input ${event}`);
+    assert.equal(serverOutput.listenerCount(event), baseline.get(`output:${event}`), `output ${event}`);
+  }
+  input.emit("drain");
+  serverOutput.emit("end");
+  serverOutput.emit("close");
+  client.dispose();
+  serverOutput.destroy();
+});
+
 test("observes synchronous server-error write failures without an unhandled rejection", async () => {
   const serverOutput = new PassThrough();
   const input = new ControlledWritable();
