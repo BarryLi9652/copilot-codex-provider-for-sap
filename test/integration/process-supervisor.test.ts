@@ -512,3 +512,122 @@ test("restart waits for an in-flight deferred start cleanup and coalesces replac
   assert.notEqual(firstChild.exitCode, null);
   await supervisor.stop();
 });
+
+test("rejects start when stdin is already closed before client construction", async () => {
+  const child = new FakeChild("any");
+  child.stdin.destroy();
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? child : new FakeChild("any"));
+  const starting = supervisor.start();
+
+  try {
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof CodexError
+        && (error.code === "process" || error.code === "protocol"),
+    );
+    assert.notEqual(child.exitCode, null);
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.stdin.listenerCount("error"), 0);
+    assert.equal(child.stdout?.listenerCount("error"), 0);
+    assert.equal(child.stderr.listenerCount("error"), 0);
+    const replacement = await supervisor.start();
+    assert.equal(children.length, 2);
+    assert.equal(replacement.isClosed, false);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    if (child.exitCode === null) {
+      child.exit();
+    }
+  }
+});
+
+test("rejects start when stdout is already closed before client construction", async () => {
+  const child = new FakeChild("any");
+  child.stdout?.destroy();
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? child : new FakeChild("any"));
+  const starting = supervisor.start();
+
+  try {
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof CodexError
+        && (error.code === "process" || error.code === "protocol"),
+    );
+    assert.notEqual(child.exitCode, null);
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.stdin.listenerCount("error"), 0);
+    assert.equal(child.stdout?.listenerCount("error"), 0);
+    assert.equal(child.stderr.listenerCount("error"), 0);
+    const replacement = await supervisor.start();
+    assert.equal(children.length, 2);
+    assert.equal(replacement.isClosed, false);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    if (child.exitCode === null) {
+      child.exit();
+    }
+  }
+});
+
+test("rejects start when the child closes before deferred spawn completion", async () => {
+  const child = new FakeChild("any", new PassThrough(), 0, true);
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? child : new FakeChild("any"));
+  const starting = supervisor.start();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  child.emit("close");
+  child.completeSpawn();
+
+  try {
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof CodexError
+        && (error.code === "process" || error.code === "protocol"),
+    );
+    assert.notEqual(child.exitCode, null);
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.stdin.listenerCount("error"), 0);
+    assert.equal(child.stdout?.listenerCount("error"), 0);
+    assert.equal(child.stderr.listenerCount("error"), 0);
+    const replacement = await supervisor.start();
+    assert.equal(children.length, 2);
+    assert.equal(replacement.isClosed, false);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    if (child.exitCode === null) {
+      child.exit();
+    }
+  }
+});
+
+test("rejects start when the child exits before deferred spawn completion", async () => {
+  const child = new FakeChild("any", new PassThrough(), 0, true);
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? child : new FakeChild("any"));
+  const starting = supervisor.start();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  child.exit(1);
+
+  try {
+    await assert.rejects(
+      starting,
+      (error: unknown) => error instanceof CodexError
+        && (error.code === "process" || error.code === "protocol"),
+    );
+    assert.notEqual(child.exitCode, null);
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.stdin.listenerCount("error"), 0);
+    assert.equal(child.stdout?.listenerCount("error"), 0);
+    assert.equal(child.stderr.listenerCount("error"), 0);
+    const replacement = await supervisor.start();
+    assert.equal(children.length, 2);
+    assert.equal(replacement.isClosed, false);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    if (child.exitCode === null) {
+      child.exit();
+    }
+  }
+});

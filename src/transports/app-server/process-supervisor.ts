@@ -249,6 +249,10 @@ export class ProcessSupervisor {
         || record.state !== "starting"
         || record.intentionalTermination
         || record.terminationPromise !== undefined
+        || record.childClosed
+        || record.stdinClosed
+        || record.stdoutClosed
+        || record.stderrClosed
       ) {
         throw processError("startCodex");
       }
