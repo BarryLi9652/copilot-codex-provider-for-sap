@@ -122,6 +122,44 @@ test("rejects every pending request with a redacted protocol error on malformed 
   clientInput.destroy();
 });
 
+test("retains safe remote JSON-RPC classification metadata without exposing its message", async () => {
+  const serverOutput = new PassThrough();
+  const clientInput = new PassThrough();
+  const client = new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    { requestTimeoutMs: 1_000 },
+  );
+  const pending = client.request("thread/start", {});
+  serverOutput.write(JSON.stringify({
+    id: 1,
+    error: {
+      code: -32602,
+      message: "dynamicTools is unavailable: private server detail",
+    },
+  }) + "\n");
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => {
+      assert.ok(error instanceof CodexError);
+      assert.equal(error.code, "protocol");
+      assert.equal(String(error).includes("private server detail"), false);
+      const cause = (error as Error & { cause?: unknown }).cause;
+      assert.ok(cause && typeof cause === "object");
+      assert.equal(JSON.stringify(cause).includes("private server detail"), false);
+      assert.equal((cause as { rpcCode?: number }).rpcCode, -32602);
+      assert.equal(
+        (cause as { rpcMessage?: string }).rpcMessage,
+        "dynamicTools is unavailable: private server detail",
+      );
+      return true;
+    },
+  );
+  client.dispose();
+  serverOutput.destroy();
+  clientInput.destroy();
+});
+
 test("cancellation removes the pending request and emits a cancellation notification", async () => {
   const serverOutput = new PassThrough();
   const clientInput = new PassThrough();

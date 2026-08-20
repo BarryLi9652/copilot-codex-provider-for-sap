@@ -6,6 +6,7 @@ import {
   type Disposable,
   type JsonRpcServerNotificationHandler,
   type JsonRpcServerRequestHandler,
+  JsonRpcRemoteError,
   protocolError,
 } from "./protocol.js";
 import { parseAppServerModels, type AppServerModelDiagnostics } from "./model-catalog.js";
@@ -41,7 +42,7 @@ export interface AppServerSessionClient {
   request<T>(method: string, params?: unknown, signal?: AbortSignal): Promise<T>;
   notify(method: string, params?: unknown): void;
   onServerRequest(method: string, handler: JsonRpcServerRequestHandler): Disposable;
-  onServerNotification?: (
+  onServerNotification: (
     method: string,
     handler: JsonRpcServerNotificationHandler,
   ) => Disposable;
@@ -79,8 +80,13 @@ export class AppServerSession {
   private initializationPromise: Promise<AppServerCapabilities> | undefined;
   private restartPromise: Promise<AppServerCapabilities> | undefined;
   private disposePromise: Promise<void> | undefined;
+  private nextGeneration = 1;
   private initializedClient: AppServerSessionClient | undefined;
+  private initializedGeneration: number | undefined;
   private capabilities: AppServerCapabilities | undefined;
+  private modelCacheClient: AppServerSessionClient | undefined;
+  private modelCacheGeneration: number | undefined;
+  private incompatibleFailure: CodexError | undefined;
   private handlerDisposables: Disposable[] = [];
   private disposed = false;
   private securityProtocolFailure = false;
@@ -117,6 +123,12 @@ export class AppServerSession {
     if (this.disposed) {
       return Promise.reject(new CodexError("cancelled", { action: "initializeCodex" }));
     }
+    if (this.restartPromise !== undefined) {
+      return this.restartPromise;
+    }
+    if (this.incompatibleFailure !== undefined) {
+      return Promise.reject(this.incompatibleFailure);
+    }
     if (
       this.capabilities !== undefined
       && this.initializedClient !== undefined
@@ -127,9 +139,12 @@ export class AppServerSession {
     if (this.initializationPromise !== undefined) {
       return this.initializationPromise;
     }
+    if (this.initializedClient?.isClosed === true) {
+      this.clearInitializedState();
+    }
 
     let operation!: Promise<AppServerCapabilities>;
-    operation = this.initializeInternal().finally(() => {
+    operation = this.initializeFromStart().finally(() => {
       if (this.initializationPromise === operation) {
         this.initializationPromise = undefined;
       }
@@ -138,9 +153,9 @@ export class AppServerSession {
     return operation;
   }
 
-  public async restart(): Promise<AppServerCapabilities> {
+  public restart(): Promise<AppServerCapabilities> {
     if (this.disposed) {
-      throw new CodexError("cancelled", { action: "restartCodex" });
+      return Promise.reject(new CodexError("cancelled", { action: "restartCodex" }));
     }
     if (this.restartPromise !== undefined) {
       return this.restartPromise;
@@ -168,14 +183,23 @@ export class AppServerSession {
     if (this.disposePromise !== undefined) {
       return this.disposePromise;
     }
-    this.disposed = true;
-    this.disposeClientHandlers();
-    this.modelCache.clear();
+    const inFlightRestart = this.restartPromise;
     const inFlightInitialization = this.initializationPromise;
+    this.disposed = true;
+    this.clearInitializedState();
     let operation!: Promise<void>;
     operation = (async (): Promise<void> => {
-      await this.supervisor.stop();
+      let stopFailure: unknown;
+      try {
+        await this.supervisor.stop();
+      } catch (cause) {
+        stopFailure = cause;
+      }
+      await inFlightRestart?.catch(() => undefined);
       await inFlightInitialization?.catch(() => undefined);
+      if (stopFailure !== undefined) {
+        throw stopFailure;
+      }
     })();
     this.disposePromise = operation;
     return operation;
@@ -185,16 +209,27 @@ export class AppServerSession {
     return this.securityProtocolFailure;
   }
 
-  private async initializeInternal(): Promise<AppServerCapabilities> {
+  private async initializeFromStart(): Promise<AppServerCapabilities> {
     const client = await this.supervisor.start();
+    this.throwIfDisposed("initializeCodex");
+    return this.initializeClient(client, this.nextGeneration++);
+  }
+
+  private async initializeClient(
+    client: AppServerSessionClient,
+    generation: number,
+  ): Promise<AppServerCapabilities> {
     this.disposeClientHandlers();
     let registrations: Disposable[] = [];
     let probingDynamicTools = false;
     try {
-      registrations = this.registerSafetyHandlers(client);
-      if (this.disposed) {
-        throw new CodexError("cancelled", { action: "initializeCodex" });
+      this.throwIfDisposed("initializeCodex");
+      if (client.isClosed === true) {
+        throw new CodexError("process", { action: "initializeCodex" });
       }
+      registrations = this.registerSafetyHandlers(client);
+      this.handlerDisposables = registrations;
+      this.throwIfDisposed("initializeCodex");
       const response = await client.request<unknown>("initialize", {
         clientInfo: {
           name: APP_SERVER_CLIENT_NAME,
@@ -202,8 +237,10 @@ export class AppServerSession {
         },
         capabilities: { experimentalApi: true },
       });
+      this.throwIfDisposed("initializeCodex");
       const capabilities = this.parseCapabilities(response);
       client.notify("initialized");
+      this.throwIfDisposed("initializeCodex");
       probingDynamicTools = true;
       await client.request("thread/start", {
         ...APP_SERVER_THREAD_CONFIG,
@@ -218,26 +255,28 @@ export class AppServerSession {
         }],
       });
       probingDynamicTools = false;
-      if (this.disposed) {
-        throw new CodexError("cancelled", { action: "initializeCodex" });
-      }
+      this.throwIfDisposed("initializeCodex");
       this.initializedClient = client;
+      this.initializedGeneration = generation;
       const probedCapabilities: AppServerCapabilities = {
         ...capabilities,
         dynamicTools: true,
       };
       this.capabilities = probedCapabilities;
-      this.handlerDisposables = registrations;
+      this.modelCache.clear();
+      this.modelCacheClient = client;
+      this.modelCacheGeneration = generation;
       this.supervisor.reportInitializationSuccess(client);
       return probedCapabilities;
     } catch (cause) {
       const failure = probingDynamicTools ? this.mapProbeFailure(cause) : this.mapInitializationFailure(cause);
-      for (const registration of registrations) {
-        registration.dispose();
-      }
+      this.disposeClientHandlers();
       if (this.initializedClient === client) {
-        this.initializedClient = undefined;
-        this.capabilities = undefined;
+        this.clearInitializedState();
+      }
+      if (failure.code === "incompatible") {
+        this.incompatibleFailure = failure;
+        this.clearInitializedState();
       }
       await this.supervisor.reportInitializationFailure(client, failure).catch(() => undefined);
       throw failure;
@@ -247,21 +286,19 @@ export class AppServerSession {
   private async restartInternal(): Promise<AppServerCapabilities> {
     const inFlightInitialization = this.initializationPromise;
     await inFlightInitialization?.catch(() => undefined);
-    if (this.disposed) {
-      throw new CodexError("cancelled", { action: "restartCodex" });
-    }
-    this.disposeClientHandlers();
-    this.initializedClient = undefined;
-    this.capabilities = undefined;
-    this.securityProtocolFailure = false;
-    this.modelCache.clear();
-    await this.supervisor.restart();
-    return this.initialize();
+    this.throwIfDisposed("restartCodex");
+    this.clearInitializedState();
+    this.incompatibleFailure = undefined;
+    const client = await this.supervisor.restart();
+    this.throwIfDisposed("restartCodex");
+    return this.initializeClient(client, this.nextGeneration++);
   }
 
   private async readAccountInternal(): Promise<AppServerAccount> {
-    const client = await this.requireInitializedClient();
+    const { client, generation } = await this.requireInitializedClient();
+    this.assertCurrentClient(client, generation, "account/read");
     const response = await client.request<unknown>("account/read", {});
+    this.assertCurrentClient(client, generation, "account/read");
     if (!isRecord(response) || !isRecord(response.account)) {
       throw protocolError("account/read", new Error("account/read result is malformed"));
     }
@@ -280,22 +317,88 @@ export class AppServerSession {
   }
 
   private async listModelsInternal(): Promise<readonly CodexModel[]> {
-    const client = await this.requireInitializedClient();
-    return this.modelCache.get(async () => {
-      if (client.isClosed === true) {
-        throw new CodexError("process", { action: "listModels" });
-      }
+    const { client, generation } = await this.requireInitializedClient();
+    this.assertCurrentClient(client, generation, "listModels");
+    this.prepareModelCache(client, generation);
+    const models = await this.modelCache.get(async () => {
+      this.assertCurrentClient(client, generation, "listModels");
       const response = await client.request<unknown>("model/list", { includeHidden: false });
+      this.assertCurrentClient(client, generation, "listModels");
       return parseAppServerModels(response, (diagnostics) => this.recordModelDiagnostics(diagnostics));
     });
+    this.assertCurrentClient(client, generation, "listModels");
+    return models;
   }
 
-  private async requireInitializedClient(): Promise<AppServerSessionClient> {
+  private async requireInitializedClient(): Promise<{
+    client: AppServerSessionClient;
+    generation: number;
+  }> {
     await this.initialize();
-    if (this.initializedClient === undefined) {
+    this.throwIfDisposed("startCodex");
+    if (this.initializedClient === undefined || this.initializedGeneration === undefined) {
       throw new CodexError("process", { action: "startCodex" });
     }
-    return this.initializedClient;
+    return {
+      client: this.initializedClient,
+      generation: this.initializedGeneration,
+    };
+  }
+
+  private throwIfDisposed(action: string): void {
+    if (this.disposed) {
+      throw new CodexError("cancelled", { action });
+    }
+  }
+
+  private clearInitializedState(): void {
+    this.disposeClientHandlers();
+    this.initializedClient = undefined;
+    this.initializedGeneration = undefined;
+    this.capabilities = undefined;
+    this.securityProtocolFailure = false;
+    this.modelCache.clear();
+    this.modelCacheClient = undefined;
+    this.modelCacheGeneration = undefined;
+  }
+
+  private prepareModelCache(client: AppServerSessionClient, generation: number): void {
+    if (this.modelCacheClient === client && this.modelCacheGeneration === generation) {
+      return;
+    }
+    this.modelCache.clear();
+    this.modelCacheClient = client;
+    this.modelCacheGeneration = generation;
+  }
+
+  private invalidateModelCache(client: AppServerSessionClient, generation: number): void {
+    if (this.modelCacheClient !== client || this.modelCacheGeneration !== generation) {
+      return;
+    }
+    this.modelCache.clear();
+    this.modelCacheClient = undefined;
+    this.modelCacheGeneration = undefined;
+  }
+
+  private assertCurrentClient(
+    client: AppServerSessionClient,
+    generation: number,
+    action: string,
+  ): void {
+    this.throwIfDisposed(action);
+    if (
+      this.initializedClient === client
+      && this.initializedGeneration === generation
+      && client.isClosed !== true
+    ) {
+      return;
+    }
+    if (this.initializedClient === client && client.isClosed === true) {
+      this.clearInitializedState();
+    } else {
+      this.invalidateModelCache(client, generation);
+    }
+    throw new CodexError("process", { action });
   }
 
   private parseCapabilities(payload: unknown): AppServerCapabilities {
@@ -326,40 +429,80 @@ export class AppServerSession {
 
   private mapInitializationFailure(cause: unknown): CodexError {
     if (cause instanceof CodexError) {
+      if (this.isCapabilityUnsupportedFailure(cause)) {
+        return this.incompatibleCapabilityError();
+      }
       return cause;
     }
     return protocolError("initialize", cause);
   }
 
   private mapProbeFailure(cause: unknown): CodexError {
-    if (
-      cause instanceof CodexError
-      && (cause.code === "cancelled" || cause.code === "timeout" || cause.code === "process")
-    ) {
+    if (cause instanceof CodexError) {
+      if (this.isCapabilityUnsupportedFailure(cause)) {
+        return this.incompatibleCapabilityError();
+      }
       return cause;
     }
-    return new CodexError("incompatible", { action: "upgradeCodex", cause });
+    return protocolError("thread/start", cause);
+  }
+
+  private incompatibleCapabilityError(): CodexError {
+    return new CodexError("incompatible", {
+      action: "upgradeCodex",
+      cause: new Error("required App Server capability is unavailable"),
+    });
+  }
+
+  private isCapabilityUnsupportedFailure(cause: CodexError): boolean {
+    if (cause.code !== "protocol") {
+      return false;
+    }
+    const remote = cause.cause instanceof JsonRpcRemoteError
+      ? { code: cause.cause.rpcCode, message: cause.cause.rpcMessage }
+      : isRecord(cause.cause)
+        && typeof cause.cause.code === "number"
+        && typeof cause.cause.message === "string"
+        ? { code: cause.cause.code, message: cause.cause.message }
+        : undefined;
+    if (remote === undefined || (remote.code !== -32601 && remote.code !== -32602)) {
+      return false;
+    }
+    if (/(dynamic[\s_-]*tools?|experimental[\s_-]*api)/i.test(remote.message)) {
+      return true;
+    }
+    return cause.action === "thread/start"
+      && remote.code === -32601
+      && /(method|procedure|request).*(not found|unknown|unsupported|unavailable)/i.test(remote.message);
   }
 
   private registerSafetyHandlers(client: AppServerSessionClient): Disposable[] {
-    const registrations: Disposable[] = [];
-    const deny: JsonRpcServerRequestHandler = () => "deny";
-    for (const method of APPROVAL_METHODS) {
-      registrations.push(client.onServerRequest(method, deny));
+    if (typeof client.onServerNotification !== "function") {
+      throw this.incompatibleCapabilityError();
     }
+    const registrations: Disposable[] = [];
+    try {
+      const deny: JsonRpcServerRequestHandler = () => "deny";
+      for (const method of APPROVAL_METHODS) {
+        registrations.push(client.onServerRequest(method, deny));
+      }
 
-    const itemStartedHandler: JsonRpcServerRequestHandler = async (params) => {
-      await this.handleItemStarted(client, params);
-      return null;
-    };
-    registrations.push(client.onServerRequest("item/started", itemStartedHandler));
-    if (client.onServerNotification !== undefined) {
+      const itemStartedHandler: JsonRpcServerRequestHandler = async (params) => {
+        await this.handleItemStarted(client, params);
+        return null;
+      };
+      registrations.push(client.onServerRequest("item/started", itemStartedHandler));
       const itemStartedNotification: JsonRpcServerNotificationHandler = async (params) => {
         await this.handleItemStarted(client, params);
       };
       registrations.push(client.onServerNotification("item/started", itemStartedNotification));
+      return registrations;
+    } catch (cause) {
+      for (const registration of registrations) {
+        registration.dispose();
+      }
+      throw cause;
     }
-    return registrations;
   }
 
   private async handleItemStarted(

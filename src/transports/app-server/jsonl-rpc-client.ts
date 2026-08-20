@@ -6,6 +6,7 @@ import {
   type Disposable,
   type JsonRpcId,
   type JsonRpcMessage,
+  JsonRpcRemoteError,
   type JsonRpcServerNotificationHandler,
   type JsonRpcServerRequestHandler,
   processError,
@@ -384,7 +385,11 @@ export class JsonlRpcClient {
     this.cleanupPending(pending);
 
     if (hasOwn(message, "error")) {
-      pending.reject(protocolError(pending.method, new Error("remote JSON-RPC request failed")));
+      const error = message.error as { code: number; message: string };
+      pending.reject(protocolError(
+        pending.method,
+        new JsonRpcRemoteError(error.code, error.message),
+      ));
       return;
     }
     pending.resolve(message.result);
