@@ -16,9 +16,9 @@ export class SafeLogger {
     const redacted = redactMetadata(metadata) as Record<string, unknown>;
     this.sink.appendLine(
       JSON.stringify({
+        ...redacted,
         time: new Date().toISOString(),
         event: name,
-        ...redacted,
       }),
     );
   }

@@ -32,7 +32,14 @@ const isSensitiveKey = (key: string): boolean => {
 
 const isUriKey = (key: string): boolean => {
   const normalizedKey = normalizeKey(key);
-  return normalizedKey === "uri" || normalizedKey === "url" || normalizedKey.endsWith("uri");
+  return (
+    normalizedKey === "uri" ||
+    normalizedKey === "url" ||
+    normalizedKey.endsWith("uri") ||
+    normalizedKey.endsWith("uris") ||
+    normalizedKey.endsWith("url") ||
+    normalizedKey.endsWith("urls")
+  );
 };
 
 const stripUriQueryAndFragment = (value: string): string => {
@@ -45,7 +52,11 @@ const stripUriQueryAndFragment = (value: string): string => {
   return cutIndex === undefined ? value : value.slice(0, cutIndex);
 };
 
-const redactValue = (value: unknown, seen: WeakSet<object>): unknown => {
+const redactValue = (
+  value: unknown,
+  seen: WeakSet<object>,
+  uriLike = false,
+): unknown => {
   if (value instanceof CodexError) {
     const safeError: Record<string, unknown> = { code: value.code };
     if (value.action !== undefined) {
@@ -57,12 +68,20 @@ const redactValue = (value: unknown, seen: WeakSet<object>): unknown => {
     return safeError;
   }
 
+  if (value instanceof Error) {
+    return REDACTED;
+  }
+
+  if (uriLike && typeof value === "string") {
+    return stripUriQueryAndFragment(value);
+  }
+
   if (Array.isArray(value)) {
     if (seen.has(value)) {
       return REDACTED;
     }
     seen.add(value);
-    const redacted = value.map((entry) => redactValue(entry, seen));
+    const redacted = value.map((entry) => redactValue(entry, seen, uriLike));
     seen.delete(value);
     return redacted;
   }
@@ -80,10 +99,8 @@ const redactValue = (value: unknown, seen: WeakSet<object>): unknown => {
   for (const [key, entry] of Object.entries(value)) {
     if (isSensitiveKey(key)) {
       redacted[key] = REDACTED;
-    } else if (isUriKey(key) && typeof entry === "string") {
-      redacted[key] = stripUriQueryAndFragment(entry);
     } else {
-      redacted[key] = redactValue(entry, seen);
+      redacted[key] = redactValue(entry, seen, uriLike || isUriKey(key));
     }
   }
 
