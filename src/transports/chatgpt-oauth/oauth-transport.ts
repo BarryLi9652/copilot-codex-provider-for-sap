@@ -24,6 +24,8 @@ const MODEL_CACHE_TTL_MS = 300_000;
 interface ActiveOperation {
   readonly signal: AbortSignal;
   abort(): void;
+  close(): Promise<void>;
+  attachCloser(closer: () => Promise<void>): void;
   finish(): void;
   readonly done: Promise<void>;
 }
@@ -77,7 +79,24 @@ export class ChatGptOAuthTransport implements CodexTransport {
     if (this.disposed) {
       throw new CodexError("incompatible", { action: "restartExtension" });
     }
-    return this.generateEvents(request, signal);
+    const operation = this.beginOperation(signal);
+    const source = this.generateEvents(request, operation);
+    const iterator = source[Symbol.asyncIterator]();
+    operation.attachCloser(async () => {
+      await iterator.return?.();
+    });
+
+    const wrapped: AsyncIterableIterator<TransportEvent> = {
+      next: (value?: unknown) => iterator.next(value),
+      return: async (_value?: unknown) => {
+        await operation.close();
+        return { done: true, value: undefined };
+      },
+      [Symbol.asyncIterator](): AsyncIterableIterator<TransportEvent> {
+        return this;
+      },
+    };
+    return wrapped;
   }
 
   public async dispose(): Promise<void> {
@@ -87,10 +106,8 @@ export class ChatGptOAuthTransport implements CodexTransport {
     this.disposed = true;
     this.lifecycleController.abort();
     const active = [...this.activeOperations];
-    for (const operation of active) {
-      operation.abort();
-    }
     this.modelCache.clear();
+    await Promise.allSettled(active.map((operation) => operation.close()));
     await Promise.allSettled(active.map((operation) => operation.done));
   }
 
@@ -105,9 +122,8 @@ export class ChatGptOAuthTransport implements CodexTransport {
 
   private async *generateEvents(
     request: CodexRequest,
-    signal: AbortSignal,
+    operation: ActiveOperation,
   ): AsyncIterable<TransportEvent> {
-    const operation = this.beginOperation(signal);
     try {
       const models = await this.modelCache.get(() => this.loadModels(operation.signal));
       if (operation.signal.aborted) {
@@ -158,6 +174,8 @@ export class ChatGptOAuthTransport implements CodexTransport {
       resolveDone = resolve;
     });
     let finished = false;
+    let closer: (() => Promise<void>) | undefined;
+    let closePromise: Promise<void> | undefined;
     const abort = (): void => {
       if (!controller.signal.aborted) {
         controller.abort();
@@ -168,6 +186,28 @@ export class ChatGptOAuthTransport implements CodexTransport {
     const operation: ActiveOperation = {
       signal: controller.signal,
       abort,
+      close: () => {
+        if (closePromise !== undefined) {
+          return closePromise;
+        }
+        closePromise = (async () => {
+          abort();
+          if (closer !== undefined) {
+            try {
+              await closer();
+            } catch {
+              // Iterator close errors must not replace the primary safe error.
+            } finally {
+              operation.finish();
+            }
+          }
+          await done;
+        })();
+        return closePromise;
+      },
+      attachCloser: (candidate) => {
+        closer = candidate;
+      },
       done,
       finish: () => {
         if (finished) {

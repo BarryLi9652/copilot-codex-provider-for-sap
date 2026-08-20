@@ -90,8 +90,10 @@ interface FakeReadResult {
 function createTrackedBody(options: {
   chunks?: readonly Uint8Array[];
   pendingRead?: boolean;
+  readError?: Error;
   cancelError?: Error;
   onCancel?: () => void;
+  onRead?: () => void;
 } = {}): TrackedBody {
   let bodyCancelCount = 0;
   let readerCancelCount = 0;
@@ -111,6 +113,10 @@ function createTrackedBody(options: {
   const reader = {
     read: async (): Promise<FakeReadResult> => {
       resolveReadStarted();
+      options.onRead?.();
+      if (options.readError !== undefined) {
+        throw options.readError;
+      }
       const chunk = chunks.shift();
       if (chunk !== undefined) {
         return { done: false, value: chunk };
@@ -357,6 +363,72 @@ test("OAuth transport refreshes once before replaying and preserves streamed tex
     } },
     { type: "completed" },
   ]);
+});
+
+test("401 body cleanup, forced refresh, and replay all happen before the first yielded event", async () => {
+  const timeline: string[] = [];
+  let responseCalls = 0;
+  const firstBody = createTrackedBody({
+    onCancel: () => timeline.push("first-401-body-cancelled"),
+  });
+  const replayBody = createTrackedBody({
+    chunks: [encoder.encode(
+      "event: response.output_text.delta\ndata: {\"delta\":\"replayed\"}\n\n" +
+      "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+    )],
+    onRead: () => timeline.push("first-output-available"),
+  });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async (forceRefresh = false) => {
+      timeline.push(forceRefresh ? "refresh-start" : "token-start");
+      if (forceRefresh) {
+        timeline.push("refresh-resolved");
+      }
+      return { token: forceRefresh ? "access-new" : "access-old" };
+    },
+  }, {
+    fetch: async (url) => {
+      if (url.includes("/models")) {
+        return jsonResponse(validModelPayload());
+      }
+      responseCalls += 1;
+      if (responseCalls === 1) {
+        timeline.push("first-response-fetch");
+        return jsonResponse({}, 401, {}, firstBody.body);
+      }
+      timeline.push("replay-fetch");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: replayBody.body,
+        json: async () => ({}),
+      };
+    },
+  });
+
+  const signal = new AbortController().signal;
+  await transport.listModels({ silent: true }, signal);
+  const events: TransportEvent[] = [];
+  for await (const event of transport.generate(createRequest(), signal)) {
+    timeline.push(`yield:${event.type}`);
+    events.push(event);
+  }
+
+  const index = (marker: string): number => {
+    const position = timeline.indexOf(marker);
+    assert.notEqual(position, -1, `missing timeline marker ${marker}`);
+    return position;
+  };
+  assert.ok(index("first-401-body-cancelled") < index("refresh-start"));
+  assert.ok(index("refresh-resolved") < index("replay-fetch"));
+  assert.ok(index("replay-fetch") < index("first-output-available"));
+  assert.ok(index("first-output-available") < index("yield:text-delta"));
+  assert.deepEqual(events, [
+    { type: "text-delta", text: "replayed" },
+    { type: "completed" },
+  ]);
+  assert.equal(firstBody.bodyCancelCalls(), 1);
 });
 
 test("429 maps to a typed rate-limit error and preserves Retry-After milliseconds", async () => {
@@ -777,6 +849,103 @@ test("early async-iterator return cancels the reader once and observes cancel fa
   assert.equal(body.readerCancelCalls(), 1);
   assert.equal(body.releaseLockCalls(), 1);
   assert.equal(requestSignal?.aborted, true);
+});
+
+test("reader cleanup failure does not replace a primary stream read error or become unhandled", async () => {
+  const body = createTrackedBody({
+    readError: new Error("primary stream read failed"),
+    cancelError: new Error("reader cancel failed"),
+  });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const transport = new ChatGptOAuthTransport({
+      getAccessToken: async () => ({ token: "access" }),
+    }, {
+      fetch: async (url) => url.includes("/models")
+        ? jsonResponse(validModelPayload())
+        : {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          body: body.body,
+          json: async () => ({}),
+        },
+    });
+    await transport.listModels({ silent: true }, new AbortController().signal);
+
+    await assert.rejects(
+      (async () => {
+        for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
+          // The first read fails before any event can be yielded.
+        }
+      })(),
+      (error: unknown) => error instanceof CodexError && error.code === "network",
+    );
+    assert.equal(body.readerCancelCalls(), 1);
+    assert.equal(body.releaseLockCalls(), 1);
+  } finally {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test("dispose closes an iterator paused after a yielded event without consumer cooperation", async () => {
+  const body = createTrackedBody({
+    chunks: [encoder.encode("event: response.output_text.delta\ndata: {\"delta\":\"paused\"}\n\n")],
+    pendingRead: true,
+    cancelError: new Error("reader cancel failed during dispose"),
+  });
+  let requestSignal: AbortSignal | undefined;
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async (url, init = {}) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : (requestSignal = init.signal, {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: body.body,
+        json: async () => ({}),
+      }),
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const iterator = transport.generate(createRequest(), new AbortController().signal)[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  assert.deepEqual(first.value, { type: "text-delta", text: "paused" });
+
+  const disposePromise = transport.dispose();
+  const timeout = Symbol("dispose timed out");
+  let outcome: unknown;
+  try {
+    outcome = await Promise.race([
+      disposePromise.then(() => "disposed", (error: unknown) => error),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 100)),
+    ]);
+  } finally {
+    if (outcome === timeout) {
+      await iterator.return?.();
+      await disposePromise;
+    }
+  }
+
+  assert.equal(outcome, "disposed");
+  await assert.doesNotReject(async () => { await iterator.return?.(); });
+  const afterReturn = await iterator.next();
+  assert.equal(afterReturn.done, true);
+  assert.equal(body.readerCancelCalls(), 1);
+  assert.equal(body.releaseLockCalls(), 1);
+  assert.equal(body.bodyCancelCalls(), 0);
+  assert.equal(requestSignal?.aborted, true);
+  await assert.rejects(
+    transport.listModels({ silent: true }, new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "incompatible",
+  );
 });
 
 test("malformed and empty model catalogs map to protocol errors", async () => {
