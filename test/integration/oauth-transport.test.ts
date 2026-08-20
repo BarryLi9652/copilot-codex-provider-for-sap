@@ -56,15 +56,104 @@ class FakeSecretStore implements SecretStore {
   }
 }
 
-function jsonResponse(payload: unknown, status = 200, headers: Record<string, string> = {}): ChatGptHttpResponse {
+function jsonResponse(
+  payload: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+  body: ChatGptHttpResponse["body"] = null,
+): ChatGptHttpResponse {
   return {
     ok: status >= 200 && status < 300,
     status,
     headers: {
       get: (name: string) => headers[name.toLowerCase()] ?? null,
     },
-    body: null,
+    body,
     json: async () => payload,
+  };
+}
+
+interface TrackedBody {
+  readonly body: ChatGptHttpResponse["body"];
+  readonly bodyCancelCalls: () => number;
+  readonly readerCancelCalls: () => number;
+  readonly releaseLockCalls: () => number;
+  readonly readStarted: Promise<void>;
+  readonly resolveRead: () => void;
+}
+
+interface FakeReadResult {
+  done: boolean;
+  value?: Uint8Array;
+}
+
+function createTrackedBody(options: {
+  chunks?: readonly Uint8Array[];
+  pendingRead?: boolean;
+  cancelError?: Error;
+  onCancel?: () => void;
+} = {}): TrackedBody {
+  let bodyCancelCount = 0;
+  let readerCancelCount = 0;
+  let releaseLockCount = 0;
+  let pendingReadResolve: ((result: FakeReadResult) => void) | undefined;
+  let resolveReadStarted!: () => void;
+  const readStarted = new Promise<void>((resolve) => {
+    resolveReadStarted = resolve;
+  });
+  const chunks = [...(options.chunks ?? [])];
+
+  const finishPendingRead = (): void => {
+    pendingReadResolve?.({ done: true });
+    pendingReadResolve = undefined;
+  };
+
+  const reader = {
+    read: async (): Promise<FakeReadResult> => {
+      resolveReadStarted();
+      const chunk = chunks.shift();
+      if (chunk !== undefined) {
+        return { done: false, value: chunk };
+      }
+      if (!options.pendingRead) {
+        return { done: true };
+      }
+      return new Promise<FakeReadResult>((resolve) => {
+        pendingReadResolve = resolve;
+      });
+    },
+    cancel: async (): Promise<void> => {
+      readerCancelCount += 1;
+      options.onCancel?.();
+      finishPendingRead();
+      if (options.cancelError !== undefined) {
+        throw options.cancelError;
+      }
+    },
+    releaseLock: (): void => {
+      releaseLockCount += 1;
+    },
+  } as unknown as ReadableStreamDefaultReader<Uint8Array>;
+
+  const body = {
+    getReader: () => reader,
+    cancel: async (): Promise<void> => {
+      bodyCancelCount += 1;
+      options.onCancel?.();
+      finishPendingRead();
+      if (options.cancelError !== undefined) {
+        throw options.cancelError;
+      }
+    },
+  } as unknown as ReadableStream<Uint8Array>;
+
+  return {
+    body,
+    bodyCancelCalls: () => bodyCancelCount,
+    readerCancelCalls: () => readerCancelCount,
+    releaseLockCalls: () => releaseLockCount,
+    readStarted,
+    resolveRead: finishPendingRead,
   };
 }
 
@@ -146,6 +235,22 @@ function modelFromCatalog(): CodexModel {
       toolCalling: true,
       parallelToolCalls: true,
     },
+  };
+}
+
+function validModelPayload(): Record<string, unknown> {
+  return {
+    models: [{
+      slug: "gpt-5-codex",
+      display_name: "GPT-5 Codex",
+      visibility: "list",
+      context_window: 272_000,
+      max_context_window: 400_000,
+      input_modalities: ["text", "image"],
+      shell_type: "shell_command",
+      supports_parallel_tool_calls: true,
+      comp_hash: "codex-5-2026-08",
+    }],
   };
 }
 
@@ -314,9 +419,11 @@ test("a request timeout maps to timeout", async () => {
 test("a second 401 after the forced refresh maps to unauthorized", async () => {
   let refreshCalls = 0;
   let requests = 0;
+  const firstBody = createTrackedBody({ cancelError: new Error("first 401 body close failed") });
+  const secondBody = createTrackedBody({ cancelError: new Error("second 401 body close failed") });
   const fetch: ChatGptFetch = async () => {
     requests += 1;
-    return jsonResponse({}, 401);
+    return jsonResponse({}, 401, {}, requests === 1 ? firstBody.body : secondBody.body);
   };
   const transport = new ChatGptOAuthTransport({
     getAccessToken: async (forceRefresh = false) => {
@@ -333,6 +440,118 @@ test("a second 401 after the forced refresh maps to unauthorized", async () => {
   );
   assert.equal(refreshCalls, 1);
   assert.equal(requests, 2);
+  assert.equal(firstBody.bodyCancelCalls(), 1);
+  assert.equal(secondBody.bodyCancelCalls(), 1);
+});
+
+test("every non-2xx response body is cancelled before the typed status error", async () => {
+  const body = createTrackedBody({ cancelError: new Error("status body close failed") });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async () => jsonResponse({}, 429, { "retry-after": "1" }, body.body),
+  });
+
+  await assert.rejects(
+    transport.listModels({ silent: true }, new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "rateLimited",
+  );
+  assert.equal(body.bodyCancelCalls(), 1);
+});
+
+test("cancellation during first 401 body cleanup prevents refresh and replay", async () => {
+  const controller = new AbortController();
+  let refreshCalls = 0;
+  let requests = 0;
+  const body = createTrackedBody({ onCancel: () => controller.abort() });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async (forceRefresh = false) => {
+      if (forceRefresh) {
+        refreshCalls += 1;
+      }
+      return { token: "access" };
+    },
+  }, {
+    fetch: async () => {
+      requests += 1;
+      return jsonResponse({}, 401, {}, body.body);
+    },
+  });
+
+  await assert.rejects(
+    transport.listModels({ silent: true }, controller.signal),
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  assert.equal(body.bodyCancelCalls(), 1);
+  assert.equal(refreshCalls, 0);
+  assert.equal(requests, 1);
+});
+
+test("pending token acquisition observes cancellation and returns promptly", async () => {
+  const controller = new AbortController();
+  let rejectToken!: (error: Error) => void;
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const token = new Promise<{ token: string }>((resolve, reject) => {
+    void resolve;
+    rejectToken = reject;
+  });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => {
+      resolveStarted();
+      return token;
+    },
+  }, {
+    fetch: async () => { throw new Error("fetch must not start"); },
+  });
+  const pending = transport.listModels({ silent: true }, controller.signal);
+  await started;
+  controller.abort();
+
+  const timeout = Symbol("timed out");
+  const outcome = await Promise.race([
+    pending.then(() => "resolved", (error: unknown) => error),
+    new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 100)),
+  ]);
+  assert.ok(outcome instanceof CodexError && outcome.code === "cancelled");
+  rejectToken(new Error("late token rejection"));
+  await Promise.allSettled([pending]);
+  assert.notEqual(outcome, timeout);
+});
+
+test("pending token acquisition observes timeout and returns promptly", async () => {
+  let rejectToken!: (error: Error) => void;
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolveStarted = resolve;
+  });
+  const token = new Promise<{ token: string }>((resolve, reject) => {
+    void resolve;
+    rejectToken = reject;
+  });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => {
+      resolveStarted();
+      return token;
+    },
+  }, {
+    fetch: async () => { throw new Error("fetch must not start"); },
+    timeoutMs: 5,
+  });
+  const pending = transport.listModels({ silent: true }, new AbortController().signal);
+  await started;
+
+  const timeout = Symbol("timed out");
+  const outcome = await Promise.race([
+    pending.then(() => "resolved", (error: unknown) => error),
+    new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 100)),
+  ]);
+  assert.ok(outcome instanceof CodexError && outcome.code === "timeout");
+  rejectToken(new Error("late token rejection"));
+  await Promise.allSettled([pending]);
+  assert.notEqual(outcome, timeout);
 });
 
 test("a stream failure after output starts does not replay the request", async () => {
@@ -372,4 +591,373 @@ test("a stream failure after output starts does not replay the request", async (
   assert.equal(modelsCalls, 1);
   assert.equal(responseCalls, 1);
   assert.deepEqual(events, [{ type: "text-delta", text: "partial" }]);
+});
+
+test("abort during a stream body read cancels the reader once before release", async () => {
+  const controller = new AbortController();
+  const body = createTrackedBody({ pendingRead: true });
+  let responseCalls = 0;
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async (url) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : (responseCalls += 1, {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: body.body,
+        json: async () => ({}),
+      }),
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const generation = (async () => {
+    for await (const _event of transport.generate(createRequest(), controller.signal)) {
+      // The tracked stream never yields a body chunk.
+    }
+  })();
+  await body.readStarted;
+  controller.abort();
+
+  const timedOut = Symbol("timed out");
+  const outcome = await Promise.race([
+    generation.then(() => "resolved", (error: unknown) => error),
+    new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), 100)),
+  ]);
+  if (outcome === timedOut) {
+    body.resolveRead();
+    await Promise.allSettled([generation]);
+    assert.fail("abort did not stop the pending body read promptly");
+  }
+  assert.ok(outcome instanceof CodexError && outcome.code === "cancelled");
+  assert.equal(responseCalls, 1);
+  assert.equal(body.readerCancelCalls(), 1);
+  assert.equal(body.releaseLockCalls(), 1);
+});
+
+test("timeout during a stream body read cancels the reader once before release", async () => {
+  const body = createTrackedBody({ pendingRead: true });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    timeoutMs: 5,
+    fetch: async (url) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: body.body,
+        json: async () => ({}),
+      },
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const generation = (async () => {
+    for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
+      // The tracked stream never yields a body chunk.
+    }
+  })();
+  await body.readStarted;
+
+  const timedOut = Symbol("timed out");
+  const outcome = await Promise.race([
+    generation.then(() => "resolved", (error: unknown) => error),
+    new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), 100)),
+  ]);
+  if (outcome === timedOut) {
+    body.resolveRead();
+    await Promise.allSettled([generation]);
+    assert.fail("timeout did not stop the pending body read promptly");
+  }
+  assert.ok(outcome instanceof CodexError && outcome.code === "timeout");
+  assert.equal(body.readerCancelCalls(), 1);
+  assert.equal(body.releaseLockCalls(), 1);
+});
+
+test("abort during model JSON body read cancels the response body", async () => {
+  const controller = new AbortController();
+  const body = createTrackedBody();
+  let resolveJsonStarted!: () => void;
+  const jsonStarted = new Promise<void>((resolve) => {
+    resolveJsonStarted = resolve;
+  });
+  let resolveJson!: (payload: unknown) => void;
+  const json = new Promise<unknown>((resolve) => {
+    resolveJson = resolve;
+  });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      body: body.body,
+      json: async () => {
+        resolveJsonStarted();
+        return json;
+      },
+    }),
+  });
+  const pending = transport.listModels({ silent: true }, controller.signal);
+  await jsonStarted;
+  controller.abort();
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  assert.equal(body.bodyCancelCalls(), 1);
+  resolveJson(validModelPayload());
+  await Promise.allSettled([pending]);
+});
+
+test("timeout during model JSON body read cancels the response body", async () => {
+  const body = createTrackedBody();
+  let resolveJsonStarted!: () => void;
+  const jsonStarted = new Promise<void>((resolve) => {
+    resolveJsonStarted = resolve;
+  });
+  let resolveJson!: (payload: unknown) => void;
+  const json = new Promise<unknown>((resolve) => {
+    resolveJson = resolve;
+  });
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    timeoutMs: 5,
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      body: body.body,
+      json: async () => {
+        resolveJsonStarted();
+        return json;
+      },
+    }),
+  });
+  const pending = transport.listModels({ silent: true }, new AbortController().signal);
+  await jsonStarted;
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "timeout",
+  );
+  assert.equal(body.bodyCancelCalls(), 1);
+  resolveJson(validModelPayload());
+  await Promise.allSettled([pending]);
+});
+
+test("early async-iterator return cancels the reader once and observes cancel failure", async () => {
+  const body = createTrackedBody({
+    chunks: [encoder.encode("event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n")],
+    pendingRead: true,
+    cancelError: new Error("reader cancel failed"),
+  });
+  let requestSignal: AbortSignal | undefined;
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async (url, init = {}) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : (requestSignal = init.signal, {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: body.body,
+        json: async () => ({}),
+      }),
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const iterator = transport.generate(createRequest(), new AbortController().signal)[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  assert.deepEqual(first.value, { type: "text-delta", text: "partial" });
+  await assert.doesNotReject(async () => { await iterator.return?.(); });
+  assert.equal(body.readerCancelCalls(), 1);
+  assert.equal(body.releaseLockCalls(), 1);
+  assert.equal(requestSignal?.aborted, true);
+});
+
+test("malformed and empty model catalogs map to protocol errors", async () => {
+  for (const payload of [{}, { models: [] }]) {
+    const transport = new ChatGptOAuthTransport({
+      getAccessToken: async () => ({ token: "access" }),
+    }, {
+      fetch: async () => jsonResponse(payload),
+    });
+
+    await assert.rejects(
+      transport.listModels({ silent: true }, new AbortController().signal),
+      (error: unknown) => error instanceof CodexError && error.code === "protocol",
+    );
+  }
+});
+
+test("malformed and empty SSE bodies map to protocol errors", async () => {
+  for (const chunks of [
+    [encoder.encode("not-json")],
+    [],
+  ]) {
+    const transport = new ChatGptOAuthTransport({
+      getAccessToken: async () => ({ token: "access" }),
+    }, {
+      fetch: async (url) => url.includes("/models")
+        ? jsonResponse(validModelPayload())
+        : streamResponse(chunks),
+    });
+    await transport.listModels({ silent: true }, new AbortController().signal);
+    const events: TransportEvent[] = [];
+
+    await assert.rejects(
+      (async () => {
+        for await (const event of transport.generate(createRequest(), new AbortController().signal)) {
+          events.push(event);
+        }
+      })(),
+      (error: unknown) => error instanceof CodexError && error.code === "protocol",
+    );
+    assert.deepEqual(events, []);
+  }
+});
+
+test("EOF without a terminal event flushes parser output before protocol failure", async () => {
+  const finalFrame = encoder.encode(
+    "event: response.output_text.delta\ndata: {\"delta\":\"flushed\"}",
+  );
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async (url) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : streamResponse([finalFrame]),
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const events: TransportEvent[] = [];
+
+  await assert.rejects(
+    (async () => {
+      for await (const event of transport.generate(createRequest(), new AbortController().signal)) {
+        events.push(event);
+      }
+    })(),
+    (error: unknown) => error instanceof CodexError && error.code === "protocol",
+  );
+  assert.deepEqual(events, [{ type: "text-delta", text: "flushed" }]);
+});
+
+test("two OAuth transports have independent model caches", async () => {
+  let modelCalls = 0;
+  const fetch: ChatGptFetch = async () => {
+    modelCalls += 1;
+    return jsonResponse(validModelPayload());
+  };
+  const first = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, { fetch });
+  const second = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, { fetch });
+
+  await first.listModels({ silent: true }, new AbortController().signal);
+  await second.listModels({ silent: true }, new AbortController().signal);
+
+  assert.equal(modelCalls, 2);
+});
+
+test("forceRefresh invalidates only the requesting transport cache", async () => {
+  let modelCalls = 0;
+  const fetch: ChatGptFetch = async () => {
+    modelCalls += 1;
+    return jsonResponse(validModelPayload());
+  };
+  const first = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, { fetch });
+  const second = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, { fetch });
+  const signal = new AbortController().signal;
+
+  await first.listModels({ silent: true }, signal);
+  await second.listModels({ silent: true }, signal);
+  await first.listModels({ silent: true, forceRefresh: true }, signal);
+  await second.listModels({ silent: true }, signal);
+
+  assert.equal(modelCalls, 3);
+});
+
+test("pre-aborted forceRefresh does not clear the valid model cache", async () => {
+  let modelCalls = 0;
+  const fetch: ChatGptFetch = async () => {
+    modelCalls += 1;
+    return jsonResponse(validModelPayload());
+  };
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, { fetch });
+  const firstSignal = new AbortController();
+  await transport.listModels({ silent: true }, firstSignal.signal);
+  firstSignal.abort();
+
+  await assert.rejects(
+    transport.listModels({ silent: true, forceRefresh: true }, firstSignal.signal),
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  assert.equal(modelCalls, 1);
+});
+
+test("invalid request timeout values are rejected safely", () => {
+  const tokenSource = { getAccessToken: async () => ({ token: "access" }) };
+  for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.throws(
+      () => new ChatGptOAuthTransport(tokenSource, { timeoutMs }),
+      (error: unknown) => error instanceof RangeError,
+    );
+  }
+  assert.doesNotThrow(() => new ChatGptOAuthTransport(tokenSource, { timeoutMs: 1 }));
+});
+
+test("dispose cancels active requests and makes future use deterministic", async () => {
+  const body = createTrackedBody({ pendingRead: true });
+  let responseCalls = 0;
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, {
+    fetch: async (url) => url.includes("/models")
+      ? jsonResponse(validModelPayload())
+      : (responseCalls += 1, {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: body.body,
+        json: async () => ({}),
+      }),
+  });
+  await transport.listModels({ silent: true }, new AbortController().signal);
+  const generation = (async () => {
+    for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
+      // The tracked stream never yields a body chunk.
+    }
+  })();
+  await body.readStarted;
+
+  await transport.dispose();
+  const outcome = await Promise.race([
+    generation.then(() => "resolved", (error: unknown) => error),
+    new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol("timed out")), 100)),
+  ]);
+  assert.ok(outcome instanceof CodexError && outcome.code === "cancelled");
+  assert.equal(body.readerCancelCalls(), 1);
+  assert.equal(body.releaseLockCalls(), 1);
+  assert.equal(responseCalls, 1);
+  await assert.rejects(
+    transport.listModels({ silent: true }, new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "incompatible",
+  );
+  assert.throws(
+    () => transport.generate(createRequest(), new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "incompatible",
+  );
 });

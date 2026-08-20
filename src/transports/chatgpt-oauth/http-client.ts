@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { CodexError } from "../../core/errors.js";
-import { OAuthError, type OAuthManager } from "./oauth-manager.js";
+import { OAuthError } from "./oauth-manager.js";
 import {
   CHATGPT_CODEX_PROFILE,
 } from "./profile.js";
@@ -34,7 +34,7 @@ export type ChatGptFetch = (
 ) => Promise<ChatGptHttpResponse>;
 
 export interface ChatGptTokenSource {
-  getAccessToken(forceRefresh?: boolean): Promise<OAuthCredentials>;
+  getAccessToken(forceRefresh?: boolean, signal?: AbortSignal): Promise<OAuthCredentials>;
 }
 
 export interface ChatGptHttpClientOptions {
@@ -82,11 +82,15 @@ export class ChatGptHttpClient {
   private readonly now: () => number;
 
   public constructor(
-    private readonly tokenSource: ChatGptTokenSource | OAuthManager,
+    private readonly tokenSource: ChatGptTokenSource,
     options: ChatGptHttpClientOptions = {},
   ) {
     this.fetch = options.fetch ?? defaultFetch;
-    this.timeoutMs = options.timeoutMs ?? CHATGPT_DEFAULT_REQUEST_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? CHATGPT_DEFAULT_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError("timeoutMs must be a finite number greater than zero");
+    }
+    this.timeoutMs = timeoutMs;
     this.idFactory = options.idFactory ?? randomUUID;
     this.userAgent = options.userAgent ?? `codex_cli_rs/${CHATGPT_CODEX_PROFILE.modelsClientVersion}`;
     this.now = options.now ?? Date.now;
@@ -102,10 +106,22 @@ export class ChatGptHttpClient {
       );
       this.assertActive(context);
       let payload: unknown;
+      let bodyRead = false;
       try {
-        payload = await response.json();
+        payload = await this.awaitWithContext(
+          Promise.resolve().then(() => response.json()),
+          context,
+        );
+        bodyRead = true;
       } catch (error) {
+        if (error instanceof CodexError) {
+          throw error;
+        }
         throw new CodexError("protocol", { action: "showDiagnostics", cause: error });
+      } finally {
+        if (!bodyRead) {
+          await this.cancelResponseBody(response);
+        }
       }
       this.assertActive(context);
       return payload;
@@ -117,9 +133,44 @@ export class ChatGptHttpClient {
     signal: AbortSignal,
   ): AsyncIterable<Uint8Array> {
     const context = this.createAbortContext(signal);
+    let response: ChatGptHttpResponse | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let readerDone = false;
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanupBody = async (): Promise<void> => {
+      if (cleanupPromise !== undefined) {
+        return cleanupPromise;
+      }
+
+      cleanupPromise = (async () => {
+        if (reader !== undefined) {
+          if (!readerDone) {
+            try {
+              await reader.cancel();
+            } catch {
+              // Cleanup errors must never replace the primary safe transport error.
+            }
+          }
+          try {
+            reader.releaseLock();
+          } catch {
+            // A reader may already be released by an underlying stream implementation.
+          }
+          return;
+        }
+        if (response !== undefined) {
+          await this.cancelResponseBody(response);
+        }
+      })();
+      return cleanupPromise;
+    };
+    const onAbort = (): void => {
+      void cleanupBody();
+    };
+
     try {
       this.assertActive(context);
-      const response = await this.request(
+      response = await this.request(
         CHATGPT_CODEX_PROFILE.responsesUrl,
         "text/event-stream",
         JSON.stringify(body),
@@ -130,26 +181,26 @@ export class ChatGptHttpClient {
         throw new CodexError("protocol", { action: "showDiagnostics" });
       }
 
-      const reader = response.body.getReader();
-      try {
-        while (true) {
-          this.assertActive(context);
-          const result = await reader.read();
-          this.assertActive(context);
-          if (result.done) {
-            return;
-          }
-          if (result.value !== undefined) {
-            yield result.value;
-          }
+      reader = response.body.getReader();
+      context.signal.addEventListener("abort", onAbort, { once: true });
+      while (true) {
+        this.assertActive(context);
+        const result = await reader.read();
+        this.assertActive(context);
+        if (result.done) {
+          readerDone = true;
+          return;
         }
-      } finally {
-        reader.releaseLock();
+        if (result.value !== undefined) {
+          yield result.value;
+        }
       }
     } catch (error) {
       throw this.mapError(error, context);
     } finally {
       context.dispose();
+      await cleanupBody();
+      context.signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -169,24 +220,27 @@ export class ChatGptHttpClient {
       sessionId: this.idFactory(),
       threadId: this.idFactory(),
     };
-    let credentials = await this.tokenSource.getAccessToken();
+    let credentials = await this.getAccessToken(false, context);
     this.assertActive(context);
 
     let response = await this.fetchOnce(url, accept, body, credentials, requestIds, context);
     this.assertActive(context);
     if (response.status === 401) {
-      await this.discardBody(response);
-      credentials = await this.tokenSource.getAccessToken(true);
+      await this.cancelResponseBody(response);
+      this.assertActive(context);
+      credentials = await this.getAccessToken(true, context);
       this.assertActive(context);
       response = await this.fetchOnce(url, accept, body, credentials, requestIds, context);
       this.assertActive(context);
       if (response.status === 401) {
-        await this.discardBody(response);
+        await this.cancelResponseBody(response);
+        this.assertActive(context);
         throw new CodexError("unauthorized", { action: "signIn" });
       }
     }
 
     if (!response.ok) {
+      await this.cancelResponseBody(response);
       throw this.statusError(response);
     }
     return response;
@@ -221,7 +275,7 @@ export class ChatGptHttpClient {
     });
   }
 
-  private async discardBody(response: ChatGptHttpResponse): Promise<void> {
+  private async cancelResponseBody(response: ChatGptHttpResponse): Promise<void> {
     try {
       await response.body?.cancel();
     } catch {
@@ -277,6 +331,59 @@ export class ChatGptHttpClient {
     }
   }
 
+  private async getAccessToken(
+    forceRefresh: boolean,
+    context: AbortContext,
+  ): Promise<OAuthCredentials> {
+    const tokenPromise = Promise.resolve().then(() =>
+      this.tokenSource.getAccessToken(forceRefresh, context.signal));
+    return this.awaitWithContext(tokenPromise, context);
+  }
+
+  private async awaitWithContext<T>(
+    promise: Promise<T>,
+    context: AbortContext,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const finish = (): void => {
+        if (!settled) {
+          settled = true;
+          context.signal.removeEventListener("abort", onAbort);
+        }
+      };
+      const onAbort = (): void => {
+        finish();
+        reject(this.abortError(context));
+      };
+
+      context.signal.addEventListener("abort", onAbort, { once: true });
+      promise.then(
+        (value) => {
+          finish();
+          resolve(value);
+        },
+        (error: unknown) => {
+          finish();
+          reject(error);
+        },
+      );
+      if (context.signal.aborted) {
+        onAbort();
+      }
+    });
+  }
+
+  private abortError(context: AbortContext): CodexError {
+    if (context.callerAborted()) {
+      return new CodexError("cancelled");
+    }
+    if (context.timedOut()) {
+      return new CodexError("timeout");
+    }
+    return new CodexError("cancelled");
+  }
+
   private createAbortContext(parentSignal: AbortSignal): AbortContext {
     const controller = new AbortController();
     let callerAborted = parentSignal.aborted;
@@ -319,6 +426,9 @@ export class ChatGptHttpClient {
           clearTimeout(timeout);
         }
         parentSignal.removeEventListener("abort", onParentAbort);
+        if (!controller.signal.aborted) {
+          controller.abort();
+        }
       },
     };
   }
