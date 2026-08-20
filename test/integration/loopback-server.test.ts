@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { request } from "node:http";
+import { request, ServerResponse } from "node:http";
 import { createServer, type Server } from "node:net";
 
-import { LoopbackCallbackServer } from "../../src/transports/chatgpt-oauth/loopback-server.js";
+import {
+  LoopbackCallbackServer,
+  LoopbackError,
+} from "../../src/transports/chatgpt-oauth/loopback-server.js";
 
 const requestUrl = (url: string, method = "GET"): Promise<{ status: number; body: string }> =>
   new Promise((resolve, reject) => {
@@ -84,6 +87,71 @@ test("loopback callback timeout closes the listener without contacting OAuth", a
   await assert.rejects(
     requestUrl(`http://127.0.0.1:${handle.port}/auth/callback?code=late&state=late`),
   );
+});
+
+test("response-writer failure still closes once and rejects the callback safely", async () => {
+  const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 100 });
+  const handle = await server.start();
+  const originalWriteHead = ServerResponse.prototype.writeHead;
+  let resolveWriterReached!: () => void;
+  const writerReached = new Promise<void>((resolve) => {
+    resolveWriterReached = resolve;
+  });
+  const uncaughtErrors: Error[] = [];
+  const uncaughtHandler = (error: Error): void => {
+    uncaughtErrors.push(error);
+  };
+  process.on("uncaughtException", uncaughtHandler);
+  ServerResponse.prototype.writeHead = function (
+    statusCode: number,
+    statusMessageOrHeaders?: string | Parameters<typeof originalWriteHead>[1],
+    headers?: Parameters<typeof originalWriteHead>[1],
+  ) {
+    if (statusCode === 200) {
+      resolveWriterReached();
+      this.destroy();
+      throw new Error("synthetic response writer failure");
+    }
+    if (typeof statusMessageOrHeaders === "string") {
+      return Reflect.apply(
+        originalWriteHead,
+        this,
+        [statusCode, statusMessageOrHeaders, headers],
+      ) as ServerResponse;
+    }
+    return Reflect.apply(originalWriteHead, this, [statusCode, statusMessageOrHeaders]) as ServerResponse;
+  };
+
+  const clientRequest = request(
+    `http://127.0.0.1:${handle.port}/auth/callback?code=code&state=state`,
+  );
+  clientRequest.on("error", () => undefined);
+  clientRequest.end();
+
+  try {
+    await writerReached;
+    await handle.close();
+    const outcome = await Promise.race([
+      handle.callback.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({ kind: "rejected" as const, error }),
+      ),
+      new Promise<{ kind: "unsettled" }>((resolve) => {
+        setImmediate(() => resolve({ kind: "unsettled" }));
+      }),
+    ]);
+    assert.equal(outcome.kind, "rejected");
+    if (outcome.kind === "rejected") {
+      assert.ok(outcome.error instanceof LoopbackError);
+      assert.equal((outcome.error.code as string), "callback_response_failed");
+    }
+    assert.deepEqual(uncaughtErrors, []);
+  } finally {
+    ServerResponse.prototype.writeHead = originalWriteHead;
+    process.off("uncaughtException", uncaughtHandler);
+    clientRequest.destroy();
+    await handle.close();
+  }
 });
 
 test("default production ports fall back from 1455 to 1457", async () => {

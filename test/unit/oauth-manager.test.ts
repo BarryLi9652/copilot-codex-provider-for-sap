@@ -596,6 +596,36 @@ test("loopback callback rejection still awaits close and reports timeout cleanup
   assert.equal(handle.closeCalls, 1);
 });
 
+test("sign-out clears storage before surfacing a loopback close failure", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session());
+  const loopback = new FakeLoopbackServer();
+  const manager = new OAuthManager(secrets, { loopbackServer: loopback });
+  let authorizeUrl = "";
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const handle = loopback.handles[0];
+  assert.ok(handle);
+  handle.closeError = new Error("synthetic close failure");
+  const signInFailure = assert.rejects(
+    signIn,
+    (error: unknown) => error instanceof OAuthError && error.code === "callback_closed",
+  );
+
+  await assert.rejects(
+    manager.signOut(),
+    (error: unknown) =>
+      error instanceof OAuthError && (error.code as string) === "callback_close_failed",
+  );
+  await signInFailure;
+  assert.equal(secrets.value, undefined);
+  assert.ok(secrets.keys.includes(`delete:${CHATGPT_OAUTH_SECRET_KEY}`));
+  assert.equal(handle.closeCalls, 1);
+});
+
 test("invalid_grant clears the extension session", async () => {
   const secrets = new MemorySecretStore();
   secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));

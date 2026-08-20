@@ -56,6 +56,7 @@ export type OAuthErrorCode =
   | "callback_state_mismatch"
   | "callback_timeout"
   | "callback_close_failed"
+  | "callback_response_failed"
   | "oauth_failed"
   | "sign_in_in_progress"
   | "token_exchange_failed"
@@ -281,10 +282,28 @@ export class OAuthManager {
     );
     this.lifecycle += 1;
     this.session = undefined;
+    let callbackCleanupError: OAuthError | undefined;
     if (active) {
-      await this.rejectActive(active, cancellation);
+      const failure = await this.rejectActive(active, cancellation);
+      callbackCleanupError = failure.cleanupError;
     }
-    await this.enqueueStorage(() => this.store.clear());
+
+    let clearError: OAuthError | undefined;
+    try {
+      await this.enqueueStorage(() => this.store.clear());
+    } catch (error) {
+      clearError = this.credentialsClearError(error);
+    }
+
+    if (callbackCleanupError !== undefined) {
+      if (clearError !== undefined) {
+        callbackCleanupError.cleanupError = clearError;
+      }
+      throw callbackCleanupError;
+    }
+    if (clearError !== undefined) {
+      throw clearError;
+    }
   }
 
   private buildAuthorizeUrl(active: ActiveSignIn, challenge: string): string {
@@ -677,7 +696,14 @@ export class OAuthManager {
 
   private loopbackError(error: unknown): OAuthError {
     if (error instanceof LoopbackError) {
-      const cleanupError = this.closeOAuthError(error);
+      const cleanupError =
+        error.code === "callback_response_failed"
+          ? new OAuthError(
+              "callback_response_failed",
+              "The ChatGPT OAuth callback response could not be written.",
+              error,
+            )
+          : this.closeOAuthError(error);
       if (error.primaryError !== undefined) {
         return this.withCleanupFailure(
           this.loopbackError(error.primaryError),
@@ -696,6 +722,16 @@ export class OAuthManager {
     this.lifecycle += 1;
     this.session = undefined;
     await this.enqueueStorage(() => this.store.clear());
+  }
+
+  private credentialsClearError(error: unknown): OAuthError {
+    return error instanceof OAuthError
+      ? error
+      : new OAuthError(
+          "oauth_failed",
+          "ChatGPT credentials could not be cleared.",
+          error,
+        );
   }
 
   private async clearCredentialsIfCurrent(generation: number): Promise<void> {

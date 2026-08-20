@@ -23,13 +23,23 @@ export interface LoopbackServerOptions {
   timeoutMs?: number;
 }
 
+export type LoopbackErrorCode =
+  | "callback_close_failed"
+  | "callback_response_failed";
+
 export class LoopbackError extends Error {
-  public readonly code = "callback_close_failed" as const;
+  public readonly code: LoopbackErrorCode;
   public readonly primaryError: Error | undefined;
 
-  public constructor(message: string, cause?: unknown, primaryError?: Error) {
+  public constructor(
+    code: LoopbackErrorCode,
+    message: string,
+    cause?: unknown,
+    primaryError?: Error,
+  ) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = "LoopbackError";
+    this.code = code;
     this.primaryError = primaryError;
   }
 }
@@ -83,9 +93,20 @@ const asError = (value: unknown, fallback: string): Error =>
   value instanceof Error ? value : serverError(fallback, value);
 
 const closeError = (cause: unknown): LoopbackError =>
-  cause instanceof LoopbackError
+  cause instanceof LoopbackError && cause.code === "callback_close_failed"
     ? cause
-    : new LoopbackError("The OAuth callback server could not be closed.", cause);
+    : new LoopbackError(
+        "callback_close_failed",
+        "The OAuth callback server could not be closed.",
+        cause,
+      );
+
+const responseError = (cause: unknown): LoopbackError =>
+  new LoopbackError(
+    "callback_response_failed",
+    "The OAuth callback response could not be written.",
+    cause,
+  );
 
 export class LoopbackCallbackServer implements LoopbackServer {
   private readonly ports: readonly number[];
@@ -151,32 +172,64 @@ export class LoopbackCallbackServer implements LoopbackServer {
       const settleCallbackAfterClose = async (
         callbackUrl: string | undefined,
         primaryError: Error | undefined,
+        response?: ServerResponse,
       ): Promise<void> => {
+        let terminalError = primaryError;
+        if (response !== undefined) {
+          try {
+            writeResponse(
+              response,
+              200,
+              "OAuth callback received",
+              "You may close this window.",
+            );
+          } catch (error) {
+            terminalError = responseError(error);
+            try {
+              response.destroy();
+            } catch (destroyError) {
+              terminalError = new LoopbackError(
+                "callback_response_failed",
+                terminalError.message,
+                { writeError: error, destroyError },
+              );
+            }
+          }
+        }
+
         try {
           await closeServer();
         } catch (error) {
           const failure = closeError(error);
           rejectCallback(
-            primaryError === undefined
+            terminalError === undefined
               ? failure
-              : new LoopbackError(failure.message, failure, primaryError),
+              : new LoopbackError(
+                  "callback_close_failed",
+                  failure.message,
+                  failure,
+                  terminalError,
+                ),
           );
           return;
         }
-        if (primaryError === undefined) {
+        if (terminalError === undefined) {
           resolveCallback(callbackUrl as string);
         } else {
-          rejectCallback(primaryError);
+          rejectCallback(terminalError);
         }
       };
 
       const runTerminal = (
         callbackUrl: string | undefined,
         primaryError: Error | undefined,
+        response?: ServerResponse,
       ): void => {
-        void settleCallbackAfterClose(callbackUrl, primaryError).catch((error: unknown) => {
-          rejectCallback(closeError(error));
-        });
+        void settleCallbackAfterClose(callbackUrl, primaryError, response).catch(
+          (error: unknown) => {
+            rejectCallback(closeError(error));
+          },
+        );
       };
 
       const closeHandle = async (reason?: Error): Promise<void> => {
@@ -193,7 +246,12 @@ export class LoopbackCallbackServer implements LoopbackServer {
             rejectCallback(
               reason === undefined
                 ? failure
-                : new LoopbackError(failure.message, failure, reason),
+                : new LoopbackError(
+                    "callback_close_failed",
+                    failure.message,
+                    failure,
+                    reason,
+                  ),
             );
           } else {
             rejectCallback(reason ?? serverError("OAuth callback server closed."));
@@ -242,8 +300,7 @@ export class LoopbackCallbackServer implements LoopbackServer {
         }
 
         callbackSettled = true;
-        writeResponse(response, 200, "OAuth callback received", "You may close this window.");
-        runTerminal(callbackUrl.toString(), undefined);
+        runTerminal(callbackUrl.toString(), undefined, response);
       };
 
       const server: Server = createServer(acceptCallback);
@@ -263,7 +320,15 @@ export class LoopbackCallbackServer implements LoopbackServer {
           const listenerError = serverError("OAuth callback listener did not expose an address.");
           void closeServer().then(
             () => reject(listenerError),
-            (error: unknown) => reject(new LoopbackError(listenerError.message, error, listenerError)),
+            (error: unknown) =>
+              reject(
+                new LoopbackError(
+                  "callback_close_failed",
+                  listenerError.message,
+                  error,
+                  listenerError,
+                ),
+              ),
           );
           return;
         }
