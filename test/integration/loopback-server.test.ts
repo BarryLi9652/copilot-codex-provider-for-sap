@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { request } from "node:http";
+
+import { LoopbackCallbackServer } from "../../src/transports/chatgpt-oauth/loopback-server.js";
+
+const requestUrl = (url: string, method = "GET"): Promise<{ status: number; body: string }> =>
+  new Promise((resolve, reject) => {
+    const clientRequest = request(url, { method }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+      });
+    });
+    clientRequest.on("error", reject);
+    clientRequest.end();
+  });
+
+test("loopback callback accepts only the exact GET path and closes after one callback", async () => {
+  const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 2_000 });
+  const handle = await server.start();
+  const redirect = new URL(handle.redirectUri);
+
+  assert.equal(redirect.protocol, "http:");
+  assert.equal(redirect.hostname, "localhost");
+  assert.equal(redirect.pathname, "/auth/callback");
+  assert.equal(handle.port, Number(redirect.port));
+
+  const wrongPath = await requestUrl(
+    `http://127.0.0.1:${handle.port}/not-the-callback?code=ignored&state=ignored`,
+  );
+  assert.equal(wrongPath.status, 404);
+  const wrongMethod = await requestUrl(
+    `http://127.0.0.1:${handle.port}/auth/callback?code=ignored&state=ignored`,
+    "POST",
+  );
+  assert.equal(wrongMethod.status, 405);
+
+  const callbackUrl =
+    "http://127.0.0.1:" +
+    `${handle.port}/auth/callback?code=abc&state=state-value&error_description=%3Cscript%3E`;
+  const callbackResponse = await requestUrl(callbackUrl);
+  assert.equal(callbackResponse.status, 200);
+  assert.match(callbackResponse.body, /callback/i);
+  assert.equal(callbackResponse.body.includes("<script>"), false);
+  assert.equal(
+    await handle.callback,
+    `http://localhost:${handle.port}/auth/callback?code=abc&state=state-value&error_description=%3Cscript%3E`,
+  );
+  await handle.close();
+
+  await assert.rejects(
+    requestUrl(`http://127.0.0.1:${handle.port}/auth/callback?code=second&state=second`),
+  );
+});
+
+test("loopback callback timeout closes the listener without contacting OAuth", async () => {
+  const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 20 });
+  const handle = await server.start();
+
+  await assert.rejects(handle.callback, /timed out/i);
+  await assert.rejects(
+    requestUrl(`http://127.0.0.1:${handle.port}/auth/callback?code=late&state=late`),
+  );
+});
