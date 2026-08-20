@@ -291,6 +291,42 @@ async function cachesModelDiscovery(): Promise<void> {
   assert.deepEqual(second, first);
 }
 
+async function skipsModelDiscoveryForPreCancelledToken(): Promise<void> {
+  let listCalls = 0;
+  const expected = new Error("pre-cancelled discovery must not start");
+  const transport: CodexTransport = {
+    listModels: () => {
+      listCalls += 1;
+      return Promise.reject(expected);
+    },
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, "test-vendor");
+  const cancellation = new vscode.CancellationTokenSource();
+  cancellation.cancel();
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandledRejections.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  try {
+    assert.deepEqual(
+      await provider.provideLanguageModelChatInformation({ silent: true }, cancellation.token),
+      [],
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(listCalls, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+    cancellation.dispose();
+  }
+}
+
 async function keepsSharedModelDiscoveryAliveWhenFirstCallerCancels(): Promise<void> {
   const firstCancellation = createTrackableCancellation();
   const secondCancellation = createTrackableCancellation();
@@ -475,6 +511,7 @@ export async function runProviderTests(): Promise<void> {
     ["provider streams text and tool calls as Copilot response parts", streamsTextAndToolCalls],
     ["provider preserves stable Copilot message parts and required tools", preservesStableMessageParts],
     ["provider caches model discovery and maps the normalized capabilities", cachesModelDiscovery],
+    ["provider skips discovery for a pre-cancelled token", skipsModelDiscoveryForPreCancelledToken],
     ["provider keeps shared discovery alive when the first caller cancels", keepsSharedModelDiscoveryAliveWhenFirstCallerCancels],
     ["provider disposes response cancellation listeners on request-build failure", disposesResponseCancellationListenerOnRequestBuildFailure],
     ["provider counts UTF-16 text and serialized tool metadata with a minimum of one", countsTokens],

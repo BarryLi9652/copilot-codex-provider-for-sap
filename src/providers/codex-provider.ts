@@ -89,6 +89,9 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const binding = toAbortSignal(token);
     try {
+      if (binding.signal.aborted) {
+        return [];
+      }
       const models = await waitForCancellation(
         this.modelCache.get(() =>
           this.transport.listModels({ silent: options.silent }, new AbortController().signal)),
