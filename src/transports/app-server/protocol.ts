@@ -26,6 +26,10 @@ export type JsonRpcServerRequestHandler = (
   id: JsonRpcId,
 ) => unknown | Promise<unknown>;
 
+export type JsonRpcServerNotificationHandler = (
+  params: unknown,
+) => void | Promise<void>;
+
 export function protocolError(action: string, cause?: unknown): CodexError {
   return new CodexError("protocol", { action, cause });
 }

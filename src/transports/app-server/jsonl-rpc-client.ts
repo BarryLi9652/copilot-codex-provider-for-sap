@@ -6,6 +6,7 @@ import {
   type Disposable,
   type JsonRpcId,
   type JsonRpcMessage,
+  type JsonRpcServerNotificationHandler,
   type JsonRpcServerRequestHandler,
   processError,
   protocolError,
@@ -69,6 +70,7 @@ export class JsonlRpcClient {
   private readonly pendingRequests = new Map<JsonRpcId, PendingRequest>();
   private readonly serverRequests = new Map<JsonRpcId, ActiveServerRequest>();
   private readonly serverRequestHandlers = new Map<string, JsonRpcServerRequestHandler>();
+  private readonly serverNotificationHandlers = new Map<string, JsonRpcServerNotificationHandler>();
   private readonly writeQueue: WriteTicket[] = [];
   private nextRequestId = 1;
   private lineBuffer = "";
@@ -199,6 +201,25 @@ export class JsonlRpcClient {
     };
   }
 
+  public onServerNotification(
+    method: string,
+    handler: JsonRpcServerNotificationHandler,
+  ): Disposable {
+    const previous = this.serverNotificationHandlers.get(method);
+    this.serverNotificationHandlers.set(method, handler);
+    return {
+      dispose: (): void => {
+        if (this.serverNotificationHandlers.get(method) === handler) {
+          if (previous === undefined) {
+            this.serverNotificationHandlers.delete(method);
+          } else {
+            this.serverNotificationHandlers.set(method, previous);
+          }
+        }
+      },
+    };
+  }
+
   public dispose(): void {
     this.terminate(new CodexError("cancelled", { action: "disposeAppServer" }));
   }
@@ -314,6 +335,8 @@ export class JsonlRpcClient {
       }
       if (hasId) {
         this.handleServerRequest(id as JsonRpcId, parsed.method, parsed.params);
+      } else {
+        this.handleServerNotification(parsed.method, parsed.params);
       }
       return;
     }
@@ -390,6 +413,19 @@ export class JsonlRpcClient {
       })
       .finally(() => {
         this.serverRequests.delete(id);
+      })
+      .catch(() => undefined);
+  }
+
+  private handleServerNotification(method: string, params: unknown): void {
+    const handler = this.serverNotificationHandlers.get(method);
+    if (handler === undefined) {
+      return;
+    }
+    void Promise.resolve()
+      .then(() => handler(params))
+      .catch((cause: unknown) => {
+        this.terminate(protocolError("handleAppServerNotification", cause));
       })
       .catch(() => undefined);
   }
@@ -557,6 +593,7 @@ export class JsonlRpcClient {
     }
     this.serverRequests.clear();
     this.serverRequestHandlers.clear();
+    this.serverNotificationHandlers.clear();
     this.lineBuffer = "";
     try {
       this.onDidTerminate?.(error);
