@@ -410,6 +410,10 @@ test("contains late child, stdout, and stderr errors during teardown and removes
     child.emit("error", new Error("late child error"));
     child.stdout?.emit("error", new Error("late stdout error"));
     child.stderr.emit("error", new Error("late stderr error"));
+    child.emit("error", new Error("second late child error"));
+    child.stdin.emit("error", new Error("late stdin error"));
+    child.stdout?.emit("error", new Error("second late stdout error"));
+    child.stderr.emit("error", new Error("second late stderr error"));
   });
   await stopping;
 
@@ -420,6 +424,48 @@ test("contains late child, stdout, and stderr errors during teardown and removes
   assert.equal(child.stdout?.listenerCount("close"), 0);
   assert.equal(child.stderr.listenerCount("error"), 0);
   assert.equal(child.stderr.listenerCount("close"), 0);
+});
+
+test("a running stdout error tears down its exact supervisor record", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const client = await supervisor.start();
+  const child = children[0] as FakeChild;
+
+  child.stdout?.emit("error", new Error("running stdout error"));
+  await wait(40);
+
+  assert.equal(client.isClosed, true);
+  assert.notEqual(child.exitCode, null);
+  assert.deepEqual(child.killCalls, [undefined]);
+  assert.equal(children.length, 1);
+  assert.equal(child.listenerCount("error"), 0);
+  assert.equal(child.stdout?.listenerCount("error"), 0);
+  assert.equal(child.stderr.listenerCount("error"), 0);
+  const replacement = await supervisor.start();
+  const replacementChild = children[1] as FakeChild;
+  replacementChild.stdout?.emit("error", new Error("second running stdout error"));
+  await wait(40);
+  assert.equal(replacement.isClosed, true);
+  await assert.rejects(
+    supervisor.start(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+});
+
+test("a running stdin error tears down its exact supervisor record", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const client = await supervisor.start();
+  const child = children[0] as FakeChild;
+
+  child.stdin.emit("error", new Error("running stdin error"));
+  await wait(40);
+
+  assert.equal(client.isClosed, true);
+  assert.notEqual(child.exitCode, null);
+  assert.deepEqual(child.killCalls, [undefined]);
+  assert.equal(child.stdin.listenerCount("error"), 0);
+  assert.equal(child.stdout?.listenerCount("error"), 0);
+  assert.equal(child.stderr.listenerCount("error"), 0);
 });
 
 test("clears the exit wait timer when a child exits normally", async () => {
@@ -437,4 +483,32 @@ test("clears the exit wait timer when a child exits normally", async () => {
 
   assert.equal(timers.created, 1);
   assert.equal(timers.active.size, 0);
+});
+
+test("restart waits for an in-flight deferred start cleanup and coalesces replacement starts", async () => {
+  const firstChild = new FakeChild("any", new PassThrough(), 0, true);
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? firstChild : new FakeChild("any"));
+  const oldStart = supervisor.start();
+  const oldOutcome = oldStart.then(
+    () => "resolved" as const,
+    (error: unknown) => ({ rejected: error }),
+  );
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+  const restarting = supervisor.restart();
+  const restartingAgain = supervisor.restart();
+  firstChild.completeSpawn();
+
+  const [replacement, replacementAgain] = await Promise.all([restarting, restartingAgain]);
+  const oldResult = await oldOutcome;
+  assert.notEqual(oldResult, "resolved");
+  if (oldResult !== "resolved") {
+    assert.ok(oldResult.rejected instanceof CodexError);
+    assert.equal(oldResult.rejected.code, "process");
+  }
+  assert.equal(replacement, replacementAgain);
+  assert.equal(children.length, 2);
+  assert.notEqual(firstChild.exitCode, null);
+  await supervisor.stop();
 });

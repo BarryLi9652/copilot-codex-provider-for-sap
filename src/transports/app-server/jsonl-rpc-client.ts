@@ -18,6 +18,7 @@ export interface JsonlRpcClientStreams {
 
 export interface JsonlRpcClientOptions {
   requestTimeoutMs?: number;
+  onDidTerminate?: (error: CodexError) => void;
 }
 
 interface WriteTicket {
@@ -63,6 +64,7 @@ export class JsonlRpcClient {
   private readonly input: Writable;
   private readonly output: Readable;
   private readonly requestTimeoutMs: number;
+  private readonly onDidTerminate: ((error: CodexError) => void) | undefined;
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private readonly pendingRequests = new Map<JsonRpcId, PendingRequest>();
   private readonly serverRequests = new Map<JsonRpcId, ActiveServerRequest>();
@@ -90,11 +92,14 @@ export class JsonlRpcClient {
     if ("input" in first && "output" in first) {
       this.input = first.input;
       this.output = first.output;
-      this.requestTimeoutMs = validateTimeout(second as JsonlRpcClientOptions | undefined);
+      const options = second as JsonlRpcClientOptions | undefined;
+      this.requestTimeoutMs = validateTimeout(options);
+      this.onDidTerminate = options?.onDidTerminate;
     } else {
       this.output = first;
       this.input = second as Writable;
       this.requestTimeoutMs = validateTimeout(third);
+      this.onDidTerminate = third?.onDidTerminate;
     }
 
     this.output.on("data", this.handleData);
@@ -553,6 +558,11 @@ export class JsonlRpcClient {
     this.serverRequests.clear();
     this.serverRequestHandlers.clear();
     this.lineBuffer = "";
+    try {
+      this.onDidTerminate?.(error);
+    } catch {
+      // A termination observer must not escape a stream callback.
+    }
   }
 }
 

@@ -349,6 +349,34 @@ test("termination preserves external listeners on caller-provided streams", asyn
   serverOutput.destroy();
 });
 
+test("notifies a termination observer exactly once", async () => {
+  const serverOutput = new PassThrough();
+  const input = new ControlledWritable();
+  const terminations: CodexError[] = [];
+  const options = {
+    requestTimeoutMs: 1_000,
+    onDidTerminate: (error: CodexError): void => {
+      terminations.push(error);
+    },
+  } as unknown as { requestTimeoutMs: number; onDidTerminate: (error: CodexError) => void };
+  const client = new JsonlRpcClient(
+    { input: input as unknown as Writable, output: serverOutput },
+    options,
+  );
+
+  const pending = client.request("termination-observer", {});
+  serverOutput.emit("end");
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+  client.dispose();
+
+  assert.equal(terminations.length, 1);
+  assert.equal(terminations[0]?.code, "process");
+  serverOutput.destroy();
+});
+
 test("observes synchronous server-error write failures without an unhandled rejection", async () => {
   const serverOutput = new PassThrough();
   const input = new ControlledWritable();
