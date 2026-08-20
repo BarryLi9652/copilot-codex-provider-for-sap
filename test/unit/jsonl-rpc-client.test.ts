@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import type { Writable } from "node:stream";
 import test from "node:test";
 
 import { CodexError } from "../../src/core/errors.js";
@@ -8,6 +10,24 @@ import { JsonlRpcClient } from "../../src/transports/app-server/jsonl-rpc-client
 const nextTick = async (): Promise<void> => {
   await new Promise<void>((resolve) => setImmediate(resolve));
 };
+
+const wait = async (milliseconds: number): Promise<void> => {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+};
+
+class ControlledWritable extends EventEmitter {
+  public readonly writes: string[] = [];
+  public blocked = false;
+  public throwOnWrite = false;
+
+  public write(chunk: string | Uint8Array): boolean {
+    if (this.throwOnWrite) {
+      throw new Error("synchronous write failure");
+    }
+    this.writes.push(Buffer.from(chunk).toString("utf8"));
+    return !this.blocked;
+  }
+}
 
 test("correlates fragmented CRLF responses while ignoring notifications", async () => {
   const serverOutput = new PassThrough();
@@ -171,4 +191,244 @@ test("dispose rejects pending requests and prevents later writes", async () => {
   );
   serverOutput.destroy();
   clientInput.destroy();
+});
+
+test("decodes a response split inside a UTF-8 code point and flushes an unterminated final line", async () => {
+  const serverOutput = new PassThrough();
+  const clientInput = new PassThrough();
+  const client = new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    { requestTimeoutMs: 1_000 },
+  );
+  const pending = client.request<{ text: string }>("unicode", {});
+  const frame = Buffer.from('{"id":1,"result":{"text":"你好"}}', "utf8");
+  const split = frame.indexOf(Buffer.from("好", "utf8")) + 1;
+  serverOutput.write(frame.subarray(0, split));
+  serverOutput.end(frame.subarray(split));
+
+  assert.deepEqual(await pending, { text: "你好" });
+  client.dispose();
+  clientInput.destroy();
+});
+
+test("rejects malformed UTF-8 instead of replacing it into valid JSON", async () => {
+  const serverOutput = new PassThrough();
+  const clientInput = new PassThrough();
+  const client = new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    { requestTimeoutMs: 1_000 },
+  );
+  const pending = client.request("malformed-utf8", {});
+  serverOutput.write(Buffer.from([0x7b, 0x22, 0x69, 0x64, 0x22, 0x3a, 0x31, 0x2c, 0x22, 0x72, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d, 0x0a]));
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "protocol",
+  );
+  client.dispose();
+  clientInput.destroy();
+});
+
+test("strictly rejects incomplete, ambiguous, extended, and malformed response envelopes", async () => {
+  const invalidResponses = [
+    '{"id":1}',
+    '{"id":1,"result":null,"error":{"code":-1,"message":"bad"}}',
+    '{"id":1,"result":null,"extra":true}',
+    '{"id":1,"error":{"code":"-1","message":"bad"}}',
+    '{"id":1,"error":{"code":-1}}',
+    '{"id":1,"error":{"code":1e999,"message":"bad"}}',
+  ];
+
+  for (const response of invalidResponses) {
+    const serverOutput = new PassThrough();
+    const clientInput = new PassThrough();
+    const client = new JsonlRpcClient(
+      { input: clientInput, output: serverOutput },
+      { requestTimeoutMs: 1_000 },
+    );
+    const pending = client.request("strict-response", {});
+    serverOutput.write(`${response}\n`);
+    await assert.rejects(
+      pending,
+      (error: unknown) => error instanceof CodexError && error.code === "protocol",
+      response,
+    );
+    client.dispose();
+    serverOutput.destroy();
+    clientInput.destroy();
+  }
+});
+
+test("serializes backpressured writes and removes a cancelled queued request", async () => {
+  const serverOutput = new PassThrough();
+  const input = new ControlledWritable();
+  input.blocked = true;
+  const client = new JsonlRpcClient(
+    { input: input as unknown as Writable, output: serverOutput },
+    { requestTimeoutMs: Number.POSITIVE_INFINITY },
+  );
+  const first = client.request("first-queued", {});
+  const controller = new AbortController();
+  const second = client.request("second-queued", {}, controller.signal);
+
+  await nextTick();
+  assert.equal(input.writes.length, 1);
+  controller.abort();
+  await assert.rejects(
+    second,
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  input.blocked = false;
+  input.emit("drain");
+  client.dispose();
+  await assert.rejects(
+    first,
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  assert.equal(input.writes.length, 1);
+  serverOutput.destroy();
+});
+
+test("termination rejects queued writes and removes all owned stream listeners", async () => {
+  const serverOutput = new PassThrough();
+  const input = new ControlledWritable();
+  input.blocked = true;
+  const client = new JsonlRpcClient(
+    { input: input as unknown as Writable, output: serverOutput },
+    { requestTimeoutMs: Number.POSITIVE_INFINITY },
+  );
+  const pending = client.request("queued", {});
+  client.onServerRequest("server/request", () => ({ ok: true }));
+  client.dispose();
+
+  await assert.rejects(
+    pending,
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  for (const event of ["data", "error", "end", "close", "drain"]) {
+    assert.equal(serverOutput.listenerCount(event), 0, `output ${event}`);
+    assert.equal(input.listenerCount(event), 0, `input ${event}`);
+  }
+  serverOutput.destroy();
+});
+
+test("observes synchronous server-error write failures without an unhandled rejection", async () => {
+  const serverOutput = new PassThrough();
+  const input = new ControlledWritable();
+  input.throwOnWrite = true;
+  const client = new JsonlRpcClient(
+    { input: input as unknown as Writable, output: serverOutput },
+    { requestTimeoutMs: Number.POSITIVE_INFINITY },
+  );
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    assert.doesNotThrow(() => {
+      serverOutput.write('{"id":77,"method":"unknown/server/request"}\n');
+    });
+    await wait(10);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    client.dispose();
+    serverOutput.destroy();
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test("maps input/output errors, end, and close to bounded typed termination", async () => {
+  for (const event of ["input-error", "output-error", "end", "close"] as const) {
+    const serverOutput = new PassThrough();
+    const clientInput = new ControlledWritable();
+    const client = new JsonlRpcClient(
+      { input: clientInput as unknown as Writable, output: serverOutput },
+      { requestTimeoutMs: 1_000 },
+    );
+    const pending = client.request("stream-lifecycle", {});
+    if (event === "input-error") {
+      clientInput.emit("error", new Error("input failed"));
+    } else if (event === "output-error") {
+      serverOutput.emit("error", new Error("output failed"));
+    } else if (event === "end") {
+      serverOutput.emit("end");
+    } else {
+      serverOutput.emit("close");
+    }
+    await assert.rejects(
+      pending,
+      (error: unknown) => error instanceof CodexError && error.code === "process",
+      event,
+    );
+    client.dispose();
+    serverOutput.destroy();
+  }
+});
+
+test("terminates once for Writable finish/close and Readable end/close with no queued-write leaks", async () => {
+  const cases = [
+    { source: "input", event: "error" },
+    { source: "input", event: "finish" },
+    { source: "input", event: "close" },
+    { source: "output", event: "error" },
+    { source: "output", event: "end" },
+    { source: "output", event: "close" },
+  ] as const;
+
+  for (const { source, event } of cases) {
+    const serverOutput = new PassThrough();
+    const input = new ControlledWritable();
+    input.blocked = true;
+    const client = new JsonlRpcClient(
+      { input: input as unknown as Writable, output: serverOutput },
+      { requestTimeoutMs: 50 },
+    );
+    const first = client.request("lifecycle-first", {});
+    const second = client.request("lifecycle-second", {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      if (source === "input") {
+        if (event === "error") {
+          input.emit("error", new Error("input failed"));
+        } else {
+          // Writable termination uses finish/close, not Readable end.
+          input.emit(event);
+        }
+        input.emit(event === "finish" ? "close" : "finish");
+        input.emit("drain");
+      } else if (event === "error") {
+        serverOutput.emit("error", new Error("output failed"));
+      } else {
+        serverOutput.emit(event);
+        serverOutput.emit(event === "end" ? "close" : "end");
+      }
+
+      const outcomes = await Promise.allSettled([first, second]);
+      assert.deepEqual(outcomes.map((outcome) => outcome.status), ["rejected", "rejected"]);
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") {
+          assert.ok(outcome.reason instanceof CodexError);
+          assert.equal(outcome.reason.code, "process");
+        }
+      }
+      assert.equal(client.isClosed, true);
+      for (const stream of [input, serverOutput]) {
+        for (const listener of ["data", "error", "end", "finish", "close", "drain"]) {
+          assert.equal(stream.listenerCount(listener), 0, `${source} ${event} ${listener}`);
+        }
+      }
+      await wait(10);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      client.dispose();
+      process.off("unhandledRejection", onUnhandled);
+      serverOutput.destroy();
+    }
+  }
 });

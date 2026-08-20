@@ -107,3 +107,29 @@ test("reports a process error when no usable candidate exists", () => {
     (error: unknown) => error instanceof CodexError && error.code === "process",
   );
 });
+
+test("splits PATH using the injected Windows delimiter instead of the host delimiter", () => {
+  const fs = new FakeFileSystem();
+  const expected = path.win32.normalize("C:\\Second\\codex.exe");
+  fs.files.add(expected);
+  const locator = new ExecutableLocator({
+    env: { PATH: "C:\\First;C:\\Second" },
+    platform: "win32",
+    fileSystem: fs,
+  });
+
+  assert.equal(locator.resolve(), expected);
+});
+
+test("splits PATH using the injected POSIX delimiter when simulating a non-Windows host", () => {
+  const fs = new FakeFileSystem();
+  const expected = "/second/codex";
+  fs.files.add(expected);
+  const locator = new ExecutableLocator({
+    env: { PATH: "/first:/second" },
+    platform: "linux",
+    fileSystem: fs,
+  });
+
+  assert.equal(locator.resolve(), expected);
+});

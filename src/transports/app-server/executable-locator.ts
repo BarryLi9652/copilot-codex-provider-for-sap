@@ -24,6 +24,9 @@ const join = (directory: string, filename: string, platform: NodeJS.Platform): s
 const candidateNames = (platform: NodeJS.Platform): readonly string[] =>
   platform === "win32" ? ["codex.exe", "codex"] : ["codex"];
 
+const pathDelimiter = (platform: NodeJS.Platform): string =>
+  platform === "win32" ? ";" : ":";
+
 export class ExecutableLocator {
   private readonly configuredExecutable: string | undefined;
   private readonly env: NodeJS.ProcessEnv;
@@ -50,7 +53,7 @@ export class ExecutableLocator {
       return this.configuredExecutable;
     }
 
-    for (const directory of this.pathValue.split(path.delimiter)) {
+    for (const directory of this.pathValue.split(pathDelimiter(this.platform))) {
       if (directory.trim() === "") {
         continue;
       }

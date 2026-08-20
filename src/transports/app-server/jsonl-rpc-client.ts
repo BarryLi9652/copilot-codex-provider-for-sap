@@ -1,4 +1,4 @@
-import { StringDecoder } from "node:string_decoder";
+import { TextDecoder } from "node:util";
 import type { Readable, Writable } from "node:stream";
 
 import { CodexError } from "../../core/errors.js";
@@ -20,6 +20,15 @@ export interface JsonlRpcClientOptions {
   requestTimeoutMs?: number;
 }
 
+interface WriteTicket {
+  readonly data: string;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (reason: unknown) => void;
+  started: boolean;
+  settled: boolean;
+}
+
 interface PendingRequest {
   readonly method: string;
   readonly resolve: (value: unknown) => void;
@@ -27,6 +36,7 @@ interface PendingRequest {
   readonly signal: AbortSignal | undefined;
   readonly onAbort: (() => void) | undefined;
   readonly timer: ReturnType<typeof setTimeout> | undefined;
+  ticket: WriteTicket | undefined;
 }
 
 interface ActiveServerRequest {
@@ -44,16 +54,23 @@ const hasOwn = (value: Record<string, unknown>, key: string): boolean =>
 const isJsonRpcId = (value: unknown): value is JsonRpcId =>
   (typeof value === "number" && Number.isFinite(value)) || typeof value === "string";
 
+const hasOnlyKeys = (
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean => Object.keys(value).every((key) => allowed.includes(key));
+
 export class JsonlRpcClient {
   private readonly input: Writable;
   private readonly output: Readable;
   private readonly requestTimeoutMs: number;
-  private readonly decoder = new StringDecoder("utf8");
+  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private readonly pendingRequests = new Map<JsonRpcId, PendingRequest>();
   private readonly serverRequests = new Map<JsonRpcId, ActiveServerRequest>();
   private readonly serverRequestHandlers = new Map<string, JsonRpcServerRequestHandler>();
+  private readonly writeQueue: WriteTicket[] = [];
   private nextRequestId = 1;
   private lineBuffer = "";
+  private activeWrite: WriteTicket | undefined;
   private closed = false;
 
   public constructor(
@@ -81,10 +98,12 @@ export class JsonlRpcClient {
     }
 
     this.output.on("data", this.handleData);
-    this.output.once("end", this.handleEnd);
-    this.output.once("close", this.handleEnd);
-    this.output.once("error", this.handleStreamError);
-    this.input.once("error", this.handleStreamError);
+    this.output.on("end", this.handleEnd);
+    this.output.on("close", this.handleEnd);
+    this.output.on("error", this.handleStreamError);
+    this.input.on("error", this.handleStreamError);
+    this.input.on("finish", this.handleInputEnd);
+    this.input.on("close", this.handleInputEnd);
   }
 
   public request<T>(
@@ -118,6 +137,7 @@ export class JsonlRpcClient {
         signal,
         onAbort,
         timer,
+        ticket: undefined,
       };
       this.pendingRequests.set(id, pending);
       if (signal !== undefined && onAbort !== undefined) {
@@ -125,10 +145,19 @@ export class JsonlRpcClient {
       }
 
       try {
-        this.writeMessage({
+        const ticket = this.enqueueMessage({
           id,
           method,
           ...(params === undefined ? {} : { params }),
+        });
+        pending.ticket = ticket;
+        void ticket.promise.catch((error: unknown) => {
+          if (this.pendingRequests.get(id) !== pending) {
+            return;
+          }
+          this.pendingRequests.delete(id);
+          this.cleanupPending(pending);
+          reject(error);
         });
       } catch (error) {
         this.pendingRequests.delete(id);
@@ -139,10 +168,11 @@ export class JsonlRpcClient {
   }
 
   public notify(method: string, params?: unknown): void {
-    this.writeMessage({
+    const ticket = this.enqueueMessage({
       method,
       ...(params === undefined ? {} : { params }),
     });
+    void ticket.promise.catch(() => undefined);
   }
 
   public onServerRequest(
@@ -180,7 +210,16 @@ export class JsonlRpcClient {
     if (this.closed) {
       return;
     }
-    const decoded = typeof chunk === "string" ? chunk : this.decoder.write(chunk);
+    let decoded: string;
+    try {
+      decoded = this.decoder.decode(
+        typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk,
+        { stream: true },
+      );
+    } catch {
+      this.terminate(protocolError("decodeAppServerMessage", new Error("invalid UTF-8")));
+      return;
+    }
     this.lineBuffer += decoded;
     this.consumeLines();
   };
@@ -189,7 +228,12 @@ export class JsonlRpcClient {
     if (this.closed) {
       return;
     }
-    this.lineBuffer += this.decoder.end();
+    try {
+      this.lineBuffer += this.decoder.decode();
+    } catch {
+      this.terminate(protocolError("decodeAppServerMessage", new Error("invalid UTF-8")));
+      return;
+    }
     if (this.lineBuffer.trim() !== "") {
       const finalLine = this.lineBuffer.endsWith("\r")
         ? this.lineBuffer.slice(0, -1)
@@ -204,6 +248,21 @@ export class JsonlRpcClient {
 
   private readonly handleStreamError = (): void => {
     this.terminate(processError("appServerStream"));
+  };
+
+  private readonly handleInputEnd = (): void => {
+    this.terminate(processError("appServerInput"));
+  };
+
+  private readonly handleDrain = (): void => {
+    if (this.closed || this.activeWrite === undefined) {
+      return;
+    }
+    const ticket = this.activeWrite;
+    this.input.removeListener("drain", this.handleDrain);
+    this.activeWrite = undefined;
+    this.settleWrite(ticket);
+    this.pumpWrites();
   };
 
   private consumeLines(): void {
@@ -244,6 +303,10 @@ export class JsonlRpcClient {
     }
 
     if (typeof parsed.method === "string") {
+      if (!hasOnlyKeys(parsed, hasId ? ["id", "method", "params"] : ["method", "params"])) {
+        this.terminate(protocolError("parseAppServerMessage", new Error("invalid JSON-RPC request")));
+        return;
+      }
       if (hasId) {
         this.handleServerRequest(id as JsonRpcId, parsed.method, parsed.params);
       }
@@ -251,11 +314,37 @@ export class JsonlRpcClient {
     }
 
     if (hasId) {
+      if (!this.isValidResponse(parsed)) {
+        this.terminate(protocolError("parseAppServerResponse", new Error("invalid JSON-RPC response")));
+        return;
+      }
       this.handleResponse(id as JsonRpcId, parsed);
       return;
     }
 
     this.terminate(protocolError("parseAppServerMessage", new Error("message has no method or id")));
+  }
+
+  private isValidResponse(message: Record<string, unknown>): boolean {
+    const hasResult = hasOwn(message, "result");
+    const hasError = hasOwn(message, "error");
+    if (hasResult === hasError) {
+      return false;
+    }
+    if (hasResult) {
+      return hasOnlyKeys(message, ["id", "result"]);
+    }
+
+    if (!hasOnlyKeys(message, ["id", "error"]) || !isRecord(message.error)) {
+      return false;
+    }
+    const error = message.error;
+    if (!hasOnlyKeys(error, ["code", "message", "data"])) {
+      return false;
+    }
+    return typeof error.code === "number"
+      && Number.isFinite(error.code)
+      && typeof error.message === "string";
   }
 
   private handleResponse(id: JsonRpcId, message: Record<string, unknown>): void {
@@ -267,11 +356,6 @@ export class JsonlRpcClient {
     this.cleanupPending(pending);
 
     if (hasOwn(message, "error")) {
-      const remoteError = message.error;
-      if (!isRecord(remoteError) || typeof remoteError.code !== "number") {
-        pending.reject(protocolError("parseAppServerResponse", new Error("invalid JSON-RPC error")));
-        return;
-      }
       pending.reject(protocolError(pending.method, new Error("remote JSON-RPC request failed")));
       return;
     }
@@ -291,18 +375,13 @@ export class JsonlRpcClient {
       return;
     }
 
-    Promise.resolve()
+    void Promise.resolve()
       .then(() => handler(params, id))
       .then((result) => {
-        if (this.closed) {
-          return;
-        }
-        this.writeMessage({ id, result });
+        this.sendServerResponse(id, result);
       })
       .catch(() => {
-        if (!this.closed) {
-          this.sendServerError(id, -32000);
-        }
+        this.sendServerError(id, -32000);
       })
       .finally(() => {
         this.serverRequests.delete(id);
@@ -310,12 +389,24 @@ export class JsonlRpcClient {
       .catch(() => undefined);
   }
 
+  private sendServerResponse(id: JsonRpcId, result: unknown): void {
+    try {
+      const ticket = this.enqueueMessage({ id, result });
+      void ticket.promise.catch(() => undefined);
+    } catch {
+      // The stream termination path owns the observable process/protocol failure.
+    }
+  }
+
   private sendServerError(id: JsonRpcId, code: number): void {
-    if (!this.closed) {
-      this.writeMessage({
+    try {
+      const ticket = this.enqueueMessage({
         id,
         error: { code, message: code === -32601 ? "method not found" : "request failed" },
       });
+      void ticket.promise.catch(() => undefined);
+    } catch {
+      // A failed response write must not escape the stream data callback.
     }
   }
 
@@ -326,14 +417,18 @@ export class JsonlRpcClient {
     }
     this.pendingRequests.delete(id);
     this.cleanupPending(pending);
-    if (!this.closed) {
+    const cancellationError = new CodexError(reason, { action: pending.method });
+    if (pending.ticket !== undefined && !pending.ticket.started) {
+      this.removeQueuedWrite(pending.ticket, cancellationError);
+    } else if (!this.closed) {
       try {
-        this.writeMessage({ method: "$/cancelRequest", params: { id } });
+        const ticket = this.enqueueMessage({ method: "$/cancelRequest", params: { id } });
+        void ticket.promise.catch(() => undefined);
       } catch {
-        // The original cancellation/timeout is the useful failure.
+        // The original cancellation/timeout remains the useful failure.
       }
     }
-    pending.reject(new CodexError(reason, { action: pending.method }));
+    pending.reject(cancellationError);
   }
 
   private cleanupPending(pending: PendingRequest): void {
@@ -345,22 +440,81 @@ export class JsonlRpcClient {
     }
   }
 
-  private writeMessage(message: JsonRpcMessage): void {
+  private enqueueMessage(message: JsonRpcMessage): WriteTicket {
     if (this.closed) {
       throw processError("sendAppServerMessage");
     }
-    let encoded: string;
+    let data: string;
     try {
-      encoded = `${JSON.stringify(message)}\n`;
+      data = `${JSON.stringify(message)}\n`;
     } catch (cause) {
       throw protocolError("serializeAppServerMessage", cause);
     }
+
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const ticket: WriteTicket = {
+      data,
+      promise,
+      resolve,
+      reject,
+      started: false,
+      settled: false,
+    };
+    this.writeQueue.push(ticket);
+    this.pumpWrites();
+    return ticket;
+  }
+
+  private pumpWrites(): void {
+    if (this.closed || this.activeWrite !== undefined) {
+      return;
+    }
+    const ticket = this.writeQueue.shift();
+    if (ticket === undefined) {
+      return;
+    }
+    ticket.started = true;
+    this.activeWrite = ticket;
+    this.input.on("drain", this.handleDrain);
+    let accepted: boolean;
     try {
-      this.input.write(encoded, "utf8");
+      accepted = this.input.write(ticket.data, "utf8");
     } catch (cause) {
-      const error = processError("writeAppServerMessage", cause);
-      this.terminate(error);
-      throw error;
+      this.input.removeListener("drain", this.handleDrain);
+      this.terminate(processError("writeAppServerMessage", cause));
+      return;
+    }
+
+    if (accepted && this.activeWrite === ticket) {
+      this.input.removeListener("drain", this.handleDrain);
+      this.activeWrite = undefined;
+      this.settleWrite(ticket);
+      queueMicrotask(() => this.pumpWrites());
+    }
+  }
+
+  private removeQueuedWrite(ticket: WriteTicket, reason: unknown): void {
+    const index = this.writeQueue.indexOf(ticket);
+    if (index >= 0) {
+      this.writeQueue.splice(index, 1);
+      this.settleWrite(ticket, reason);
+    }
+  }
+
+  private settleWrite(ticket: WriteTicket, error?: unknown): void {
+    if (ticket.settled) {
+      return;
+    }
+    ticket.settled = true;
+    if (error === undefined) {
+      ticket.resolve();
+    } else {
+      ticket.reject(error);
     }
   }
 
@@ -369,12 +523,34 @@ export class JsonlRpcClient {
       return;
     }
     this.closed = true;
+    this.input.removeAllListeners("data");
+    this.input.removeAllListeners("error");
+    this.input.removeAllListeners("end");
+    this.input.removeAllListeners("finish");
+    this.input.removeAllListeners("close");
+    this.input.removeAllListeners("drain");
+    this.output.removeAllListeners("data");
+    this.output.removeAllListeners("error");
+    this.output.removeAllListeners("end");
+    this.output.removeAllListeners("close");
+    this.output.removeAllListeners("drain");
+
     for (const pending of this.pendingRequests.values()) {
       this.cleanupPending(pending);
       pending.reject(error);
     }
     this.pendingRequests.clear();
+    for (const ticket of this.writeQueue) {
+      this.settleWrite(ticket, error);
+    }
+    this.writeQueue.length = 0;
+    if (this.activeWrite !== undefined) {
+      this.settleWrite(this.activeWrite, error);
+      this.activeWrite = undefined;
+    }
     this.serverRequests.clear();
+    this.serverRequestHandlers.clear();
+    this.lineBuffer = "";
   }
 }
 

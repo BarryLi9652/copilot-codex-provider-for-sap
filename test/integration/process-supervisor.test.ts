@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import { CodexError } from "../../src/core/errors.js";
@@ -16,6 +18,87 @@ const waitForExit = (child: ChildProcess): Promise<void> => new Promise((resolve
   }
   child.once("exit", () => resolve());
 });
+
+const wait = async (milliseconds: number): Promise<void> => {
+  await new Promise<void>((resolve) => setTimeout(() => resolve(), milliseconds));
+};
+
+type KillMode = "any" | "force-only" | "never";
+
+class FakeChild extends EventEmitter {
+  public readonly stdin = new PassThrough();
+  public readonly stdout: PassThrough | null;
+  public readonly stderr = new PassThrough();
+  public readonly killCalls: Array<NodeJS.Signals | number | undefined> = [];
+  public pid = 30_000;
+  public exitCode: number | null = null;
+  public signalCode: NodeJS.Signals | null = null;
+  public exitedAt: number | undefined;
+
+  public constructor(
+    private readonly killMode: KillMode = "any",
+    stdout: PassThrough | null = new PassThrough(),
+    private readonly killDelayMs = 0,
+  ) {
+    super();
+    this.stdout = stdout;
+  }
+
+  public kill(signal?: NodeJS.Signals | number): boolean {
+    this.killCalls.push(signal);
+    const shouldExit = this.killMode === "any"
+      || (this.killMode === "force-only" && signal === "SIGKILL");
+    if (shouldExit) {
+      setTimeout(() => this.exit(0, typeof signal === "string" ? signal : null), this.killDelayMs);
+    }
+    return true;
+  }
+
+  public exit(code = 0, signal: NodeJS.Signals | null = null): void {
+    if (this.exitCode !== null || this.signalCode !== null) {
+      return;
+    }
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.exitedAt = Date.now();
+    this.emit("exit", code, signal);
+  }
+}
+
+const asChildProcess = (child: FakeChild): ChildProcess => child as unknown as ChildProcess;
+
+type SupervisorClient = Awaited<ReturnType<ProcessSupervisor["start"]>>;
+
+interface FixRoundSupervisor extends ProcessSupervisor {
+  dispose(): Promise<void>;
+  reportInitializationFailure(client: SupervisorClient, cause?: unknown): Promise<void>;
+  reportInitializationSuccess(client: SupervisorClient): void;
+}
+
+const asFixRoundSupervisor = (supervisor: ProcessSupervisor): FixRoundSupervisor =>
+  supervisor as FixRoundSupervisor;
+
+const injectedSupervisor = (
+  spawnChild: (count: number) => FakeChild,
+  options: Partial<ConstructorParameters<typeof ProcessSupervisor>[0]> = {},
+): { supervisor: ProcessSupervisor; children: FakeChild[] } => {
+  const children: FakeChild[] = [];
+  const supervisorOptions = {
+    configuredExecutable: process.execPath,
+    cwd: process.cwd(),
+    env: { ...process.env },
+    killGraceMs: 10,
+    forceKillWaitMs: 20,
+    ...options,
+    spawnProcess: () => {
+      const child = spawnChild(children.length + 1);
+      children.push(child);
+      return asChildProcess(child);
+    },
+  } as ConstructorParameters<typeof ProcessSupervisor>[0];
+  const supervisor = new ProcessSupervisor(supervisorOptions);
+  return { supervisor, children };
+};
 
 test("starts the fake App Server with exact stdio argv and stops without an orphan", async () => {
   let receivedExecutable = "";
@@ -132,4 +215,123 @@ test("records only stderr metadata and never includes stderr content in diagnost
   const metadata = logLines.map((line) => JSON.parse(line) as Record<string, unknown>);
   assert.ok(metadata.some((entry) => entry.event === "appServer.stderr"));
   assert.ok(metadata.every((entry) => typeof entry.bytes === "number"));
+});
+
+test("does not let an old child error close or clear a newer generation", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const first = await supervisor.start();
+  await supervisor.stop();
+  const second = await supervisor.restart();
+  const oldChild = children[0] as FakeChild;
+  oldChild.emit("error", new Error("late old child error"));
+  oldChild.stderr.emit("data", "late old stderr");
+  assert.doesNotThrow(() => {
+    oldChild.stderr.emit("error", new Error("late old stderr error"));
+  });
+  oldChild.emit("exit", 1, null);
+
+  assert.equal(await supervisor.start(), second);
+  assert.equal(second.isClosed, false);
+  assert.notEqual(first, second);
+  await supervisor.stop();
+});
+
+test("failed start kills and waits for the exact child before rejecting", async () => {
+  const child = new FakeChild("any", null, 20);
+  const { supervisor } = injectedSupervisor(() => child);
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    supervisor.start(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+  assert.ok(child.exitedAt !== undefined);
+  assert.ok(child.exitedAt >= startedAt + 15);
+  assert.deepEqual(child.killCalls, [undefined]);
+});
+
+test("escalates from graceful kill to SIGKILL when graceful kill is ignored", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("force-only"));
+  await supervisor.start();
+  const stopping = supervisor.stop();
+  await stopping;
+  assert.deepEqual((children[0] as FakeChild).killCalls, [undefined, "SIGKILL"]);
+  assert.equal((children[0] as FakeChild).exitCode, 0);
+  await supervisor.stop();
+});
+
+test("returns a typed process error after bounded force-kill failure and does not spawn over a live child", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("never"));
+  await supervisor.start();
+  await assert.rejects(
+    supervisor.stop(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+  assert.deepEqual((children[0] as FakeChild).killCalls, [undefined, "SIGKILL"]);
+  await assert.rejects(
+    supervisor.start(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+  (children[0] as FakeChild).exit();
+});
+
+test("does not spawn a new child while the prior child is still terminating", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any", new PassThrough(), 20));
+  await supervisor.start();
+  const stopping = supervisor.stop();
+  const starting = supervisor.start();
+  await stopping;
+  const second = await starting;
+
+  assert.equal(children.length, 2);
+  assert.ok((children[0] as FakeChild).exitedAt !== undefined);
+  await supervisor.stop();
+  assert.equal(second.isClosed, true);
+});
+
+test("shares one concurrent start promise and exposes idempotent dispose", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const firstStart = supervisor.start();
+  const secondStart = supervisor.start();
+  const [first, second] = await Promise.all([firstStart, secondStart]);
+  assert.equal(first, second);
+  assert.equal(children.length, 1);
+  await asFixRoundSupervisor(supervisor).dispose();
+  await asFixRoundSupervisor(supervisor).dispose();
+});
+
+test("tracks initialization failures, resets after success, and ignores stale client reports", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const first = await supervisor.start();
+  await asFixRoundSupervisor(supervisor).reportInitializationFailure(first, new Error("first init failed"));
+
+  const second = await supervisor.start();
+  asFixRoundSupervisor(supervisor).reportInitializationSuccess(second);
+  (children[1] as FakeChild).exit(1);
+  await wait(1);
+
+  const third = await supervisor.start();
+  await asFixRoundSupervisor(supervisor).reportInitializationFailure(first, new Error("stale failure"));
+  assert.equal(await supervisor.start(), third);
+
+  await asFixRoundSupervisor(supervisor).reportInitializationFailure(third, new Error("second init failed"));
+  await assert.rejects(
+    supervisor.start(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+  const reset = await supervisor.restart();
+  asFixRoundSupervisor(supervisor).reportInitializationSuccess(reset);
+  await asFixRoundSupervisor(supervisor).dispose();
+});
+
+test("handles a child error as a generation-owned failure and permits one restart", async () => {
+  const { supervisor, children } = injectedSupervisor(() => new FakeChild("any"));
+  const first = await supervisor.start();
+  (children[0] as FakeChild).emit("error", new Error("child error"));
+  await wait(1);
+  const second = await supervisor.start();
+
+  assert.notEqual(first, second);
+  assert.equal(children.length, 2);
+  await asFixRoundSupervisor(supervisor).dispose();
 });
