@@ -1,0 +1,106 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import type { CodexModel, CodexRequest } from "../../src/core/types.js";
+import { buildResponsesRequest } from "../../src/transports/chatgpt-oauth/request-codec.js";
+
+const model: CodexModel = {
+  id: "gpt-5-codex",
+  name: "GPT-5 Codex",
+  family: "gpt",
+  version: "codex-5-2026-08",
+  maxInputTokens: 258400,
+  maxOutputTokens: 128000,
+  capabilities: { imageInput: true, toolCalling: true, parallelToolCalls: true },
+};
+
+const request: CodexRequest = {
+  requestId: "request-1",
+  modelId: model.id,
+  instructions: "Be precise.",
+  toolMode: "required",
+  tools: [{
+    name: "get_abap_object_lines",
+    description: "Read ABAP lines",
+    inputSchema: {
+      type: "object",
+      properties: { uri: { type: "string" } },
+      required: ["uri"],
+    },
+  }],
+  messages: [
+    {
+      role: "user",
+      parts: [
+        { kind: "text", text: "Read this object." },
+        { kind: "image", mimeType: "image/png", data: new Uint8Array([0, 1, 2, 255]) },
+      ],
+    },
+    {
+      role: "assistant",
+      parts: [{ kind: "tool-call", callId: "call-7", name: "get_abap_object_lines", input: {
+        uri: "adt://DEV/zcl_demo",
+      } }],
+    },
+    {
+      role: "user",
+      parts: [{ kind: "tool-result", callId: "call-7", content: [
+        { kind: "text", text: "CLASS zcl_demo DEFINITION." },
+        { kind: "image", mimeType: "image/jpeg", data: new Uint8Array([3, 4]) },
+      ] }],
+    },
+  ],
+};
+
+test("encodes Responses flags, every tool schema, multimodal input, and exact tool IDs", () => {
+  const body = buildResponsesRequest(request, model);
+
+  assert.equal(body.model, "gpt-5-codex");
+  assert.equal(body.instructions, "Be precise.");
+  assert.equal(body.store, false);
+  assert.equal(body.stream, true);
+  assert.equal(body.parallel_tool_calls, true);
+  assert.equal(body.tool_choice, "required");
+  assert.deepEqual(body.tools, [{
+    type: "function",
+    name: "get_abap_object_lines",
+    description: "Read ABAP lines",
+    parameters: { type: "object", properties: { uri: { type: "string" } }, required: ["uri"] },
+    strict: false,
+  }]);
+
+  assert.deepEqual(body.input, [
+    {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "Read this object." },
+        { type: "input_image", image_url: "data:image/png;base64,AAEC/w==" },
+      ],
+    },
+    {
+      type: "function_call",
+      call_id: "call-7",
+      name: "get_abap_object_lines",
+      arguments: "{\"uri\":\"adt://DEV/zcl_demo\"}",
+    },
+    {
+      type: "function_call_output",
+      call_id: "call-7",
+      output: [
+        { type: "input_text", text: "CLASS zcl_demo DEFINITION." },
+        { type: "input_image", image_url: "data:image/jpeg;base64,AwQ=" },
+      ],
+    },
+  ]);
+});
+
+test("uses automatic tool choice and disables parallel calls from model capabilities", () => {
+  const body = buildResponsesRequest({ ...request, toolMode: "auto" }, {
+    ...model,
+    capabilities: { imageInput: true, toolCalling: true, parallelToolCalls: false },
+  });
+
+  assert.equal(body.tool_choice, "auto");
+  assert.equal(body.parallel_tool_calls, false);
+});
