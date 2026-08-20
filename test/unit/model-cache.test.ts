@@ -44,7 +44,47 @@ test("separate model caches do not share values or in-flight refreshes", async (
   assert.equal(b[0]?.id, "model-2");
 });
 
-test("clear discards cached values and rejected in-flight refreshes", async () => {
+test("clear discards populated cache data", async () => {
+  let calls = 0;
+  const cache = new ModelCache(300_000);
+  const load = async () => [createModel(`model-${++calls}`)];
+
+  assert.equal((await cache.get(load))[0]?.id, "model-1");
+  cache.clear();
+
+  assert.equal((await cache.get(load))[0]?.id, "model-2");
+  assert.equal(calls, 2);
+});
+
+test("clear prevents a pending refresh from repopulating stale models", async () => {
+  let calls = 0;
+  let resolveStale!: (models: readonly CodexModel[]) => void;
+  const staleRefresh = new Promise<readonly CodexModel[]>((resolve) => {
+    resolveStale = resolve;
+  });
+  const cache = new ModelCache(300_000, () => 0);
+  const pending = cache.get(async () => {
+    calls += 1;
+    return staleRefresh;
+  });
+
+  cache.clear();
+  const fresh = await cache.get(async () => {
+    calls += 1;
+    return [createModel("fresh-model")];
+  });
+
+  assert.equal(fresh[0]?.id, "fresh-model");
+  resolveStale([createModel("stale-model")]);
+  assert.equal((await pending)[0]?.id, "stale-model");
+  assert.equal(
+    (await cache.get(async () => [createModel("unexpected-model")]))[0]?.id,
+    "fresh-model",
+  );
+  assert.equal(calls, 2);
+});
+
+test("clear allows retry after a rejected refresh", async () => {
   let calls = 0;
   const cache = new ModelCache(300_000);
   const rejected = cache.get(async () => {

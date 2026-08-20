@@ -40,7 +40,7 @@ const request: CodexRequest = {
   instructions: "Answer briefly.",
 };
 
-test("shared transport contracts represent normalized model, request, and event data", () => {
+test("shared transport contracts deliver normalized model, request, and event data", async () => {
   const events: TransportEvent[] = [
     { type: "text-delta", text: "hello" },
     { type: "tool-call", callId: "call-1", name: "lookup", input: { key: "value" } },
@@ -57,15 +57,16 @@ test("shared transport contracts represent normalized model, request, and event 
     dispose: async () => undefined,
   };
 
-  assert.deepEqual(events, [
-    { type: "text-delta", text: "hello" },
-    { type: "tool-call", callId: "call-1", name: "lookup", input: { key: "value" } },
-    { type: "usage", inputTokens: 3, outputTokens: 2 },
-    { type: "completed" },
-  ]);
-  assert.equal(transport.listModels({ silent: true }, new AbortController().signal).then(
-    (models) => models[0]?.id,
-  ) instanceof Promise, true);
+  const delivered: TransportEvent[] = [];
+  for await (const event of transport.generate(request, new AbortController().signal)) {
+    delivered.push(event);
+  }
+
+  assert.deepEqual(delivered, events);
+  assert.deepEqual(
+    await transport.listModels({ silent: true }, new AbortController().signal),
+    [model],
+  );
   assert.deepEqual(request.messages[0], {
     role: "user",
     parts: [{ kind: "text", text: "hello" }],
@@ -118,6 +119,24 @@ test("toAbortSignal bridges later cancellation and disposes the listener", () =>
   assert.equal(bridge.signal.aborted, true);
   bridge.dispose();
   assert.equal(disposed, true);
+});
+
+test("disposing toAbortSignal before cancellation prevents a later abort", () => {
+  let cancel: (() => void) | undefined;
+  let disposed = false;
+  const bridge = toAbortSignal({
+    isCancellationRequested: false,
+    onCancellationRequested: (listener: (event: unknown) => void) => {
+      cancel = () => listener(undefined);
+      return { dispose: () => { disposed = true; } };
+    },
+  });
+
+  bridge.dispose();
+  cancel?.();
+
+  assert.equal(disposed, true);
+  assert.equal(bridge.signal.aborted, false);
 });
 
 test("EmptyTransport exposes no models and throws only its configured error", async () => {
