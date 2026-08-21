@@ -8,7 +8,14 @@ export interface ToolContinuationResult {
   success: boolean;
 }
 
+export interface ToolContinuationIdentity {
+  readonly generation: number;
+  readonly leaseId: string;
+}
+
 export interface PendingToolCall {
+  generation: number;
+  leaseId: string;
   rpcId: JsonRpcId;
   threadId: string;
   turnId: string;
@@ -23,6 +30,8 @@ export interface PendingToolCall {
 }
 
 export interface PendingToolCallRequest {
+  generation?: number;
+  leaseId?: string;
   rpcId: JsonRpcId;
   threadId: string;
   turnId: string;
@@ -36,6 +45,8 @@ export interface PendingToolCallRequest {
 }
 
 export interface PendingContinuation {
+  readonly generation: number;
+  readonly leaseId: string;
   readonly threadId: string;
   readonly turnId: string;
   readonly calls: readonly PendingToolCall[];
@@ -43,6 +54,8 @@ export interface PendingContinuation {
 
 export interface ToolContinuationResumeOptions {
   continueTurn?: boolean;
+  generation?: number;
+  leaseId?: string;
   threadId?: string;
   turnId?: string;
 }
@@ -68,7 +81,57 @@ const continuationError = (): CodexError => new CodexError("toolContinuation", {
   action: "resumeToolCall",
 });
 
-const chainKey = (threadId: string, turnId: string): string => `${threadId}\u0000${turnId}`;
+const LEGACY_IDENTITY: ToolContinuationIdentity = {
+  generation: 0,
+  leaseId: "legacy",
+};
+
+const identityOf = (
+  generation?: number,
+  leaseId?: string,
+): ToolContinuationIdentity => {
+  if ((generation === undefined) !== (leaseId === undefined)) {
+    throw continuationError();
+  }
+  const identity = {
+    generation: generation ?? LEGACY_IDENTITY.generation,
+    leaseId: leaseId ?? LEGACY_IDENTITY.leaseId,
+  };
+  if (
+    !Number.isSafeInteger(identity.generation)
+    || identity.generation < 0
+    || identity.leaseId.length === 0
+  ) {
+    throw continuationError();
+  }
+  return identity;
+};
+
+const identityFrom = (identity?: ToolContinuationIdentity): ToolContinuationIdentity =>
+  identityOf(identity?.generation, identity?.leaseId);
+
+const hasIdentity = (options: ToolContinuationResumeOptions): boolean =>
+  options.generation !== undefined || options.leaseId !== undefined;
+
+const chainKey = (
+  threadId: string,
+  turnId: string,
+  identity: ToolContinuationIdentity,
+): string => JSON.stringify([
+  identity.generation,
+  identity.leaseId,
+  threadId,
+  turnId,
+]);
+
+const callKey = (
+  callId: string,
+  identity: ToolContinuationIdentity,
+): string => JSON.stringify([
+  identity.generation,
+  identity.leaseId,
+  callId,
+]);
 
 export class ToolContinuationRegistry {
   private readonly now: () => number;
@@ -96,16 +159,24 @@ export class ToolContinuationRegistry {
     return this.callsById.size;
   }
 
-  public has(callId: string): boolean {
-    return this.callsById.has(callId);
+  public has(callId: string, identity?: ToolContinuationIdentity): boolean {
+    return this.callsById.has(callKey(callId, identityFrom(identity)));
   }
 
-  public hasState(threadId: string, turnId: string): boolean {
-    return this.states.has(chainKey(threadId, turnId));
+  public hasState(
+    threadId: string,
+    turnId: string,
+    identity?: ToolContinuationIdentity,
+  ): boolean {
+    return this.states.has(chainKey(threadId, turnId, identityFrom(identity)));
   }
 
-  public isReady(threadId: string, turnId: string): boolean {
-    const state = this.states.get(chainKey(threadId, turnId));
+  public isReady(
+    threadId: string,
+    turnId: string,
+    identity?: ToolContinuationIdentity,
+  ): boolean {
+    const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
     if (state === undefined) {
       return false;
     }
@@ -117,15 +188,19 @@ export class ToolContinuationRegistry {
     if (request.callId.length === 0 || request.threadId.length === 0 || request.turnId.length === 0) {
       throw continuationError();
     }
-    if (this.callsById.has(request.callId)) {
+    const identity = identityOf(request.generation, request.leaseId);
+    const callKeyValue = callKey(request.callId, identity);
+    if (this.callsById.has(callKeyValue)) {
       throw continuationError();
     }
 
-    const key = chainKey(request.threadId, request.turnId);
+    const key = chainKey(request.threadId, request.turnId, identity);
     let state = this.states.get(key);
     if (state === undefined) {
       const callMap = new Map<string, PendingToolCall>();
       state = {
+        generation: identity.generation,
+        leaseId: identity.leaseId,
         threadId: request.threadId,
         turnId: request.turnId,
         calls: [],
@@ -150,6 +225,8 @@ export class ToolContinuationRegistry {
       throw continuationError();
     }
     const call: PendingToolCall = {
+      generation: identity.generation,
+      leaseId: identity.leaseId,
       rpcId: request.rpcId,
       threadId: request.threadId,
       turnId: request.turnId,
@@ -162,9 +239,9 @@ export class ToolContinuationRegistry {
       reject: request.reject,
     };
     state.callMap.set(call.callId, call);
-    this.callsById.set(call.callId, { call, state });
+    this.callsById.set(callKeyValue, { call, state });
     const timer = this.setTimeout(() => {
-      const entry = this.callsById.get(call.callId);
+      const entry = this.callsById.get(callKeyValue);
       if (entry?.state === state) {
         this.terminate(state, new CodexError("timeout"));
       }
@@ -175,24 +252,31 @@ export class ToolContinuationRegistry {
     return state;
   }
 
-  public markSurfaced(callId: string): void {
-    const entry = this.callsById.get(callId);
+  public markSurfaced(callId: string, identity?: ToolContinuationIdentity): void {
+    const entry = this.callsById.get(callKey(callId, identityFrom(identity)));
     if (entry === undefined) {
       throw continuationError();
     }
     entry.call.surfacedToCopilot = true;
   }
 
-  public unsurfaced(threadId: string, turnId: string): readonly PendingToolCall[] {
-    const state = this.states.get(chainKey(threadId, turnId));
+  public unsurfaced(
+    threadId: string,
+    turnId: string,
+    identity?: ToolContinuationIdentity,
+  ): readonly PendingToolCall[] {
+    const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
     if (state === undefined) {
       return [];
     }
     return [...state.callMap.values()].filter((call) => !call.surfacedToCopilot);
   }
 
-  public received(callId: string): ToolContinuationResult | undefined {
-    return this.callsById.get(callId)?.call.receivedResult;
+  public received(
+    callId: string,
+    identity?: ToolContinuationIdentity,
+  ): ToolContinuationResult | undefined {
+    return this.callsById.get(callKey(callId, identityFrom(identity)))?.call.receivedResult;
   }
 
   public resume(
@@ -223,7 +307,7 @@ export class ToolContinuationRegistry {
         throw continuationError();
       }
       seen.add(result.callId);
-      const entry = this.callsById.get(result.callId);
+      const entry = this.callsById.get(callKey(result.callId, this.identityOfState(state)));
       if (entry === undefined || entry.state !== state || entry.call.receivedResult !== undefined) {
         throw continuationError();
       }
@@ -277,15 +361,20 @@ export class ToolContinuationRegistry {
     threadId: string,
     turnId: string,
     error: Error = new CodexError("cancelled"),
+    identity?: ToolContinuationIdentity,
   ): void {
-    const state = this.states.get(chainKey(threadId, turnId));
+    const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
     if (state !== undefined) {
       this.terminate(state, error);
     }
   }
 
-  public cleanup(threadId: string, turnId: string): void {
-    const state = this.states.get(chainKey(threadId, turnId));
+  public cleanup(
+    threadId: string,
+    turnId: string,
+    identity?: ToolContinuationIdentity,
+  ): void {
+    const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
     if (state !== undefined) {
       this.removeState(state);
     }
@@ -295,9 +384,10 @@ export class ToolContinuationRegistry {
     error: Error = new CodexError("process"),
     threadId?: string,
     turnId?: string,
+    identity?: ToolContinuationIdentity,
   ): void {
     if (threadId !== undefined && turnId !== undefined) {
-      const state = this.states.get(chainKey(threadId, turnId));
+      const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
       if (state !== undefined) {
         this.terminate(state, error);
       }
@@ -316,20 +406,28 @@ export class ToolContinuationRegistry {
     results: readonly ToolContinuationResult[],
     options: ToolContinuationResumeOptions,
   ): ContinuationState | undefined {
+    const identity = identityOf(options.generation, options.leaseId);
     if (results.length === 0) {
       if (options.threadId !== undefined && options.turnId !== undefined) {
-        return this.states.get(chainKey(options.threadId, options.turnId));
+        return this.states.get(chainKey(options.threadId, options.turnId, identity));
       }
       if (this.states.size !== 1) {
         return undefined;
       }
       return this.states.values().next().value as ContinuationState | undefined;
     }
-    const first = this.callsById.get(results[0]?.callId ?? "");
-    if (first === undefined) {
+    const callId = results[0]?.callId ?? "";
+    const candidates = [...this.callsById.values()]
+      .filter((entry) => entry.call.callId === callId)
+      .filter((entry) => (
+        !hasIdentity(options)
+        || entry.call.generation === identity.generation && entry.call.leaseId === identity.leaseId
+      ));
+    const candidateStates = [...new Set(candidates.map((entry) => entry.state))];
+    if (candidateStates.length !== 1) {
       throw continuationError();
     }
-    return first.state;
+    return candidateStates[0];
   }
 
   private bindSignal(state: ContinuationState, signal: AbortSignal): void {
@@ -344,7 +442,11 @@ export class ToolContinuationRegistry {
       return;
     }
     const onAbort = (): void => {
-      if (this.states.get(chainKey(state.threadId, state.turnId)) === state) {
+      if (this.states.get(chainKey(
+        state.threadId,
+        state.turnId,
+        this.identityOfState(state),
+      )) === state) {
         this.terminate(state, new CodexError("cancelled"));
       }
     };
@@ -364,13 +466,13 @@ export class ToolContinuationRegistry {
   }
 
   private removeState(state: ContinuationState): void {
-    const key = chainKey(state.threadId, state.turnId);
+    const key = chainKey(state.threadId, state.turnId, this.identityOfState(state));
     if (this.states.get(key) !== state) {
       return;
     }
     this.states.delete(key);
     for (const callId of state.callMap.keys()) {
-      this.callsById.delete(callId);
+      this.callsById.delete(callKey(callId, this.identityOfState(state)));
     }
     if (state.signal !== undefined && state.onAbort !== undefined) {
       state.signal.removeEventListener("abort", state.onAbort);
@@ -382,5 +484,9 @@ export class ToolContinuationRegistry {
     }
     state.timers.clear();
     state.callMap.clear();
+  }
+
+  private identityOfState(state: ContinuationState): ToolContinuationIdentity {
+    return { generation: state.generation, leaseId: state.leaseId };
   }
 }

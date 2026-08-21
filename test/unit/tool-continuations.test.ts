@@ -204,3 +204,34 @@ test("cancellation and process exit reject every pending call and leave no orpha
   assert.equal(registry.size, 0);
   assert.deepEqual(registry.unsurfaced("thread-cancel", "turn-cancel"), []);
 });
+
+test("isolates reused call and turn IDs by generation and lease identity", () => {
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const firstIdentity = { generation: 1, leaseId: "lease-1" };
+  const secondIdentity = { generation: 2, leaseId: "lease-2" };
+  registry.capture({
+    ...request("same-call", "reused-thread", "reused-turn"),
+    ...firstIdentity,
+  });
+  registry.capture({
+    ...request("same-call", "reused-thread", "reused-turn"),
+    ...secondIdentity,
+  });
+
+  assert.equal(registry.size, 2);
+  assert.equal(registry.has("same-call", firstIdentity), true);
+  assert.equal(registry.has("same-call", secondIdentity), true);
+
+  registry.cancel(
+    "reused-thread",
+    "reused-turn",
+    new CodexError("cancelled"),
+    firstIdentity,
+  );
+  assert.equal(registry.has("same-call", firstIdentity), false);
+  assert.equal(registry.has("same-call", secondIdentity), true);
+  assert.equal(registry.size, 1);
+
+  registry.cleanup("reused-thread", "reused-turn", secondIdentity);
+  assert.equal(registry.size, 0);
+});

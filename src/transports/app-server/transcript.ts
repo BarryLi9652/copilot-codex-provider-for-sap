@@ -14,6 +14,48 @@ const escapeTranscriptText = (value: string): string => value
   .replace(/\[/g, "\\u005b")
   .replace(/\]/g, "\\u005d");
 
+const escapeJsonText = (value: string): string => {
+  let inString = false;
+  let escaped = false;
+  let output = "";
+  for (const character of value) {
+    if (!inString) {
+      output += character;
+      if (character === '"') {
+        inString = true;
+      }
+      continue;
+    }
+    if (escaped) {
+      output += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      output += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      output += character;
+      inString = false;
+      continue;
+    }
+    if (character === "<") {
+      output += "\\u003c";
+    } else if (character === ">") {
+      output += "\\u003e";
+    } else if (character === "[") {
+      output += "\\u005b";
+    } else if (character === "]") {
+      output += "\\u005d";
+    } else {
+      output += character;
+    }
+  }
+  return output;
+};
+
 const escapeAttribute = (value: string): string => value
   .replace(/&/g, "&amp;")
   .replace(/"/g, "&quot;")
@@ -22,7 +64,7 @@ const escapeAttribute = (value: string): string => value
 
 const jsonText = (value: unknown): string => {
   try {
-    return escapeTranscriptText(JSON.stringify(value) ?? "null");
+    return escapeJsonText(JSON.stringify(value) ?? "null");
   } catch (cause) {
     throw new CodexError("protocol", { action: "serializeTranscript", cause });
   }

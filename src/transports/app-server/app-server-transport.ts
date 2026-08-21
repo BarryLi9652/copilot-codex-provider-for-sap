@@ -23,6 +23,7 @@ import {
 import { serializeTranscript } from "./transcript.js";
 import {
   ToolContinuationRegistry,
+  type ToolContinuationIdentity,
   type ToolContinuationResult,
 } from "./tool-continuations.js";
 
@@ -106,7 +107,20 @@ const readCorrelation = (params: unknown): Correlation | undefined => {
     : { threadId, turnId };
 };
 
-const chainKey = (threadId: string, turnId: string): string => `${threadId}\u0000${turnId}`;
+const chainKey = (
+  threadId: string,
+  turnId: string,
+  generation: number,
+  leaseId: string,
+): string => JSON.stringify([generation, leaseId, threadId, turnId]);
+
+const callKey = (callId: string, generation: number, leaseId: string): string =>
+  JSON.stringify([generation, leaseId, callId]);
+
+const stateIdentity = (state: TurnState): ToolContinuationIdentity => ({
+  generation: state.generation,
+  leaseId: state.leaseId,
+});
 
 const cancellationError = (): CodexError => new CodexError("cancelled");
 
@@ -279,16 +293,23 @@ export class AppServerTransport implements CodexTransport {
 
       if (continuationState !== undefined) {
         activeState = continuationState;
-        this.assertContinuationImages(continuationState, results);
         this.bindSignal(continuationState, signal);
         continuationState.keepAlive = false;
         const newResults = results.filter((result) =>
-          this.callStates.get(result.callId) === continuationState
-          && this.registry.has(result.callId)
+          this.callStates.get(callKey(
+            result.callId,
+            continuationState.generation,
+            continuationState.leaseId,
+          )) === continuationState
+          && this.registry.has(result.callId, stateIdentity(continuationState))
           && !continuationState.receivedCallIds.has(result.callId)
-          && this.registry.received(result.callId) === undefined);
+          && this.registry.received(result.callId, stateIdentity(continuationState)) === undefined);
+        this.assertContinuationImages(continuationState, newResults);
         if (newResults.length > 0) {
-          const resumed = this.registry.resume(newResults, signal);
+          const resumed = this.registry.resume(newResults, signal, {
+            generation: continuationState.generation,
+            leaseId: continuationState.leaseId,
+          });
           for (const result of newResults) {
             continuationState.receivedCallIds.add(result.callId);
           }
@@ -301,11 +322,13 @@ export class AppServerTransport implements CodexTransport {
         if (this.registry.unsurfaced(
           continuationState.threadId,
           continuationState.turnId,
+          stateIdentity(continuationState),
         ).length > 0) {
           yield* this.consumeState(continuationState, signal);
         } else if (this.registry.hasState(
           continuationState.threadId,
           continuationState.turnId,
+          stateIdentity(continuationState),
         )) {
           continuationState.keepAlive = true;
         }
@@ -394,7 +417,12 @@ export class AppServerTransport implements CodexTransport {
         input: serializeTranscript(request.messages, { supportsImages }),
       }, signal);
       state.turnId = turn.turnId;
-      this.states.set(chainKey(state.threadId, state.turnId), state);
+      this.states.set(chainKey(
+        state.threadId,
+        state.turnId,
+        state.generation,
+        state.leaseId,
+      ), state);
       this.flushPreResponse(state);
       this.bindSignal(state, signal);
       return state;
@@ -489,6 +517,7 @@ export class AppServerTransport implements CodexTransport {
       state.terminal = true;
       state.failure = error;
       state.queue.fail(error);
+      void this.terminateState(state, error, true);
     }
   }
 
@@ -570,13 +599,15 @@ export class AppServerTransport implements CodexTransport {
     return new Promise<unknown>((resolve, reject) => {
       try {
         this.registry.capture({
+          generation: state.generation,
+          leaseId: state.leaseId,
           ...call,
           respond: (result) => resolve(result),
           reject,
           continue: (signal) => this.consumeState(state, signal),
         });
         state.callIds.add(call.callId);
-        this.callStates.set(call.callId, state);
+        this.callStates.set(callKey(call.callId, state.generation, state.leaseId), state);
         state.queue.push({ kind: "tool" });
       } catch (cause) {
         reject(cause);
@@ -608,7 +639,12 @@ export class AppServerTransport implements CodexTransport {
     const processFailure = error.code === "process"
       ? error
       : new CodexError("process", { action: "appServerExit", cause: error });
-    this.registry.processExit(processFailure, state.threadId, state.turnId);
+    this.registry.processExit(
+      processFailure,
+      state.threadId,
+      state.turnId,
+      stateIdentity(state),
+    );
     void this.terminateState(state, processFailure, false);
   }
 
@@ -632,10 +668,14 @@ export class AppServerTransport implements CodexTransport {
         if (state.failure !== undefined) {
           throw state.failure;
         }
-        const unsurfaced = this.registry.unsurfaced(state.threadId, state.turnId);
+        const unsurfaced = this.registry.unsurfaced(
+          state.threadId,
+          state.turnId,
+          stateIdentity(state),
+        );
         if (unsurfaced.length > 0) {
           for (const call of unsurfaced) {
-            this.registry.markSurfaced(call.callId);
+            this.registry.markSurfaced(call.callId, stateIdentity(state));
             yield {
               type: "tool-call",
               callId: call.callId,
@@ -643,9 +683,11 @@ export class AppServerTransport implements CodexTransport {
               input: call.input,
             };
           }
-          if (this.registry.isReady(state.threadId, state.turnId)) {
+          if (this.registry.isReady(state.threadId, state.turnId, stateIdentity(state))) {
             this.registry.resume([], signal, {
               continueTurn: false,
+              generation: state.generation,
+              leaseId: state.leaseId,
               threadId: state.threadId,
               turnId: state.turnId,
             });
@@ -717,16 +759,29 @@ export class AppServerTransport implements CodexTransport {
   }
 
   private findContinuationState(results: readonly ToolContinuationResult[]): TurnState | undefined {
+    const candidates = new Set<TurnState>();
     for (const result of results) {
-      if (!this.registry.has(result.callId)) {
-        continue;
-      }
-      const state = this.callStates.get(result.callId);
-      if (state !== undefined && !state.cleaned && !state.cleanupStarted) {
-        return state;
+      for (const state of this.states.values()) {
+        if (
+          state.cleaned
+          || state.cleanupStarted
+          || !state.callIds.has(result.callId)
+          || this.callStates.get(callKey(
+            result.callId,
+            state.generation,
+            state.leaseId,
+          )) !== state
+          || !this.registry.has(result.callId, stateIdentity(state))
+        ) {
+          continue;
+        }
+        candidates.add(state);
       }
     }
-    return undefined;
+    if (candidates.size > 1) {
+      throw protocolError("toolContinuation");
+    }
+    return candidates.values().next().value as TurnState | undefined;
   }
 
   private bindSignal(state: TurnState, signal: AbortSignal): void {
@@ -765,10 +820,10 @@ export class AppServerTransport implements CodexTransport {
     state.terminal = true;
     if (error !== undefined) {
       state.failure = error;
-      this.registry.cancel(state.threadId, state.turnId, error);
+      this.registry.cancel(state.threadId, state.turnId, error, stateIdentity(state));
       state.queue.fail(error);
     } else {
-      this.registry.cleanup(state.threadId, state.turnId);
+      this.registry.cleanup(state.threadId, state.turnId, stateIdentity(state));
       state.queue.close();
     }
     const operation = (async (): Promise<Error | undefined> => {
@@ -789,11 +844,20 @@ export class AppServerTransport implements CodexTransport {
         }
       }
       for (const callId of state.callIds) {
-        if (this.callStates.get(callId) === state) {
-          this.callStates.delete(callId);
+        const key = callKey(callId, state.generation, state.leaseId);
+        if (this.callStates.get(key) === state) {
+          this.callStates.delete(key);
         }
       }
-      this.states.delete(chainKey(state.threadId, state.turnId));
+      const stateKey = chainKey(
+        state.threadId,
+        state.turnId,
+        state.generation,
+        state.leaseId,
+      );
+      if (this.states.get(stateKey) === state) {
+        this.states.delete(stateKey);
+      }
       if (interrupt && state.turnId !== "") {
         cleanupError = await this.boundedCall(() =>
           state.lease.interrupt(state.threadId, state.turnId));

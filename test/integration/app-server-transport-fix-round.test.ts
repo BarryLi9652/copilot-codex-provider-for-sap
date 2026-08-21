@@ -107,9 +107,10 @@ class FakeLease implements AppServerTransportLease {
     public readonly generation: number,
     public readonly leaseId: string,
     private readonly selectedModel: CodexModel = model,
+    ids?: { threadId: string; turnId: string },
   ) {
-    this.threadId = `${leaseId}-thread`;
-    this.turnId = `${leaseId}-turn`;
+    this.threadId = ids?.threadId ?? `${leaseId}-thread`;
+    this.turnId = ids?.turnId ?? `${leaseId}-turn`;
   }
 
   public startThread(
@@ -157,7 +158,14 @@ class FakeLease implements AppServerTransportLease {
 
   public onToolCall(handler: JsonRpcServerRequestHandler): Disposable {
     this.allToolHandlers.push(handler);
-    return { dispose: () => undefined };
+    return {
+      dispose: () => {
+        const index = this.allToolHandlers.indexOf(handler);
+        if (index >= 0) {
+          this.allToolHandlers.splice(index, 1);
+        }
+      },
+    };
   }
 
   public onSecurityFailure(handler: (failure: {
@@ -213,6 +221,15 @@ class FakeLease implements AppServerTransportLease {
   public get selectedModelForTest(): CodexModel {
     return this.selectedModel;
   }
+
+  public get allNotificationHandlerCount(): number {
+    return [...this.allNotifications.values()]
+      .reduce((count, handlers) => count + handlers.length, 0);
+  }
+
+  public get allToolHandlerCount(): number {
+    return this.allToolHandlers.length;
+  }
 }
 
 class FakeSession implements AppServerTransportSession {
@@ -220,13 +237,19 @@ class FakeSession implements AppServerTransportSession {
   public readonly client: AppServerSessionClient = {} as AppServerSessionClient;
   private nextGeneration = 1;
 
-  public constructor(private readonly selectedModel: CodexModel = model) {}
+  public constructor(
+    private readonly selectedModel: CodexModel = model,
+    private readonly reuseTurnIds = false,
+  ) {}
 
   public acquireTransportLease(): Promise<AppServerTransportLease> {
     const lease = new FakeLease(
       this.nextGeneration,
       `lease-${this.nextGeneration}`,
       this.selectedModel,
+      this.reuseTurnIds
+        ? { threadId: "reused-thread", turnId: "reused-turn" }
+        : undefined,
     );
     this.nextGeneration += 1;
     this.leases.push(lease);
@@ -509,5 +532,207 @@ test("cleanup uses the old lease after the session has acquired a replacement ge
   assert.equal(oldLease.unsubscribes.length, 1);
   assert.equal((replacement as FakeLease).interrupts.length, 0);
   assert.equal((replacement as FakeLease).unsubscribes.length, 0);
+  await transport.dispose();
+});
+
+test("old generation cleanup cannot delete a replacement with reused thread, turn, and call IDs", async () => {
+  const session = new FakeSession(model, true);
+  const transport = new AppServerTransport(
+    session,
+    new ToolContinuationRegistry({ now: () => 500 }),
+  );
+  const oldInitial = collect(transport.generate(request(), new AbortController().signal));
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const oldLease = session.leases[0] as FakeLease;
+  const oldTool = oldLease.emitToolCall({
+    threadId: oldLease.threadId,
+    turnId: oldLease.turnId,
+    callId: "reused-call",
+    name: "lookup",
+    input: { generation: "old" },
+  }, 1);
+  let oldToolReturned = false;
+  const oldToolResponse = oldTool.then(() => {
+    oldToolReturned = true;
+  });
+  assert.deepEqual(await oldInitial, [{
+    type: "tool-call",
+    callId: "reused-call",
+    name: "lookup",
+    input: { generation: "old" },
+  }]);
+  const oldContinuation = transport.generate(request([
+    resultMessage("reused-call", [{ kind: "text", text: "old result" }]),
+  ]), new AbortController().signal)[Symbol.asyncIterator]();
+  const oldContinuationFirst = oldContinuation.next();
+  await waitFor(() => oldToolReturned);
+  await oldToolResponse;
+
+  const newIterator = transport.generate(request(), new AbortController().signal)[Symbol.asyncIterator]();
+  const newFirst = newIterator.next();
+  await waitFor(() => session.leases.length === 2 && session.leases[1]?.turnStarts.length === 1);
+  const newLease = session.leases[1] as FakeLease;
+  const newTool = newLease.emitToolCall({
+    threadId: newLease.threadId,
+    turnId: newLease.turnId,
+    callId: "reused-call",
+    name: "lookup",
+    input: { generation: "new" },
+  }, 2);
+  assert.deepEqual((await newFirst).value, {
+    type: "tool-call",
+    callId: "reused-call",
+    name: "lookup",
+    input: { generation: "new" },
+  });
+  assert.equal(newLease.interrupts.length, 0);
+
+  await oldLease.emitNotification("turn/completed", {
+    threadId: oldLease.threadId,
+    turnId: oldLease.turnId,
+  });
+  assert.deepEqual(await oldContinuationFirst, {
+    done: false,
+    value: { type: "completed" },
+  });
+  assert.deepEqual(await oldContinuation.next(), { done: true, value: undefined });
+
+  await transport.dispose();
+  await assert.rejects(newTool, (error: unknown) => error instanceof Error);
+  assert.equal(oldLease.releaseCount, 1);
+  assert.equal(newLease.releaseCount, 1);
+  assert.equal(newLease.interrupts.length, 1);
+  assert.equal(newLease.unsubscribes.length, 1);
+});
+
+test("turn failure cleans a paused keep-alive turn after one tool RPC has returned", async () => {
+  const session = new FakeSession();
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const transport = new AppServerTransport(session, registry);
+  const initial = collect(transport.generate(request(), new AbortController().signal));
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const lease = session.leases[0] as FakeLease;
+  const firstTool = lease.emitToolCall({
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    callId: "failed-call-1",
+    name: "lookup",
+    input: { key: "one" },
+  }, 1);
+  assert.deepEqual(await initial, [
+    { type: "tool-call", callId: "failed-call-1", name: "lookup", input: { key: "one" } },
+  ]);
+
+  const continuation = transport.generate(request([
+    resultMessage("failed-call-1", [{ kind: "text", text: "one" }]),
+  ]), new AbortController().signal)[Symbol.asyncIterator]();
+  const continuationFirst = continuation.next();
+  await firstTool;
+  const secondTool = lease.emitToolCall({
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    callId: "failed-call-2",
+    name: "lookup",
+    input: { key: "two" },
+  }, 2);
+  const secondToolRejection = assert.rejects(secondTool, (error: unknown) => error instanceof Error);
+  assert.deepEqual(await continuationFirst, {
+    done: false,
+    value: { type: "tool-call", callId: "failed-call-2", name: "lookup", input: { key: "two" } },
+  });
+  assert.deepEqual(await continuation.next(), { done: true, value: undefined });
+  await lease.emitNotification("turn/failed", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+  });
+  await waitFor(() => lease.interrupts.length === 1 && lease.unsubscribes.length === 1);
+
+  assert.equal(registry.size, 0);
+  assert.equal(lease.releaseCount, 1);
+  await secondToolRejection;
+  assert.equal(lease.allNotificationHandlerCount, 0);
+  assert.equal(lease.allToolHandlerCount, 0);
+  await transport.dispose();
+});
+
+test("turn error cleans a paused keep-alive turn directly", async () => {
+  const session = new FakeSession();
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const transport = new AppServerTransport(session, registry);
+  const initial = collect(transport.generate(request(), new AbortController().signal));
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const lease = session.leases[0] as FakeLease;
+  const pendingTool = lease.emitToolCall({
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    callId: "error-call",
+    name: "lookup",
+    input: { key: "error" },
+  }, 1);
+  const pendingToolRejection = assert.rejects(pendingTool, (error: unknown) => error instanceof Error);
+  assert.deepEqual(await initial, [
+    { type: "tool-call", callId: "error-call", name: "lookup", input: { key: "error" } },
+  ]);
+
+  await lease.emitNotification("turn/error", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+  });
+  await waitFor(() => lease.interrupts.length === 1 && lease.unsubscribes.length === 1);
+
+  assert.equal(registry.size, 0);
+  assert.equal(lease.releaseCount, 1);
+  await pendingToolRejection;
+  assert.equal(lease.allNotificationHandlerCount, 0);
+  assert.equal(lease.allToolHandlerCount, 0);
+  await transport.dispose();
+});
+
+test("ignores historical image results when validating a live text-only continuation", async () => {
+  const session = new FakeSession(textOnlyModel);
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const transport = new AppServerTransport(session, registry);
+  const firstIterator = transport.generate(request(), new AbortController().signal)[Symbol.asyncIterator]();
+  const first = firstIterator.next();
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const lease = session.leases[0] as FakeLease;
+  const pendingTool = lease.emitToolCall({
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    callId: "live-text-call",
+    name: "lookup",
+    input: { key: "live" },
+  }, 1);
+  assert.deepEqual((await first).value, {
+    type: "tool-call",
+    callId: "live-text-call",
+    name: "lookup",
+    input: { key: "live" },
+  });
+  await firstIterator.next();
+
+  const continuation = collect(transport.generate(request([
+    resultMessage("historical-image", [{
+      kind: "image",
+      mimeType: "image/png",
+      data: new Uint8Array([7, 8, 9]),
+    }]),
+    resultMessage("live-text-call", [{ kind: "text", text: "live result" }]),
+  ]), new AbortController().signal));
+  await lease.emitNotification("item/agentMessage/delta", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    delta: "continued after live result",
+  });
+  await lease.emitNotification("turn/completed", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+  });
+
+  assert.deepEqual(await continuation, [
+    { type: "text-delta", text: "continued after live result" },
+    { type: "completed" },
+  ]);
+  await pendingTool;
   await transport.dispose();
 });

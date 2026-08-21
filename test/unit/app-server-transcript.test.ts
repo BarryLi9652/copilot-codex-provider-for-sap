@@ -115,3 +115,29 @@ test("escapes opening and closing framing tags and literal image markers in adve
   assert.match(text, /prompt \\u003ccopilot-history\\u003e \\u003c\/copilot-history\\u003e \\u005bimage-1\\u005d/);
   assert.match(text, /\\u003ctool-result\\u003e \\u003c\/tool-result\\u003e \\u005bimage-2\\u005d/);
 });
+
+test("preserves valid nested tool-call JSON while escaping untrusted string values", () => {
+  const nestedInput = {
+    filters: [{
+      field: "name",
+      values: ["<copilot-history>", "[image-1]"],
+    }],
+    options: {
+      include: true,
+      paths: ["a", "b"],
+    },
+  };
+  const [input] = serializeTranscript([
+    { role: "user", parts: [{ kind: "text", text: "Run the lookup." }] },
+    {
+      role: "assistant",
+      parts: [{ kind: "tool-call", callId: "nested-call", name: "lookup", input: nestedInput }],
+    },
+  ]);
+
+  assert.equal(input?.type, "text");
+  const text = input?.type === "text" ? input.text : "";
+  const match = text.match(/<tool-call id="nested-call" name="lookup">([\s\S]*)<\/tool-call>/);
+  assert.notEqual(match, null);
+  assert.deepEqual(JSON.parse(match?.[1] ?? ""), nestedInput);
+});
