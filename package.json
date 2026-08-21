@@ -2,7 +2,7 @@
   "name": "copilot-codex-provider-for-sap",
   "displayName": "Copilot Codex Provider for SAP",
   "description": "Use Codex through ChatGPT OAuth or a local Codex App Server in GitHub Copilot Chat, with SAP ABAP tooling support.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "leonbwang",
   "private": true,
   "license": "UNLICENSED",
@@ -76,7 +76,7 @@
     "test": "npm run test:unit && npm run test:integration",
     "check": "npm run typecheck && npm test",
     "package": "npm run check && npm run test:extension && npm run package:vsix",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/copilot-codex-provider-for-sap-0.1.1.vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/copilot-codex-provider-for-sap-0.1.2.vsix",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

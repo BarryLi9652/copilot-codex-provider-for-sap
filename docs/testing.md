@@ -37,6 +37,19 @@ All npm downloads and test runtimes remain under the project (`.npm-cache`, `.vs
 | `npm run test:extension` | 0 | PASS — 22/22 |
 | `npm run package` | 0 | PASS — VSIX 0.1.1 created with 82 files |
 
+## 0.1.2 App Server model-catalog evidence — 2026-08-21
+
+| Check | Exit | Result |
+|---|---:|---|
+| Current official `model/list` regression | 0 | PASS — entries without token limits receive conservative Copilot metadata; malformed explicit limits remain rejected |
+| Dynamic-tools capability gate | 0 | PASS — missing model-level tool metadata is advertised only after the read-only dynamic-tools probe succeeds; malformed explicit metadata remains fail-closed |
+| Legacy input modalities | 0 | PASS — missing modalities default to text and image; malformed values remain fail-closed |
+| Real Codex App Server production chain | 0 | PASS — 7 models discovered, 7 tool-capable, 3 image-capable, with fallback token budgets applied to all 7 |
+| `npm run test:unit` | 0 | PASS — 107/107 |
+| `npm run test:integration` | 0 | PASS — 95/95 |
+| `npm run test:extension` | 0 | PASS — 22/22 |
+| `npm run package` | 0 | PASS — VSIX 0.1.2 created with 82 files |
+
 Detected local prerequisites (read-only inspection):
 
 | Component | Version/status |

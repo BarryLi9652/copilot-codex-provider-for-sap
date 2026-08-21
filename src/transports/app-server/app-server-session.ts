@@ -650,7 +650,11 @@ export class AppServerSession {
       this.assertCurrentClient(client, generation, "listModels");
       const response = await client.request<unknown>("model/list", { includeHidden: false });
       this.assertCurrentClient(client, generation, "listModels");
-      return parseAppServerModels(response, (diagnostics) => this.recordModelDiagnostics(diagnostics));
+      return parseAppServerModels(
+        response,
+        { dynamicToolsAvailable: this.capabilities?.dynamicTools === true },
+        (diagnostics) => this.recordModelDiagnostics(diagnostics),
+      );
     });
     this.assertCurrentClient(client, generation, "listModels");
     return models;

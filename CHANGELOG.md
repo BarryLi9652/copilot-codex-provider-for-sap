@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 — 2026-08-21
+
+- Restored Local CLI model discovery for the current official App Server `model/list` response shape.
+- Added conservative Copilot token-budget fallbacks when App Server models omit token limits while preserving valid legacy limits.
+- Advertised Copilot tool calling only after the dynamic-tools probe succeeds, rejected malformed explicit tool metadata, and applied the official legacy image-modality default.
+
 ## 0.1.1 — 2026-08-21
 
 - Fixed Local CLI startup with current Codex App Server initialize responses that do not echo client capabilities.
