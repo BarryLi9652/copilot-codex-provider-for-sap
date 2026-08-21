@@ -311,26 +311,56 @@ test("ignores historical tool results while preserving them in the next turn tra
 test("passes request instructions exactly once into the real App Server turn payload", async () => {
   const session = new FakeSession();
   const transport = new AppServerTransport(session, new ToolContinuationRegistry({ now: () => 500 }));
-  const instructions = "ABAP guidance: prefer supplied semantic tools.";
-  const pending = collect(transport.generate(
+  const marker = "TASK11_EXACTLY_ONCE_INSTRUCTION_MARKER";
+  const instructions = `ABAP guidance: prefer supplied semantic tools. ${marker}`;
+  const initial = collect(transport.generate(
     request(undefined, instructions),
     new AbortController().signal,
   ));
 
   await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
   const lease = session.leases[0] as FakeLease;
-  const inputTexts = lease.turnStarts[0]?.input
+  const pendingToolReply = lease.emitToolCall({
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    callId: "instruction-call",
+    name: "lookup",
+    input: { key: "value" },
+  }, 1);
+  assert.deepEqual(await initial, [{
+    type: "tool-call",
+    callId: "instruction-call",
+    name: "lookup",
+    input: { key: "value" },
+  }]);
+
+  const continuation = collect(transport.generate(request([
+    resultMessage("instruction-call", [{ kind: "text", text: "result" }]),
+  ], instructions), new AbortController().signal));
+  const toolReply = await pendingToolReply;
+  assert.equal((JSON.stringify(toolReply) ?? "").includes(marker), false);
+  assert.equal(lease.turnStarts.length, 1);
+
+  const allTurnStartText = lease.turnStarts.flatMap((turnStart) => turnStart.input)
     .filter((item): item is Extract<AppServerUserInput, { type: "text" }> => item.type === "text")
-    .map((item) => item.text) ?? [];
+    .map((item) => item.text)
+    .join("\n");
+  assert.equal(allTurnStartText.split(marker).length - 1, 1);
+  assert.match(allTurnStartText, /<current-user-message>Look up the value\.<\/current-user-message>/);
 
-  assert.equal(inputTexts.filter((text) => text.includes(instructions)).length, 1);
-  assert.match(inputTexts.join("\n"), /<current-user-message>Look up the value\.<\/current-user-message>/);
-
+  await lease.emitNotification("item/agentMessage/delta", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+    delta: "continued without duplicate instructions",
+  });
   await lease.emitNotification("turn/completed", {
     threadId: lease.threadId,
     turnId: lease.turnId,
   });
-  assert.deepEqual(await pending, [{ type: "completed" }]);
+  assert.deepEqual(await continuation, [
+    { type: "text-delta", text: "continued without duplicate instructions" },
+    { type: "completed" },
+  ]);
   await transport.dispose();
 });
 
