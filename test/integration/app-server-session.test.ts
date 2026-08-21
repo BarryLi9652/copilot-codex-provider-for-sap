@@ -445,6 +445,33 @@ test("lets the successful dynamic-tool probe establish capability after a false 
   await session.dispose();
 });
 
+test("accepts the current App Server initialize result without echoed client capabilities", async () => {
+  const supervisor = new FakeAppServerSupervisor();
+  const client = supervisor.clients[0] as FakeAppServerClient;
+  const originalRequest = client.request.bind(client);
+  client.request = async <T>(method: string, params?: unknown): Promise<T> => {
+    if (method !== "initialize") {
+      return originalRequest(method, params);
+    }
+    client.requests.push({ method, params });
+    return {
+      userAgent: "codex_vscode/0.148.0-alpha.9 (Windows 10.0.26100; x86_64)",
+      codexHome: "C:\\Users\\example\\.codex",
+      platformFamily: "windows",
+      platformOs: "windows",
+    } as T;
+  };
+  const session = new AppServerSession(supervisor, "0.1.0");
+
+  assert.deepEqual(await session.initialize(), { dynamicTools: true });
+  assert.deepEqual(client.requests.map(({ method }) => method), [
+    "initialize",
+    "thread/start",
+  ]);
+
+  await session.dispose();
+});
+
 test("registers deny handlers and interrupts native command or file items without content", async () => {
   const supervisor = new FakeAppServerSupervisor();
   const client = supervisor.clients[0] as FakeAppServerClient;

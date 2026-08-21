@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-08-21
+
+- Fixed Local CLI startup with current Codex App Server initialize responses that do not echo client capabilities.
+- Accepted the current finite numeric `emittedAtMs` metadata on App Server notifications while rejecting malformed values and unknown fields.
+- Kept dynamic-tools compatibility fail-closed by using the existing ephemeral read-only capability probe.
+
 ## 0.1.0 — 2026-08-21
 
 - Added two independent Copilot language-model providers: ChatGPT OAuth and Local Codex App Server.

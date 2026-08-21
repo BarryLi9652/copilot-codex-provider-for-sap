@@ -735,18 +735,26 @@ export class AppServerSession {
   }
 
   private parseCapabilities(payload: unknown): AppServerCapabilities {
-    if (!isRecord(payload) || !isRecord(payload.capabilities)) {
+    if (!isRecord(payload)) {
       throw protocolError("initialize", new Error("initialize result is malformed"));
     }
     const capabilities = payload.capabilities;
-    if (capabilities.experimentalApi !== true) {
+    if (capabilities !== undefined && !isRecord(capabilities)) {
+      throw protocolError("initialize", new Error("initialize capabilities are malformed"));
+    }
+    const currentShape = nonEmptyString(payload.userAgent) !== undefined;
+    if (!currentShape && capabilities === undefined) {
+      throw protocolError("initialize", new Error("initialize result is malformed"));
+    }
+    if (isRecord(capabilities) && capabilities.experimentalApi === false) {
       throw new CodexError("incompatible", {
         action: "upgradeCodex",
         cause: new Error("App Server lacks the required experimental capabilities"),
       });
     }
     if (
-      "dynamicTools" in capabilities
+      isRecord(capabilities)
+      && "dynamicTools" in capabilities
       && capabilities.dynamicTools !== undefined
       && typeof capabilities.dynamicTools !== "boolean"
     ) {
@@ -755,7 +763,7 @@ export class AppServerSession {
     const serverInfo = isRecord(payload.serverInfo) ? payload.serverInfo : undefined;
     const serverVersion = nonEmptyString(serverInfo?.version);
     return {
-      dynamicTools: capabilities.dynamicTools === true,
+      dynamicTools: isRecord(capabilities) && capabilities.dynamicTools === true,
       ...(serverVersion === undefined ? {} : { serverVersion }),
     };
   }

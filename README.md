@@ -22,13 +22,13 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.0.vsix`。
+1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.1.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
 4. 在 Copilot Chat 模型选择器中分别选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI`。
 
 ```powershell
-code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.0.vsix
+code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.1.vsix
 ```
 
 ## ChatGPT OAuth route

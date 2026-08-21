@@ -25,6 +25,18 @@ All npm downloads and test runtimes remain under the project (`.npm-cache`, `.vs
 | `npm run package` | 0 | VSIX 0.1.0 | PASS — package created with 82 files |
 | VSIX archive inspection | 0 | `@vscode/vsce` 3.9.2 / ZIP inspection | PASS — all required files present; 0 forbidden files; no embedded source in maps |
 
+## 0.1.1 Local CLI compatibility evidence — 2026-08-21
+
+| Check | Exit | Result |
+|---|---:|---|
+| Initialize-response regression | 0 | PASS — current App Server responses without echoed client capabilities are accepted; malformed and explicitly incompatible legacy responses remain rejected |
+| JSONL notification regressions | 0 | PASS — finite numeric `emittedAtMs` is accepted; non-numeric metadata and unknown fields remain rejected |
+| Real Codex App Server production chain | 0 | PASS — Codex CLI `0.148.0-alpha.9` reached `running` and the read-only probe reported `dynamicTools: true` through `ProcessSupervisor` and `AppServerSession` |
+| `npm run test:unit` | 0 | PASS — 103/103 |
+| `npm run test:integration` | 0 | PASS — 95/95 |
+| `npm run test:extension` | 0 | PASS — 22/22 |
+| `npm run package` | 0 | PASS — VSIX 0.1.1 created with 82 files |
+
 Detected local prerequisites (read-only inspection):
 
 | Component | Version/status |
