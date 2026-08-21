@@ -9,9 +9,44 @@
   "main": "./out/src/extension.js",
   "activationEvents": [
     "onLanguageModelChatProvider:copilot-codex.chatgpt-oauth",
-    "onLanguageModelChatProvider:copilot-codex.local-cli"
+    "onLanguageModelChatProvider:copilot-codex.local-cli",
+    "onCommand:copilotCodex.chatgpt.signIn",
+    "onCommand:copilotCodex.chatgpt.signInManual",
+    "onCommand:copilotCodex.chatgpt.signOut",
+    "onCommand:copilotCodex.chatgpt.refreshModels",
+    "onCommand:copilotCodex.local.selectExecutable",
+    "onCommand:copilotCodex.local.start",
+    "onCommand:copilotCodex.local.restart",
+    "onCommand:copilotCodex.local.stop",
+    "onCommand:copilotCodex.local.refreshModels",
+    "onCommand:copilotCodex.showDiagnostics",
+    "onCommand:copilotCodex.clearExtensionData"
   ],
   "contributes": {
+    "commands": [
+      { "command": "copilotCodex.chatgpt.signIn", "title": "Copilot Codex: Sign In with ChatGPT" },
+      { "command": "copilotCodex.chatgpt.signInManual", "title": "Copilot Codex: Complete ChatGPT Sign-In Manually" },
+      { "command": "copilotCodex.chatgpt.signOut", "title": "Copilot Codex: Sign Out ChatGPT" },
+      { "command": "copilotCodex.chatgpt.refreshModels", "title": "Copilot Codex: Refresh ChatGPT Models" },
+      { "command": "copilotCodex.local.selectExecutable", "title": "Copilot Codex: Select Local Codex Executable" },
+      { "command": "copilotCodex.local.start", "title": "Copilot Codex: Start Local Codex" },
+      { "command": "copilotCodex.local.restart", "title": "Copilot Codex: Restart Local Codex" },
+      { "command": "copilotCodex.local.stop", "title": "Copilot Codex: Stop Local Codex" },
+      { "command": "copilotCodex.local.refreshModels", "title": "Copilot Codex: Refresh Local Models" },
+      { "command": "copilotCodex.showDiagnostics", "title": "Copilot Codex: Show Diagnostics" },
+      { "command": "copilotCodex.clearExtensionData", "title": "Copilot Codex: Clear Extension Data" }
+    ],
+    "configuration": {
+      "title": "Copilot Codex Provider for SAP",
+      "properties": {
+        "copilotCodex.local.codexPath": { "type": "string", "default": "" },
+        "copilotCodex.requestTimeoutSeconds": { "type": "number", "default": 600, "minimum": 10 },
+        "copilotCodex.toolTimeoutSeconds": { "type": "number", "default": 300, "minimum": 30 },
+        "copilotCodex.catalogCacheMinutes": { "type": "number", "default": 5, "minimum": 1 },
+        "copilotCodex.sapSelectionMaxChars": { "type": "number", "default": 16000, "minimum": 1000 },
+        "copilotCodex.logLevel": { "type": "string", "enum": ["error", "warn", "info", "debug"], "default": "info" }
+      }
+    },
     "languageModelChatProviders": [
       {
         "vendor": "copilot-codex.chatgpt-oauth",

@@ -78,6 +78,8 @@ interface ChildRecord {
   terminationPromise: Promise<void> | undefined;
 }
 
+export type ProcessSupervisorState = ChildRecord["state"] | "stopped";
+
 export class ProcessSupervisor {
   private readonly env: NodeJS.ProcessEnv;
   private readonly safeCwd: string;
@@ -121,6 +123,10 @@ export class ProcessSupervisor {
     });
     this.spawnProcess = options.spawnProcess ?? ((executable, args, spawnOptions) =>
       spawn(executable, args, spawnOptions));
+  }
+
+  public get state(): ProcessSupervisorState {
+    return this.currentRecord?.state ?? "stopped";
   }
 
   public start(): Promise<JsonlRpcClient> {

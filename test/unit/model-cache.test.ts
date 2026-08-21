@@ -56,6 +56,19 @@ test("clear discards populated cache data", async () => {
   assert.equal(calls, 2);
 });
 
+test("snapshot reports the cached model count and live age without loading", async () => {
+  let now = 1_000;
+  const cache = new ModelCache(300_000, () => now);
+
+  assert.equal(cache.snapshot(), undefined);
+  await cache.get(async () => [createModel("one"), createModel("two")]);
+  now = 3_500;
+
+  assert.deepEqual(cache.snapshot(), { modelCount: 2, ageMs: 2_500 });
+  cache.clear();
+  assert.equal(cache.snapshot(), undefined);
+});
+
 test("clear prevents a pending refresh from repopulating stale models", async () => {
   let calls = 0;
   let resolveStale!: (models: readonly CodexModel[]) => void;

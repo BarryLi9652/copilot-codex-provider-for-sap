@@ -148,7 +148,9 @@ test("starts the fake App Server with exact stdio argv and stops without an orph
     },
   });
 
+  assert.equal(supervisor.state, "stopped");
   const client = await supervisor.start();
+  assert.equal(supervisor.state, "running");
   assert.equal(receivedExecutable, process.execPath);
   assert.deepEqual(receivedArgs, ["app-server", "--listen", "stdio://"]);
   assert.equal(receivedOptions?.shell, false);
@@ -165,6 +167,7 @@ test("starts the fake App Server with exact stdio argv and stops without an orph
   assert.deepEqual(initialized.capabilities, { experimentalApi: true, dynamicTools: true });
 
   await supervisor.stop();
+  assert.equal(supervisor.state, "stopped");
   await waitForExit(child as ChildProcess);
   assert.notEqual((child as ChildProcess).exitCode, null);
   await supervisor.stop();

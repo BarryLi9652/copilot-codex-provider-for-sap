@@ -3,7 +3,11 @@ import type { CodexModel } from "./types.js";
 type ModelLoader = () => Promise<readonly CodexModel[]>;
 
 export class ModelCache {
-  private cached: { models: readonly CodexModel[]; expiresAt: number } | undefined;
+  private cached: {
+    models: readonly CodexModel[];
+    cachedAt: number;
+    expiresAt: number;
+  } | undefined;
   private inFlight: Promise<readonly CodexModel[]> | undefined;
   private generation = 0;
 
@@ -27,7 +31,8 @@ export class ModelCache {
       .then(
         (models) => {
           if (generation === this.generation) {
-            this.cached = { models, expiresAt: this.now() + this.ttlMs };
+            const cachedAt = this.now();
+            this.cached = { models, cachedAt, expiresAt: cachedAt + this.ttlMs };
             this.inFlight = undefined;
           }
           return models;
@@ -48,5 +53,15 @@ export class ModelCache {
     this.generation += 1;
     this.cached = undefined;
     this.inFlight = undefined;
+  }
+
+  public snapshot(): { modelCount: number; ageMs: number } | undefined {
+    if (this.cached === undefined) {
+      return undefined;
+    }
+    return {
+      modelCount: this.cached.models.length,
+      ageMs: Math.max(0, this.now() - this.cached.cachedAt),
+    };
   }
 }

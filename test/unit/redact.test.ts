@@ -159,6 +159,24 @@ test("preserves logger envelope fields over redacted metadata", () => {
   assert.equal(serialized.includes("injected-event-secret"), false);
 });
 
+test("safe logger honors the configured log-level threshold", () => {
+  const lines: string[] = [];
+  const logger = new SafeLogger(
+    { appendLine: (value: string) => lines.push(value) },
+    () => "warn",
+  );
+
+  logger.event("info-event");
+  logger.event("warning-event", {}, "warn");
+  logger.event("error-event", {}, "error");
+  logger.event("debug-event", {}, "debug");
+
+  assert.deepEqual(lines.map((line) => (JSON.parse(line) as { event: string }).event), [
+    "warning-event",
+    "error-event",
+  ]);
+});
+
 test("redacts ordinary Error values without exposing message or stack", () => {
   const error = new Error("private generic error message");
   Object.defineProperty(error, "message", {

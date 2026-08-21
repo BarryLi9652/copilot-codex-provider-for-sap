@@ -167,6 +167,7 @@ export interface AppServerSessionSupervisor {
 export interface AppServerSessionOptions {
   extensionVersion: string;
   modelCacheTtlMs?: number;
+  modelCache?: ModelCache;
   now?: () => number;
   logger?: SafeLogger;
 }
@@ -254,7 +255,7 @@ export class AppServerSession {
       throw new RangeError("modelCacheTtlMs must be positive");
     }
     this.extensionVersion = options.extensionVersion;
-    this.modelCache = new ModelCache(ttlMs, options.now);
+    this.modelCache = options.modelCache ?? new ModelCache(ttlMs, options.now);
     this.logger = options.logger;
   }
 
@@ -527,6 +528,10 @@ export class AppServerSession {
 
   public get hasSecurityProtocolFailure(): boolean {
     return this.securityProtocolFailure;
+  }
+
+  public get currentCapabilities(): AppServerCapabilities | undefined {
+    return this.capabilities === undefined ? undefined : { ...this.capabilities };
   }
 
   private async initializeFromStart(): Promise<AppServerCapabilities> {

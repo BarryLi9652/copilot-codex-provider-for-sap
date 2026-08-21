@@ -1,7 +1,21 @@
 import * as vscode from "vscode";
 
+import {
+  buildDiagnosticsReport,
+  DiagnosticsHistory,
+  type DiagnosticsRouteSnapshot,
+} from "./commands/diagnostics";
+import {
+  createCommandServices,
+  registerCommands,
+  type CommandDependencies,
+  type CommandUi,
+} from "./commands/register-commands";
 import { CHATGPT_VENDOR_ID, LOCAL_VENDOR_ID } from "./constants";
+import { ModelCache } from "./core/model-cache";
 import { CodexLanguageModelProvider } from "./providers/codex-provider";
+import { SapContextProvider } from "./sap/context";
+import { SafeLogger, type LogLevel } from "./security/logger";
 import { AppServerSession } from "./transports/app-server/app-server-session";
 import { AppServerTransport } from "./transports/app-server/app-server-transport";
 import { ExecutableLocator } from "./transports/app-server/executable-locator";
@@ -12,28 +26,211 @@ import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
 
 export function activate(context: vscode.ExtensionContext): void {
+  const configuration = vscode.workspace.getConfiguration("copilotCodex");
+  const requestTimeoutMs = secondsToMs(configuration.get("requestTimeoutSeconds", 600), 10);
+  const toolTimeoutMs = secondsToMs(configuration.get("toolTimeoutSeconds", 300), 30);
+  const catalogCacheMs = minutesToMs(configuration.get("catalogCacheMinutes", 5), 1);
+  const configuredExecutable = configuration.get<string>("local.codexPath", "").trim();
+  const diagnosticsOutput = vscode.window.createOutputChannel("Copilot Codex Diagnostics");
+  const logOutput = vscode.window.createOutputChannel("Copilot Codex Log");
+  const logger = new SafeLogger(
+    logOutput,
+    () => configuration.get<LogLevel>("logLevel", "info"),
+  );
+  const diagnostics = new DiagnosticsHistory();
+  const sapContextProvider = new SapContextProvider();
   const oauthStore = new OAuthStore(context.secrets);
   const oauthManager = new OAuthManager(oauthStore);
+  const chatGptProviderCache = new ModelCache(catalogCacheMs);
+  const localProviderCache = new ModelCache(catalogCacheMs);
+  const chatGptModelCache = new ModelCache(catalogCacheMs);
+  const localModelCache = new ModelCache(catalogCacheMs);
+  const chatGptTransport = new ChatGptOAuthTransport(oauthManager, {
+    timeoutMs: requestTimeoutMs,
+    modelCache: chatGptModelCache,
+    logger,
+  });
   const chatGptProvider = new CodexLanguageModelProvider(
-    new ChatGptOAuthTransport(oauthManager),
+    chatGptTransport,
     CHATGPT_VENDOR_ID,
+    { sapContextProvider, modelCache: chatGptProviderCache },
   );
-  const localExecutable = new ExecutableLocator();
+  const localExecutable = new ExecutableLocator({
+    configuredExecutable: configuredExecutable || undefined,
+  });
   const localSupervisor = new ProcessSupervisor({
     locator: localExecutable,
     cwd: context.extensionPath,
+    requestTimeoutMs,
+    logger,
   });
   const localSession = new AppServerSession(localSupervisor, {
     extensionVersion: String(context.extension.packageJSON.version ?? "0.1.0"),
+    modelCacheTtlMs: catalogCacheMs,
+    modelCache: localModelCache,
+    logger,
   });
+  const continuationRegistry = new ToolContinuationRegistry({ timeoutMs: toolTimeoutMs });
   const localTransport = new AppServerTransport(
     localSession,
-    new ToolContinuationRegistry(),
+    continuationRegistry,
   );
   const localProvider = new CodexLanguageModelProvider(
     localTransport,
     LOCAL_VENDOR_ID,
+    { sapContextProvider, modelCache: localProviderCache },
   );
+
+  let appServerAccountType: "chatgpt" | "personalAccessToken" | undefined;
+  const cacheSnapshot = (
+    providerCache: ModelCache,
+    transportCache: ModelCache,
+    available: boolean,
+  ): DiagnosticsRouteSnapshot => ({
+    available,
+    ...(providerCache.snapshot() ?? transportCache.snapshot()),
+  });
+
+  const dependencies: CommandDependencies = {
+    oauth: {
+      signIn: (openExternal) => oauthManager.signIn(openExternal),
+      completeManualCallback: (url) => oauthManager.completeManualCallback(url),
+      signOut: () => oauthManager.signOut(),
+      clearSecret: () => oauthManager.signOut(),
+    },
+    chatgptModels: {
+      refresh: async () => {
+        chatGptProviderCache.clear();
+        const models = await chatGptTransport.listModels(
+          { silent: false, forceRefresh: true },
+          new AbortController().signal,
+        );
+        return models.length;
+      },
+      clear: () => {
+        chatGptProviderCache.clear();
+        chatGptModelCache.clear();
+      },
+    },
+    local: {
+      selectExecutable: async (path) => {
+        new ExecutableLocator({ configuredExecutable: path }).resolve();
+        await configuration.update("local.codexPath", path, vscode.ConfigurationTarget.Global);
+      },
+      start: async () => {
+        await localSession.initialize();
+        const account = await localSession.readAccount();
+        appServerAccountType = account.type;
+      },
+      restart: async () => {
+        await localSession.restart();
+        const account = await localSession.readAccount();
+        appServerAccountType = account.type;
+      },
+      stop: async () => {
+        await localSupervisor.stop();
+        appServerAccountType = undefined;
+      },
+      refreshModels: async () => {
+        localProviderCache.clear();
+        localModelCache.clear();
+        await localSession.initialize();
+        const models = await localSession.listModels();
+        const account = await localSession.readAccount();
+        appServerAccountType = account.type;
+        return models.length;
+      },
+      clearModels: () => {
+        localProviderCache.clear();
+        localModelCache.clear();
+      },
+    },
+    continuations: { clear: () => continuationRegistry.dispose() },
+    diagnostics: {
+      show: async () => {
+        const session = await oauthStore.load();
+        let executablePath: string | undefined;
+        try {
+          executablePath = localExecutable.resolve();
+        } catch {
+          executablePath = undefined;
+        }
+        if (localSupervisor.state === "running" && appServerAccountType === undefined) {
+          try {
+            appServerAccountType = (await localSession.readAccount()).type;
+          } catch (error) {
+            diagnostics.record(error);
+          }
+        }
+        const sap = sapContextProvider.collect();
+        diagnosticsOutput.clear();
+        diagnosticsOutput.appendLine(buildDiagnosticsReport({
+          extensionVersion: String(context.extension.packageJSON.version ?? "unknown"),
+          vscodeVersion: vscode.version,
+          platform: `${process.platform}-${process.arch}`,
+          chatgpt: cacheSnapshot(
+            chatGptProviderCache,
+            chatGptModelCache,
+            session !== undefined,
+          ),
+          local: cacheSnapshot(
+            localProviderCache,
+            localModelCache,
+            executablePath !== undefined,
+          ),
+          executablePath,
+          appServer: {
+            processState: localSupervisor.state,
+            ...localSession.currentCapabilities,
+            accountType: appServerAccountType,
+          },
+          sap: {
+            abapFsInstalled: sap.abapFsInstalled,
+            adtInstalled: sap.adtInstalled,
+          },
+          lastErrorCodes: diagnostics.snapshot(),
+        }));
+        diagnosticsOutput.show(true);
+      },
+      clear: () => {
+        diagnostics.clear();
+        diagnosticsOutput.clear();
+        logOutput.clear();
+      },
+      record: (error) => diagnostics.record(error),
+    },
+  };
+  const ui: CommandUi = {
+    confirmPrivateSignIn: async () => {
+      const signedIn = await oauthStore.load() !== undefined;
+      const choice = await vscode.window.showWarningMessage(
+        `ChatGPT OAuth status: ${signedIn ? "signed in" : "signed out"}. This route uses a private ChatGPT Codex interface that may change without notice.`,
+        { modal: true },
+        "Continue",
+      );
+      return choice === "Continue";
+    },
+    openExternal: async (url) => vscode.env.openExternal(vscode.Uri.parse(url)),
+    promptManualCallback: () => vscode.window.showInputBox({
+      title: "Complete ChatGPT Sign-In Manually",
+      prompt: "Paste the complete callback URL without editing it.",
+      ignoreFocusOut: true,
+    }),
+    selectExecutable: async () => {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: false,
+        canSelectMany: false,
+        openLabel: "Select Codex executable",
+      });
+      return selected?.[0]?.fsPath;
+    },
+    showInformation: (message) => vscode.window.showInformationMessage(message),
+    showSafeError: () => vscode.window.showErrorMessage(
+      "Copilot Codex command failed. Run 'Copilot Codex: Show Diagnostics' for safe details.",
+    ),
+  };
+  registerCommands(createCommandServices(dependencies, ui), context);
 
   context.subscriptions.push(
     vscode.lm.registerLanguageModelChatProvider(
@@ -44,8 +241,17 @@ export function activate(context: vscode.ExtensionContext): void {
       LOCAL_VENDOR_ID,
       localProvider,
     ),
+    diagnosticsOutput,
+    logOutput,
+    chatGptTransport,
     localTransport,
   );
 }
+
+const secondsToMs = (value: number, minimum: number): number =>
+  Math.max(minimum, Number.isFinite(value) ? value : minimum) * 1_000;
+
+const minutesToMs = (value: number, minimum: number): number =>
+  Math.max(minimum, Number.isFinite(value) ? value : minimum) * 60_000;
 
 export function deactivate(): void {}

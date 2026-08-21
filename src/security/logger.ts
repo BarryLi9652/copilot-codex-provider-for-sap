@@ -12,7 +12,14 @@ export class SafeLogger {
     private readonly level: () => LogLevel,
   ) {}
 
-  public event(name: string, metadata: Record<string, unknown> = {}): void {
+  public event(
+    name: string,
+    metadata: Record<string, unknown> = {},
+    eventLevel: LogLevel = "info",
+  ): void {
+    if (LOG_LEVEL_ORDER[eventLevel] > LOG_LEVEL_ORDER[this.level()]) {
+      return;
+    }
     const redacted = redactMetadata(metadata) as Record<string, unknown>;
     this.sink.appendLine(
       JSON.stringify({
@@ -23,3 +30,10 @@ export class SafeLogger {
     );
   }
 }
+
+const LOG_LEVEL_ORDER: Readonly<Record<LogLevel, number>> = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3,
+};

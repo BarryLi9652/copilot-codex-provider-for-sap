@@ -278,6 +278,7 @@ test("initializes once, sends initialized, probes dynamic tools, reads account, 
 
   assert.deepEqual(firstCapabilities, { dynamicTools: true, serverVersion: "1.0.0" });
   assert.deepEqual(secondCapabilities, firstCapabilities);
+  assert.deepEqual(session.currentCapabilities, firstCapabilities);
   assert.equal(supervisor.startCalls, 1);
   assert.deepEqual(client.requests.map(({ method }) => method), [
     "initialize",
