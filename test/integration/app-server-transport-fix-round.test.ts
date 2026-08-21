@@ -46,15 +46,18 @@ const tools = [{
   inputSchema: { type: "object", properties: { key: { type: "string" } } },
 }] as const;
 
-const request = (messages: CodexRequest["messages"] = [
-  { role: "user", parts: [{ kind: "text", text: "Look up the value." }] },
-]): CodexRequest => ({
+const request = (
+  messages: CodexRequest["messages"] = [
+    { role: "user", parts: [{ kind: "text", text: "Look up the value." }] },
+  ],
+  instructions = "",
+): CodexRequest => ({
   requestId: `request-${Math.random()}`,
   modelId: model.id,
   messages,
   tools,
   toolMode: "auto",
-  instructions: "",
+  instructions,
 });
 
 const resultMessage = (
@@ -302,6 +305,32 @@ test("ignores historical tool results while preserving them in the next turn tra
   assert.equal(transcript?.type, "text");
   assert.match(transcript?.type === "text" ? transcript.text : "", /historical-call/);
   assert.equal(lease.releaseCount, 1);
+  await transport.dispose();
+});
+
+test("passes request instructions exactly once into the real App Server turn payload", async () => {
+  const session = new FakeSession();
+  const transport = new AppServerTransport(session, new ToolContinuationRegistry({ now: () => 500 }));
+  const instructions = "ABAP guidance: prefer supplied semantic tools.";
+  const pending = collect(transport.generate(
+    request(undefined, instructions),
+    new AbortController().signal,
+  ));
+
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const lease = session.leases[0] as FakeLease;
+  const inputTexts = lease.turnStarts[0]?.input
+    .filter((item): item is Extract<AppServerUserInput, { type: "text" }> => item.type === "text")
+    .map((item) => item.text) ?? [];
+
+  assert.equal(inputTexts.filter((text) => text.includes(instructions)).length, 1);
+  assert.match(inputTexts.join("\n"), /<current-user-message>Look up the value\.<\/current-user-message>/);
+
+  await lease.emitNotification("turn/completed", {
+    threadId: lease.threadId,
+    turnId: lease.turnId,
+  });
+  assert.deepEqual(await pending, [{ type: "completed" }]);
   await transport.dispose();
 });
 

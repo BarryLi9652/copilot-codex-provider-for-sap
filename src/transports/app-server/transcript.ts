@@ -6,6 +6,7 @@ export type UserInput = AppServerUserInput;
 
 export interface TranscriptOptions {
   supportsImages?: boolean;
+  instructions?: string;
 }
 
 const escapeTranscriptText = (value: string): string => value
@@ -141,7 +142,13 @@ export function serializeTranscript(
     `<current-user-message>${currentContent}</current-user-message>`,
   ];
 
+  const instructions = options.instructions;
+  const instructionInput = instructions === undefined || instructions.trim().length === 0
+    ? []
+    : [{ type: "text" as const, text: `<codex-instructions>\n${instructions}\n</codex-instructions>` }];
+
   return [
+    ...instructionInput,
     { type: "text", text: lines.join("\n") },
     ...imageInputs,
   ];

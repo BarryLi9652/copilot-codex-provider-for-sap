@@ -414,7 +414,10 @@ export class AppServerTransport implements CodexTransport {
       const turn = await lease.startTurn({
         threadId: state.threadId,
         modelId: request.modelId,
-        input: serializeTranscript(request.messages, { supportsImages }),
+        input: serializeTranscript(request.messages, {
+          supportsImages,
+          instructions: request.instructions,
+        }),
       }, signal);
       const invalidLeaseIdentity = state.lease !== lease
         || state.generation !== lease.generation
