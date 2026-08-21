@@ -1,0 +1,60 @@
+# V1 testing and acceptance
+
+## Automated commands
+
+```powershell
+npm install
+npm run clean
+npm run typecheck
+npm run test
+npm run test:extension
+npm run package
+npx vsce ls --tree
+```
+
+All npm downloads and test runtimes remain under the project (`.npm-cache`, `.vscode-test`). The extension test launcher removes inherited `ELECTRON_RUN_AS_NODE` only for its VS Code Electron subprocess.
+
+## Automated release evidence — 2026-08-21
+
+| Command | Exit | Runtime | Result |
+|---|---:|---|---|
+| `npm run typecheck` | 0 | TypeScript 6.0.3 | PASS |
+| `npm run test:unit` | 0 | Node 24 | PASS — 101/101 |
+| `npm run test:integration` | 0 | Node 24 | PASS — 94/94 |
+| `npm run test:extension` | 0 | VS Code 1.131.0 | PASS — 22/22 |
+| `npm run package` | 0 | VSIX 0.1.0 | PASS — package created with 82 files |
+| VSIX archive inspection | 0 | `@vscode/vsce` 3.9.2 / ZIP inspection | PASS — all required files present; 0 forbidden files; no embedded source in maps |
+
+Detected local prerequisites (read-only inspection):
+
+| Component | Version/status |
+|---|---|
+| Codex CLI | `0.148.0-alpha.9` |
+| ABAP FS | `2.8.4` |
+| SAP ADT for VS Code | `1.1.2` win32-x64 |
+| GitHub Copilot Chat | Not detected in the default extensions directory; verify the target VS Code profile |
+
+No account identity, SAP authority, source, callback URL or tool payload was recorded.
+
+## Manual acceptance matrix
+
+Run in a VS Code profile where GitHub Copilot Chat, ABAP FS and SAP ADT are enabled and the user explicitly authorizes login/SAP access.
+
+| # | Case | Expected | 2026-08-21 result |
+|---:|---|---|---|
+| 1 | Provider visibility | `Codex · ChatGPT OAuth` and `Codex · Local CLI` appear separately | NOT RUN — target Copilot profile required |
+| 2 | OAuth route | Login, model discovery and text streaming complete | NOT RUN — interactive ChatGPT login required |
+| 3 | Local route | App Server reuses Codex-managed ChatGPT login; models/text stream | NOT RUN — interactive Development Host required |
+| 4 | ABAP tool continuation | Each route completes one `get_abap_object_lines` call through Copilot and continues | NOT RUN — Copilot + SAP system required |
+| 5 | Dirty `adt://` context | Unsaved selection and diagnostics affect answer without workspace scan | NOT RUN — SAP connection required |
+| 6 | Cancellation isolation | Cancelling one route stops only that route | NOT RUN — interactive Copilot session required |
+| 7 | Crash isolation | App Server crash does not affect OAuth | NOT RUN — interactive dual-route session required |
+| 8 | Negative security check | No SAP write/activation, shell, patch, ADT MCP, token/prompt/source log | NOT RUN — inspect during cases 2–7 |
+
+Automated equivalents cover provider independence, crash isolation, cancellation, dynamic-tool forwarding, native-action denial, prompt/source redaction, dirty `adt://` context and exact late-result behavior. They do not replace user acceptance against real accounts and a real SAP system.
+
+## Manual evidence template
+
+After user acceptance, replace each `NOT RUN` cell with `PASS` or `FAIL` and record only the date, VS Code version, Codex App Server version, ABAP FS version, SAP ADT version and safe error code if failed.
+
+Never record account identity, SAP system authority, source, prompts, tokens, raw stderr or tool payloads.

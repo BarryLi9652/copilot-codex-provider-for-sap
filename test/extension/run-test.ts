@@ -27,9 +27,15 @@ async function main(): Promise<void> {
     `--extensions-dir=${path.join(cachePath, "extensions")}`,
     `--user-data-dir=${path.join(cachePath, "user-data")}`,
   ];
+  const environment = { ...process.env };
+  delete environment.ELECTRON_RUN_AS_NODE;
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(executable, args, { shell: false, stdio: "inherit" });
+    const child = spawn(executable, args, {
+      shell: false,
+      stdio: "inherit",
+      env: environment,
+    });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (code === 0) {
