@@ -50,7 +50,8 @@ const readCorrelation = (payload: unknown): Correlation | undefined => {
     return undefined;
   }
   const threadId = nonEmptyString(payload.threadId);
-  const turnId = nonEmptyString(payload.turnId);
+  const nestedTurn = isRecord(payload.turn) ? payload.turn : undefined;
+  const turnId = nonEmptyString(payload.turnId) ?? nonEmptyString(nestedTurn?.id);
   return threadId === undefined || turnId === undefined
     ? undefined
     : { threadId, turnId };

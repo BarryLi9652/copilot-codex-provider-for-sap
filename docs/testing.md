@@ -50,6 +50,19 @@ All npm downloads and test runtimes remain under the project (`.npm-cache`, `.vs
 | `npm run test:extension` | 0 | PASS — 22/22 |
 | `npm run package` | 0 | PASS — VSIX 0.1.2 created with 82 files |
 
+## 0.1.3 Local CLI reply evidence — 2026-08-21
+
+| Check | Exit | Result |
+|---|---:|---|
+| Current nested turn completion | 0 | PASS — `params.threadId` plus `params.turn.id` is correlated before and after the `turn/start` response; failed current statuses remain fail-closed |
+| Final-answer reconciliation | 0 | PASS — commentary and final-answer items remain distinct; final-only replies are surfaced; a partially streamed final item emits only its missing suffix |
+| Current dynamic-tool request | 0 | PASS — `tool` / `arguments` fields reach Copilot while legacy `name` / `input` remains supported |
+| Real Codex App Server production chain | 0 | PASS — `gpt-5.6-luna` returned text and a terminal completion through the compiled `ProcessSupervisor` → `AppServerSession` → `AppServerTransport` chain |
+| `npm run test:unit` | 0 | PASS — 107/107 |
+| `npm run test:integration` | 0 | PASS — 104/104 |
+| `npm run test:extension` | 0 | PASS — 22/22 |
+| `npm run package` | 0 | PASS — VSIX 0.1.3 created with 82 files |
+
 Detected local prerequisites (read-only inspection):
 
 | Component | Version/status |

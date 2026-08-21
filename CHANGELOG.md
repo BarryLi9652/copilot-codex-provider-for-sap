@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 — 2026-08-21
+
+- Fixed Local CLI replies for current App Server nested turn notifications, per-item final-answer reconciliation, strict completion statuses, final-message-only responses, and current dynamic-tool request fields.
+
 ## 0.1.2 — 2026-08-21
 
 - Restored Local CLI model discovery for the current official App Server `model/list` response shape.

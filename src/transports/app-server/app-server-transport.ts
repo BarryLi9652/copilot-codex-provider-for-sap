@@ -82,15 +82,20 @@ interface TurnState {
   cleaned: boolean;
   consumerActive: boolean;
   keepAlive: boolean;
+  readonly streamedAgentText: Map<string, string>;
   cleanupPromise: Promise<Error | undefined> | undefined;
 }
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const CLEANUP_TIMEOUT_MS = 250;
 const DEFAULT_FAILED_CALL_TTL_MS = 300_000;
+const LEGACY_AGENT_MESSAGE_ID = "\u0000legacy-agent-message";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
+
+const hasOwn = (value: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
 
 const stringValue = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
@@ -103,10 +108,41 @@ const readCorrelation = (params: unknown): Correlation | undefined => {
     return undefined;
   }
   const threadId = stringValue(params.threadId);
-  const turnId = stringValue(params.turnId);
+  const nestedTurn = isRecord(params.turn) ? params.turn : undefined;
+  const turnId = stringValue(params.turnId) ?? stringValue(nestedTurn?.id);
   return threadId === undefined || turnId === undefined
     ? undefined
     : { threadId, turnId };
+};
+
+interface FinalAgentMessage {
+  readonly id: string | undefined;
+  readonly text: string;
+}
+
+const readFinalAgentMessage = (
+  turn: Record<string, unknown> | undefined,
+): FinalAgentMessage | undefined => {
+  if (!Array.isArray(turn?.items)) {
+    return undefined;
+  }
+  let lastMessage: FinalAgentMessage | undefined;
+  let finalMessage: FinalAgentMessage | undefined;
+  for (const value of turn.items) {
+    if (!isRecord(value) || value.type !== "agentMessage") {
+      continue;
+    }
+    const text = stringValue(value.text);
+    if (text === undefined) {
+      continue;
+    }
+    const message = { id: stringValue(value.id), text };
+    lastMessage = message;
+    if (value.phase === "final_answer") {
+      finalMessage = message;
+    }
+  }
+  return finalMessage ?? lastMessage;
 };
 
 const chainKey = (
@@ -423,6 +459,7 @@ export class AppServerTransport implements CodexTransport {
         cleaned: false,
         consumerActive: false,
         keepAlive: false,
+        streamedAgentText: new Map(),
         cleanupPromise: undefined,
       };
       this.attachHandlers(state);
@@ -526,6 +563,11 @@ export class AppServerTransport implements CodexTransport {
       }
       const delta = stringValue(params.delta) ?? stringValue(params.text);
       if (delta !== undefined) {
+        const itemId = stringValue(params.itemId) ?? LEGACY_AGENT_MESSAGE_ID;
+        state.streamedAgentText.set(
+          itemId,
+          `${state.streamedAgentText.get(itemId) ?? ""}${delta}`,
+        );
         state.queue.push({ kind: "event", event: { type: "text-delta", text: delta } });
       }
       return;
@@ -547,6 +589,45 @@ export class AppServerTransport implements CodexTransport {
       return;
     }
     if (method === "turn/completed") {
+      const record = isRecord(params) ? params : undefined;
+      const turn = isRecord(record?.turn) ? record.turn : undefined;
+      const status = stringValue(turn?.status) ?? stringValue(record?.status);
+      const legacyCompleted = record !== undefined
+        && turn === undefined
+        && status === undefined
+        && !hasOwn(record, "turn")
+        && !hasOwn(record, "status");
+      if (status !== "completed" && !legacyCompleted) {
+        const error = status === "interrupted"
+          ? cancellationError()
+          : protocolError("turn/completed", new Error("App Server turn did not complete successfully"));
+        state.terminal = true;
+        state.failure = error;
+        state.queue.fail(error);
+        void this.terminateState(state, error, false);
+        return;
+      }
+      const finalMessage = readFinalAgentMessage(turn);
+      if (finalMessage !== undefined) {
+        const itemId = finalMessage.id ?? LEGACY_AGENT_MESSAGE_ID;
+        const streamed = state.streamedAgentText.get(itemId) ?? "";
+        if (!finalMessage.text.startsWith(streamed)) {
+          const error = protocolError(
+            "turn/completed",
+            new Error("App Server final agent message did not match its streamed deltas"),
+          );
+          state.terminal = true;
+          state.failure = error;
+          state.queue.fail(error);
+          void this.terminateState(state, error, false);
+          return;
+        }
+        const suffix = finalMessage.text.slice(streamed.length);
+        if (suffix.length > 0) {
+          state.streamedAgentText.set(itemId, finalMessage.text);
+          state.queue.push({ kind: "event", event: { type: "text-delta", text: suffix } });
+        }
+      }
       state.terminal = true;
       state.queue.push({ kind: "event", event: { type: "completed" } });
       return;
@@ -991,7 +1072,7 @@ function parseToolCall(params: unknown, rpcId: JsonRpcId): ParsedToolCall {
     throw protocolError("item/tool/call");
   }
   const callId = stringValue(params.callId);
-  const name = stringValue(params.name);
+  const name = stringValue(params.name) ?? stringValue(params.tool);
   const threadId = stringValue(params.threadId);
   const turnId = stringValue(params.turnId);
   if (threadId === undefined || turnId === undefined || callId === undefined || name === undefined) {
