@@ -3,14 +3,16 @@ import type {
   CodexModel,
   CodexRequest,
   CodexTransport,
-  MessagePart,
   TransportEvent,
 } from "../../core/types.js";
-import {
-  type AppServerSessionClient,
-  type AppServerCapabilities,
+import type {
+  AppServerDynamicTool,
+  AppServerNotificationMethod,
+  AppServerSecurityFailure,
+  AppServerTransportLease,
+  AppServerTransportSession,
+  AppServerTurnStartParams,
 } from "./app-server-session.js";
-import { APP_SERVER_THREAD_CONFIG } from "./safety-profile.js";
 import {
   type Disposable,
   type JsonRpcId,
@@ -21,61 +23,88 @@ import {
 import { serializeTranscript } from "./transcript.js";
 import {
   ToolContinuationRegistry,
-  type PendingToolCall,
   type ToolContinuationResult,
 } from "./tool-continuations.js";
 
-export type { AppServerSessionClient } from "./app-server-session.js";
-
-export interface AppServerTransportSession {
-  initialize(): Promise<AppServerCapabilities>;
-  listModels(): Promise<readonly CodexModel[]>;
-  getClient(): AppServerSessionClient;
-  request<T>(method: string, params?: unknown, signal?: AbortSignal): Promise<T>;
-  dispose?(): Promise<void>;
-}
+export type {
+  AppServerDynamicTool,
+  AppServerNotificationMethod,
+  AppServerSecurityFailure,
+  AppServerTransportLease,
+  AppServerTransportSession,
+  AppServerTurnStartParams,
+} from "./app-server-session.js";
 
 export interface AppServerTransportOptions {
   supportsImages?: boolean;
 }
 
-interface DynamicTool {
-  type: "function";
-  name: string;
-  description: string;
-  inputSchema: Readonly<Record<string, unknown>>;
-  deferLoading: false;
+type QueueItem = { kind: "event"; event: TransportEvent } | { kind: "tool" };
+
+interface Correlation {
+  readonly threadId: string;
+  readonly turnId: string;
 }
 
-type QueueItem =
-  | { kind: "event"; event: TransportEvent }
-  | { kind: "tool" };
+interface PreResponseNotification {
+  readonly method: AppServerNotificationMethod;
+  readonly params: unknown;
+}
+
+interface PreResponseToolCall {
+  readonly params: unknown;
+  readonly rpcId: JsonRpcId;
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (error: unknown) => void;
+}
 
 interface TurnState {
+  readonly generation: number;
+  readonly leaseId: string;
+  readonly lease: AppServerTransportLease;
   readonly threadId: string;
   turnId: string;
-  readonly client: AppServerSessionClient;
+  readonly supportsImages: boolean;
   readonly toolNames: ReadonlySet<string>;
   readonly queue: AsyncQueue<QueueItem>;
   readonly registrations: Disposable[];
   readonly callIds: Set<string>;
-  readonly seenCallIds: Set<string>;
   readonly receivedCallIds: Set<string>;
+  readonly preResponseNotifications: PreResponseNotification[];
+  readonly preResponseToolCalls: PreResponseToolCall[];
   signal: AbortSignal | undefined;
   onAbort: (() => void) | undefined;
   terminal: boolean;
   failure: Error | undefined;
+  cleanupStarted: boolean;
   cleaned: boolean;
   consumerActive: boolean;
+  keepAlive: boolean;
+  cleanupPromise: Promise<Error | undefined> | undefined;
 }
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
+const CLEANUP_TIMEOUT_MS = 250;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 const stringValue = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
+
+const numberValue = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const readCorrelation = (params: unknown): Correlation | undefined => {
+  if (!isRecord(params)) {
+    return undefined;
+  }
+  const threadId = stringValue(params.threadId);
+  const turnId = stringValue(params.turnId);
+  return threadId === undefined || turnId === undefined
+    ? undefined
+    : { threadId, turnId };
+};
 
 const chainKey = (threadId: string, turnId: string): string => `${threadId}\u0000${turnId}`;
 
@@ -132,6 +161,7 @@ class AsyncQueue<T> {
       return;
     }
     this.failure = error;
+    this.values.length = 0;
     this.close();
   }
 
@@ -204,16 +234,16 @@ export class AppServerTransport implements CodexTransport {
     if (signal.aborted) {
       throw cancellationError();
     }
-    await this.session.initialize();
+    const models = await this.session.listModels();
     if (signal.aborted) {
       throw cancellationError();
     }
-    return this.session.listModels();
+    return models;
   }
 
   public generate(request: CodexRequest, signal: AbortSignal): AsyncIterable<TransportEvent> {
     if (this.disposed) {
-      throw new CodexError("cancelled");
+      throw cancellationError();
     }
     return this.generateEvents(request, signal);
   }
@@ -230,7 +260,7 @@ export class AppServerTransport implements CodexTransport {
       true,
     )));
     this.registry.dispose();
-    await this.session.dispose?.();
+    await this.session.dispose();
   }
 
   private async *generateEvents(
@@ -242,137 +272,204 @@ export class AppServerTransport implements CodexTransport {
       throw cancellationError();
     }
 
-    const results = this.extractToolResults(request.messages);
-    const continuationState = this.findContinuationState(results);
-    if (results.length > 0 && continuationState === undefined) {
-      this.registry.resume(results, signal);
-      return;
-    }
-
-    if (continuationState !== undefined) {
-      this.bindSignal(continuationState, signal);
-      const newResults = results.filter((result) => !continuationState.receivedCallIds.has(result.callId));
-      if (newResults.length > 0) {
-        const resumed = this.registry.resume(newResults, signal);
-        for (const result of newResults) {
-          continuationState.receivedCallIds.add(result.callId);
-        }
-        if (resumed !== undefined) {
-          yield* resumed;
-          return;
-        }
-      }
-      if (this.registry.unsurfaced(continuationState.threadId, continuationState.turnId).length > 0) {
-        yield* this.consumeState(continuationState, signal);
-      }
-      return;
-    }
-
-    const state = await this.startTurn(request, signal);
+    let activeState: TurnState | undefined;
     try {
+      const results = this.extractToolResults(request.messages);
+      const continuationState = this.findContinuationState(results);
+
+      if (continuationState !== undefined) {
+        activeState = continuationState;
+        this.assertContinuationImages(continuationState, results);
+        this.bindSignal(continuationState, signal);
+        continuationState.keepAlive = false;
+        const newResults = results.filter((result) =>
+          this.callStates.get(result.callId) === continuationState
+          && this.registry.has(result.callId)
+          && !continuationState.receivedCallIds.has(result.callId)
+          && this.registry.received(result.callId) === undefined);
+        if (newResults.length > 0) {
+          const resumed = this.registry.resume(newResults, signal);
+          for (const result of newResults) {
+            continuationState.receivedCallIds.add(result.callId);
+          }
+          if (resumed !== undefined) {
+            yield* resumed;
+            return;
+          }
+        }
+
+        if (this.registry.unsurfaced(
+          continuationState.threadId,
+          continuationState.turnId,
+        ).length > 0) {
+          yield* this.consumeState(continuationState, signal);
+        } else if (this.registry.hasState(
+          continuationState.threadId,
+          continuationState.turnId,
+        )) {
+          continuationState.keepAlive = true;
+        }
+        return;
+      }
+
+      const state = await this.startTurn(request, signal);
+      activeState = state;
       yield* this.consumeState(state, signal);
     } catch (cause) {
-      await this.terminateState(state, asError(cause, protocolError("turn/start")), true);
+      const error = asError(cause, protocolError("turn"));
+      if (activeState !== undefined && !activeState.cleaned) {
+        await this.terminateState(activeState, error, true);
+      }
       throw cause;
+    } finally {
+      if (activeState !== undefined && !activeState.cleaned && !activeState.keepAlive) {
+        const cleanupError = await this.terminateState(activeState, cancellationError(), true);
+        if (cleanupError !== undefined) {
+          throw cleanupError;
+        }
+      }
     }
   }
 
   private async startTurn(request: CodexRequest, signal: AbortSignal): Promise<TurnState> {
-    await this.session.initialize();
-    if (signal.aborted) {
-      throw cancellationError();
-    }
-    const dynamicTools = request.tools.map((tool): DynamicTool => {
-      if (!TOOL_NAME_PATTERN.test(tool.name)) {
-        throw new CodexError("protocol", {
-          action: "invalidToolName",
-          cause: new Error(tool.name),
-        });
-      }
-      return {
-        type: "function",
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        deferLoading: false,
-      };
-    });
-    const threadResponse = await this.session.request<unknown>("thread/start", {
-      ...APP_SERVER_THREAD_CONFIG,
-      dynamicTools,
-    }, signal);
-    const threadId = parseThreadId(threadResponse);
-    const client = this.session.getClient();
-    const state: TurnState = {
-      threadId,
-      turnId: "",
-      client,
-      toolNames: new Set(dynamicTools.map((tool) => tool.name)),
-      queue: new AsyncQueue<QueueItem>(),
-      registrations: [],
-      callIds: new Set(),
-      seenCallIds: new Set(),
-      receivedCallIds: new Set(),
-      signal: undefined,
-      onAbort: undefined,
-      terminal: false,
-      failure: undefined,
-      cleaned: false,
-      consumerActive: false,
-    };
-    this.attachHandlers(state);
+    const lease = await this.session.acquireTransportLease();
+    let state: TurnState | undefined;
     try {
-      const turnResponse = await this.session.request<unknown>("turn/start", {
-        threadId,
-        model: request.modelId,
-        input: serializeTranscript(request.messages, { supportsImages: this.supportsImages }),
+      if (signal.aborted) {
+        throw cancellationError();
+      }
+      if (!lease.capabilities.dynamicTools) {
+        throw new CodexError("incompatible", { action: "upgradeCodex" });
+      }
+      const models = await this.session.listModels();
+      const selectedModel = models.find((candidate) => candidate.id === request.modelId);
+      if (selectedModel === undefined) {
+        throw protocolError("model/list", new Error(`unknown model: ${request.modelId}`));
+      }
+      const supportsImages = this.supportsImages && selectedModel.capabilities.imageInput;
+      const dynamicTools = request.tools.map((tool): AppServerDynamicTool => {
+        if (!TOOL_NAME_PATTERN.test(tool.name)) {
+          throw new CodexError("protocol", {
+            action: "invalidToolName",
+            cause: new Error(tool.name),
+          });
+        }
+        return {
+          type: "function",
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          deferLoading: false,
+        };
+      });
+      const thread = await lease.startThread(dynamicTools, signal);
+      state = {
+        generation: lease.generation,
+        leaseId: lease.leaseId,
+        lease,
+        threadId: thread.threadId,
+        turnId: "",
+        supportsImages,
+        toolNames: new Set(dynamicTools.map((tool) => tool.name)),
+        queue: new AsyncQueue<QueueItem>(),
+        registrations: [],
+        callIds: new Set(),
+        receivedCallIds: new Set(),
+        preResponseNotifications: [],
+        preResponseToolCalls: [],
+        signal: undefined,
+        onAbort: undefined,
+        terminal: false,
+        failure: undefined,
+        cleanupStarted: false,
+        cleaned: false,
+        consumerActive: false,
+        keepAlive: false,
+        cleanupPromise: undefined,
+      };
+      this.attachHandlers(state);
+      const turn = await lease.startTurn({
+        threadId: state.threadId,
+        modelId: request.modelId,
+        input: serializeTranscript(request.messages, { supportsImages }),
       }, signal);
-      state.turnId = parseTurnId(turnResponse);
+      state.turnId = turn.turnId;
       this.states.set(chainKey(state.threadId, state.turnId), state);
+      this.flushPreResponse(state);
       this.bindSignal(state, signal);
       return state;
     } catch (cause) {
-      await this.terminateState(state, asError(cause, protocolError("turn/start")), true);
+      if (state !== undefined) {
+        await this.terminateState(state, asError(cause, protocolError("turn/start")), true);
+      } else {
+        lease.release();
+      }
       throw cause;
     }
   }
 
   private attachHandlers(state: TurnState): void {
-    const registerNotification = (
-      method: string,
-      handler: JsonRpcServerNotificationHandler,
-    ): void => {
-      state.registrations.push(state.client.onServerNotification(method, handler));
+    const registerNotification = (method: AppServerNotificationMethod): void => {
+      state.registrations.push(state.lease.onNotification(method, (params) => {
+        this.handleNotification(state, method, params);
+      }));
     };
+    for (const method of [
+      "turn/started",
+      "item/agentMessage/delta",
+      "turn/usage",
+      "turn/completed",
+      "turn/failed",
+      "turn/error",
+    ] as const) {
+      registerNotification(method);
+    }
+    state.registrations.push(state.lease.onToolCall((params, rpcId) =>
+      this.handleToolRequest(state, params, rpcId)));
+    state.registrations.push(state.lease.onSecurityFailure((failure) => {
+      this.handleSecurityFailure(state, failure);
+    }));
+    state.registrations.push(state.lease.onProcessExit((error) => {
+      this.handleProcessExit(state, error);
+    }));
+  }
 
-    const matches = (params: unknown): boolean => {
-      if (!isRecord(params)) {
-        return false;
+  private handleNotification(
+    state: TurnState,
+    method: AppServerNotificationMethod,
+    params: unknown,
+    allowPreResponse = true,
+  ): void {
+    const correlation = readCorrelation(params);
+    if (correlation === undefined || correlation.threadId !== state.threadId) {
+      return;
+    }
+    if (state.turnId === "") {
+      if (allowPreResponse) {
+        state.preResponseNotifications.push({ method, params });
       }
-      const threadId = stringValue(params.threadId);
-      const turnId = stringValue(params.turnId);
-      return (threadId === undefined || threadId === state.threadId)
-        && (state.turnId === "" || turnId === undefined || turnId === state.turnId);
-    };
-
-    const deltaHandler: JsonRpcServerNotificationHandler = (params) => {
-      if (!matches(params) || !isRecord(params)) {
+      return;
+    }
+    if (correlation.turnId !== state.turnId || state.cleaned || state.cleanupStarted) {
+      return;
+    }
+    if (method === "item/agentMessage/delta") {
+      if (!isRecord(params)) {
         return;
       }
       const delta = stringValue(params.delta) ?? stringValue(params.text);
       if (delta !== undefined) {
         state.queue.push({ kind: "event", event: { type: "text-delta", text: delta } });
       }
-    };
-    registerNotification("item/agentMessage/delta", deltaHandler);
-
-    const usageHandler: JsonRpcServerNotificationHandler = (params) => {
-      if (!matches(params) || !isRecord(params) || !isRecord(params.usage)) {
+      return;
+    }
+    if (method === "turn/usage") {
+      if (!isRecord(params)) {
         return;
       }
-      const usage = params.usage;
-      const inputTokens = typeof usage.inputTokens === "number" ? usage.inputTokens : undefined;
-      const outputTokens = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
+      const usage = isRecord(params.usage) ? params.usage : params;
+      const inputTokens = numberValue(usage.inputTokens ?? usage.input_tokens);
+      const outputTokens = numberValue(usage.outputTokens ?? usage.output_tokens);
       if (inputTokens !== undefined || outputTokens !== undefined) {
         state.queue.push({ kind: "event", event: {
           type: "usage",
@@ -380,45 +477,67 @@ export class AppServerTransport implements CodexTransport {
           ...(outputTokens === undefined ? {} : { outputTokens }),
         } });
       }
-    };
-    registerNotification("turn/usage", usageHandler);
-
-    const completeHandler: JsonRpcServerNotificationHandler = (params) => {
-      if (!matches(params)) {
-        return;
-      }
+      return;
+    }
+    if (method === "turn/completed") {
       state.terminal = true;
       state.queue.push({ kind: "event", event: { type: "completed" } });
-    };
-    registerNotification("turn/completed", completeHandler);
-
-    const failureHandler: JsonRpcServerNotificationHandler = (params) => {
-      if (!matches(params)) {
-        return;
-      }
+      return;
+    }
+    if (method === "turn/failed" || method === "turn/error") {
       const error = protocolError("turn", new Error("App Server turn failed"));
       state.terminal = true;
       state.failure = error;
       state.queue.fail(error);
-      void this.terminateState(state, error, false);
-    };
-    registerNotification("turn/failed", failureHandler);
-    registerNotification("turn/error", failureHandler);
+    }
+  }
 
-    const startedHandler: JsonRpcServerNotificationHandler = (params) => {
-      if (!isRecord(params) || stringValue(params.threadId) !== state.threadId) {
-        return;
-      }
-      const turnId = stringValue(params.turnId);
-      if (state.turnId === "" && turnId !== undefined) {
-        state.turnId = turnId;
-      }
-    };
-    registerNotification("turn/started", startedHandler);
+  private handleToolRequest(
+    state: TurnState,
+    params: unknown,
+    rpcId: JsonRpcId,
+  ): Promise<unknown> {
+    const correlation = readCorrelation(params);
+    if (
+      state.cleaned
+      || state.cleanupStarted
+      || state.terminal
+      || state.failure !== undefined
+    ) {
+      return Promise.reject(protocolError("lateToolCall"));
+    }
+    if (correlation === undefined || correlation.threadId !== state.threadId) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    if (state.turnId === "") {
+      return new Promise<unknown>((resolve, reject) => {
+        state.preResponseToolCalls.push({ params, rpcId, resolve, reject });
+      });
+    }
+    if (correlation.turnId !== state.turnId) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    return this.handleToolCall(state, params, rpcId);
+  }
 
-    const toolHandler: JsonRpcServerRequestHandler = (params, rpcId) =>
-      this.handleToolCall(state, params, rpcId);
-    state.registrations.push(state.client.onServerRequest("item/tool/call", toolHandler));
+  private flushPreResponse(state: TurnState): void {
+    const notifications = state.preResponseNotifications.splice(0);
+    for (const notification of notifications) {
+      const correlation = readCorrelation(notification.params);
+      if (correlation?.threadId === state.threadId && correlation.turnId === state.turnId) {
+        this.handleNotification(state, notification.method, notification.params, false);
+      }
+    }
+    const toolCalls = state.preResponseToolCalls.splice(0);
+    for (const toolCall of toolCalls) {
+      const correlation = readCorrelation(toolCall.params);
+      if (correlation?.threadId !== state.threadId || correlation.turnId !== state.turnId) {
+        toolCall.reject(protocolError("item/tool/call"));
+        continue;
+      }
+      void this.handleToolCall(state, toolCall.params, toolCall.rpcId)
+        .then(toolCall.resolve, toolCall.reject);
+    }
   }
 
   private handleToolCall(
@@ -426,22 +545,26 @@ export class AppServerTransport implements CodexTransport {
     params: unknown,
     rpcId: JsonRpcId,
   ): Promise<unknown> {
+    if (
+      state.cleaned
+      || state.cleanupStarted
+      || state.terminal
+      || state.failure !== undefined
+    ) {
+      return Promise.reject(protocolError("lateToolCall"));
+    }
     let call: ParsedToolCall;
     try {
       call = parseToolCall(params, rpcId);
     } catch (cause) {
-      const error = asError(cause, protocolError("item/tool/call"));
-      void this.terminateState(state, error, true);
-      return Promise.reject(error);
+      return Promise.reject(asError(cause, protocolError("item/tool/call")));
     }
     if (
       call.threadId !== state.threadId
-      || state.turnId !== "" && call.turnId !== state.turnId
+      || call.turnId !== state.turnId
       || !state.toolNames.has(call.name)
     ) {
-      const error = protocolError("item/tool/call");
-      void this.terminateState(state, error, true);
-      return Promise.reject(error);
+      return Promise.reject(protocolError("item/tool/call"));
     }
 
     return new Promise<unknown>((resolve, reject) => {
@@ -453,13 +576,40 @@ export class AppServerTransport implements CodexTransport {
           continue: (signal) => this.consumeState(state, signal),
         });
         state.callIds.add(call.callId);
-        state.seenCallIds.add(call.callId);
         this.callStates.set(call.callId, state);
         state.queue.push({ kind: "tool" });
       } catch (cause) {
         reject(cause);
       }
     });
+  }
+
+  private handleSecurityFailure(state: TurnState, failure: AppServerSecurityFailure): void {
+    if (
+      state.cleaned
+      || state.cleanupStarted
+      || failure.generation !== state.generation
+      || failure.leaseId !== state.leaseId
+      || failure.threadId !== state.threadId
+      || failure.turnId !== state.turnId
+    ) {
+      return;
+    }
+    const error = new CodexError("protocol", { action: "securityBoundary" });
+    state.failure = error;
+    state.terminal = true;
+    void this.terminateState(state, error, failure.interruptIssued !== true);
+  }
+
+  private handleProcessExit(state: TurnState, error: CodexError): void {
+    if (state.cleaned || state.cleanupStarted) {
+      return;
+    }
+    const processFailure = error.code === "process"
+      ? error
+      : new CodexError("process", { action: "appServerExit", cause: error });
+    this.registry.processExit(processFailure, state.threadId, state.turnId);
+    void this.terminateState(state, processFailure, false);
   }
 
   private async *consumeState(
@@ -476,8 +626,12 @@ export class AppServerTransport implements CodexTransport {
       throw protocolError("concurrentTurn");
     }
     state.consumerActive = true;
+    state.keepAlive = false;
     try {
       while (!state.cleaned) {
+        if (state.failure !== undefined) {
+          throw state.failure;
+        }
         const unsurfaced = this.registry.unsurfaced(state.threadId, state.turnId);
         if (unsurfaced.length > 0) {
           for (const call of unsurfaced) {
@@ -489,6 +643,15 @@ export class AppServerTransport implements CodexTransport {
               input: call.input,
             };
           }
+          if (this.registry.isReady(state.threadId, state.turnId)) {
+            this.registry.resume([], signal, {
+              continueTurn: false,
+              threadId: state.threadId,
+              turnId: state.turnId,
+            });
+            continue;
+          }
+          state.keepAlive = true;
           return;
         }
 
@@ -497,20 +660,7 @@ export class AppServerTransport implements CodexTransport {
           return;
         }
         if (item.value.kind === "tool") {
-          const calls = this.registry.unsurfaced(state.threadId, state.turnId);
-          if (calls.length === 0) {
-            continue;
-          }
-          for (const call of calls) {
-            this.registry.markSurfaced(call.callId);
-            yield {
-              type: "tool-call",
-              callId: call.callId,
-              name: call.name,
-              input: call.input,
-            };
-          }
-          return;
+          continue;
         }
 
         yield item.value.event;
@@ -553,15 +703,28 @@ export class AppServerTransport implements CodexTransport {
     return results;
   }
 
+  private assertContinuationImages(
+    state: TurnState,
+    results: readonly ToolContinuationResult[],
+  ): void {
+    if (state.supportsImages) {
+      return;
+    }
+    if (results.some((result) => result.contentItems.some((item) =>
+      isRecord(item) && item.type === "inputImage"))) {
+      throw new CodexError("incompatible", { action: "imageInput" });
+    }
+  }
+
   private findContinuationState(results: readonly ToolContinuationResult[]): TurnState | undefined {
     for (const result of results) {
+      if (!this.registry.has(result.callId)) {
+        continue;
+      }
       const state = this.callStates.get(result.callId);
-      if (state !== undefined && !state.cleaned) {
+      if (state !== undefined && !state.cleaned && !state.cleanupStarted) {
         return state;
       }
-    }
-    if (results.length === 0 && this.states.size === 1) {
-      return this.states.values().next().value as TurnState | undefined;
     }
     return undefined;
   }
@@ -593,62 +756,95 @@ export class AppServerTransport implements CodexTransport {
     state: TurnState,
     error: Error | undefined,
     interrupt: boolean,
-  ): Promise<void> {
-    if (state.cleaned) {
-      return;
+  ): Promise<Error | undefined> {
+    if (state.cleanupPromise !== undefined) {
+      return state.cleanupPromise;
     }
+    state.cleanupStarted = true;
     state.cleaned = true;
-    if (state.signal !== undefined && state.onAbort !== undefined) {
-      state.signal.removeEventListener("abort", state.onAbort);
-    }
-    state.signal = undefined;
-    state.onAbort = undefined;
+    state.terminal = true;
     if (error !== undefined) {
+      state.failure = error;
       this.registry.cancel(state.threadId, state.turnId, error);
       state.queue.fail(error);
     } else {
       this.registry.cleanup(state.threadId, state.turnId);
+      state.queue.close();
     }
-    if (interrupt && state.turnId !== "") {
-      await this.session.request("turn/interrupt", {
-        threadId: state.threadId,
-        turnId: state.turnId,
-      }).catch(() => undefined);
+    const operation = (async (): Promise<Error | undefined> => {
+      let cleanupError: Error | undefined;
+      if (state.signal !== undefined && state.onAbort !== undefined) {
+        state.signal.removeEventListener("abort", state.onAbort);
+      }
+      state.signal = undefined;
+      state.onAbort = undefined;
+      for (const pending of state.preResponseToolCalls.splice(0)) {
+        pending.reject(error ?? cancellationError());
+      }
+      for (const registration of state.registrations.splice(0)) {
+        try {
+          registration.dispose();
+        } catch {
+          // Listener disposal is best effort during terminal cleanup.
+        }
+      }
+      for (const callId of state.callIds) {
+        if (this.callStates.get(callId) === state) {
+          this.callStates.delete(callId);
+        }
+      }
+      this.states.delete(chainKey(state.threadId, state.turnId));
+      if (interrupt && state.turnId !== "") {
+        cleanupError = await this.boundedCall(() =>
+          state.lease.interrupt(state.threadId, state.turnId));
+      }
+      if (state.threadId !== "") {
+        const unsubscribeError = await this.boundedCall(() =>
+          state.lease.unsubscribe(state.threadId));
+        cleanupError ??= unsubscribeError;
+      }
+      try {
+        state.lease.release();
+      } catch (cause) {
+        cleanupError ??= asError(cause, protocolError("leaseRelease"));
+      }
+      state.queue.close();
+      return cleanupError;
+    })();
+    state.cleanupPromise = operation;
+    await operation;
+  }
+
+  private async boundedCall(operation: () => Promise<void>): Promise<Error | undefined> {
+    let promise: Promise<void>;
+    try {
+      promise = operation();
+    } catch (cause) {
+      return asError(cause, protocolError("cleanup"));
     }
-    if (state.threadId !== "") {
-      await this.session.request("thread/unsubscribe", {
-        threadId: state.threadId,
-      }).catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<Error | undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), CLEANUP_TIMEOUT_MS);
+      const unref = (timer as unknown as { unref?: () => void }).unref;
+      unref?.call(timer);
+    });
+    try {
+      return await Promise.race([
+        promise.then(() => undefined, (cause) => asError(cause, protocolError("cleanup"))),
+        timeout,
+      ]);
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
     }
-    for (const registration of state.registrations.splice(0)) {
-      registration.dispose();
-    }
-    for (const callId of state.callIds) {
-      this.callStates.delete(callId);
-    }
-    this.states.delete(chainKey(state.threadId, state.turnId));
-    state.queue.close();
   }
 
   private throwIfDisposed(): void {
     if (this.disposed) {
-      throw new CodexError("cancelled");
+      throw cancellationError();
     }
   }
-}
-
-function parseThreadId(payload: unknown): string {
-  if (!isRecord(payload) || !isRecord(payload.thread) || typeof payload.thread.id !== "string") {
-    throw protocolError("thread/start");
-  }
-  return payload.thread.id;
-}
-
-function parseTurnId(payload: unknown): string {
-  if (!isRecord(payload) || !isRecord(payload.turn) || typeof payload.turn.id !== "string") {
-    throw protocolError("turn/start");
-  }
-  return payload.turn.id;
 }
 
 interface ParsedToolCall {
@@ -664,21 +860,19 @@ function parseToolCall(params: unknown, rpcId: JsonRpcId): ParsedToolCall {
   if (!isRecord(params)) {
     throw protocolError("item/tool/call");
   }
-  const item = isRecord(params.item) ? params.item : undefined;
-  const threadId = stringValue(params.threadId) ?? stringValue(item?.threadId);
-  const turnId = stringValue(params.turnId) ?? stringValue(item?.turnId);
-  const callId = stringValue(params.callId) ?? stringValue(params.id) ?? stringValue(item?.callId);
-  const name = stringValue(params.name) ?? stringValue(params.toolName) ?? stringValue(item?.name);
+  const callId = stringValue(params.callId);
+  const name = stringValue(params.name);
+  const threadId = stringValue(params.threadId);
+  const turnId = stringValue(params.turnId);
   if (threadId === undefined || turnId === undefined || callId === undefined || name === undefined) {
     throw protocolError("item/tool/call");
   }
-  const input = params.input ?? params.arguments ?? item?.input ?? item?.arguments;
   return {
     rpcId,
     threadId,
     turnId,
     callId,
     name,
-    input,
+    input: params.input ?? params.arguments,
   };
 }

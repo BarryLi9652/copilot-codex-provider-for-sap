@@ -8,7 +8,11 @@ export interface TranscriptOptions {
   supportsImages?: boolean;
 }
 
-const escapeTranscriptText = (value: string): string => value.replace(/<\//g, "<\\/");
+const escapeTranscriptText = (value: string): string => value
+  .replace(/</g, "\\u003c")
+  .replace(/>/g, "\\u003e")
+  .replace(/\[/g, "\\u005b")
+  .replace(/\]/g, "\\u005d");
 
 const escapeAttribute = (value: string): string => value
   .replace(/&/g, "&amp;")

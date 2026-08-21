@@ -4,9 +4,13 @@ import test from "node:test";
 import { CodexError } from "../../src/core/errors.js";
 import type { CodexModel, CodexRequest, TransportEvent } from "../../src/core/types.js";
 import type {
-  AppServerSessionClient,
+  AppServerDynamicTool,
+  AppServerSecurityFailure,
+  AppServerTransportLease,
   AppServerTransportSession,
+  AppServerTurnStartParams,
 } from "../../src/transports/app-server/app-server-transport.js";
+import type { AppServerSessionClient } from "../../src/transports/app-server/app-server-session.js";
 import { AppServerTransport } from "../../src/transports/app-server/app-server-transport.js";
 import { APP_SERVER_THREAD_CONFIG } from "../../src/transports/app-server/safety-profile.js";
 import type {
@@ -165,26 +169,75 @@ class FakeAppServerClient implements AppServerSessionClient {
   }
 }
 
+class FakeLease implements AppServerTransportLease {
+  public readonly generation = 1;
+  public readonly leaseId = "fake-lease-1";
+  public readonly capabilities = { dynamicTools: true };
+
+  public constructor(private readonly client: FakeAppServerClient) {}
+
+  public async startThread(
+    dynamicTools: readonly AppServerDynamicTool[],
+  ): Promise<{ threadId: string }> {
+    const response = await this.client.request<{ thread: { id: string } }>("thread/start", {
+      ...APP_SERVER_THREAD_CONFIG,
+      dynamicTools,
+    });
+    return { threadId: response.thread.id };
+  }
+
+  public async startTurn(params: AppServerTurnStartParams): Promise<{ turnId: string }> {
+    const response = await this.client.request<{ turn: { id: string } }>("turn/start", {
+      threadId: params.threadId,
+      model: params.modelId,
+      input: params.input,
+    });
+    return { turnId: response.turn.id };
+  }
+
+  public interrupt(threadId: string, turnId: string): Promise<void> {
+    return this.client.request("turn/interrupt", { threadId, turnId }).then(() => undefined);
+  }
+
+  public unsubscribe(threadId: string): Promise<void> {
+    return this.client.request("thread/unsubscribe", { threadId }).then(() => undefined);
+  }
+
+  public onNotification(
+    method: "turn/started" | "item/agentMessage/delta" | "turn/usage" | "turn/completed" | "turn/failed" | "turn/error",
+    handler: JsonRpcServerNotificationHandler,
+  ): Disposable {
+    return this.client.onServerNotification(method, handler);
+  }
+
+  public onToolCall(handler: JsonRpcServerRequestHandler): Disposable {
+    return this.client.onServerRequest("item/tool/call", handler);
+  }
+
+  public onSecurityFailure(_handler: (failure: AppServerSecurityFailure) => void): Disposable {
+    return { dispose: () => undefined };
+  }
+
+  public onProcessExit(_handler: (error: CodexError) => void): Disposable {
+    return { dispose: () => undefined };
+  }
+
+  public release(): void {}
+}
+
 class FakeSession implements AppServerTransportSession {
   public constructor(public readonly client: FakeAppServerClient) {}
-
-  public initialize(): Promise<{ dynamicTools: boolean }> {
-    return Promise.resolve({ dynamicTools: true });
-  }
 
   public listModels(): Promise<readonly CodexModel[]> {
     return Promise.resolve([model]);
   }
 
-  public getClient(): AppServerSessionClient {
-    return this.client;
+  public acquireTransportLease(): Promise<AppServerTransportLease> {
+    return Promise.resolve(new FakeLease(this.client));
   }
 
-  public request<T>(method: string, params?: unknown, signal?: AbortSignal): Promise<T> {
-    if (signal?.aborted) {
-      return Promise.reject(new CodexError("cancelled"));
-    }
-    return this.client.request<T>(method, params);
+  public dispose(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

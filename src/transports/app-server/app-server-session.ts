@@ -1,9 +1,10 @@
 import { CodexError } from "../../core/errors.js";
 import { ModelCache } from "../../core/model-cache.js";
-import type { CodexModel } from "../../core/types.js";
+import type { CodexModel, JsonObject } from "../../core/types.js";
 import { SafeLogger } from "../../security/logger.js";
 import {
   type Disposable,
+  type JsonRpcId,
   type JsonRpcServerNotificationHandler,
   type JsonRpcServerRequestHandler,
   JsonRpcRemoteError,
@@ -22,11 +23,52 @@ const APPROVAL_METHODS = [
   "item/permission/requestApproval",
 ] as const;
 
+const TRANSPORT_NOTIFICATION_METHODS: readonly AppServerNotificationMethod[] = [
+  "turn/started",
+  "item/agentMessage/delta",
+  "turn/usage",
+  "turn/completed",
+  "turn/failed",
+  "turn/error",
+];
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 const nonEmptyString = (value: unknown): string | undefined =>
   typeof value === "string" && value.trim().length > 0 ? value : undefined;
+
+const turnKey = (threadId: string, turnId: string): string => `${threadId}\u0000${turnId}`;
+
+interface Correlation {
+  readonly threadId: string;
+  readonly turnId: string;
+}
+
+const readCorrelation = (payload: unknown): Correlation | undefined => {
+  if (!isRecord(payload)) {
+    return undefined;
+  }
+  const threadId = nonEmptyString(payload.threadId);
+  const turnId = nonEmptyString(payload.turnId);
+  return threadId === undefined || turnId === undefined
+    ? undefined
+    : { threadId, turnId };
+};
+
+const readThreadId = (payload: unknown): string => {
+  if (!isRecord(payload) || !isRecord(payload.thread) || nonEmptyString(payload.thread.id) === undefined) {
+    throw protocolError("thread/start");
+  }
+  return payload.thread.id as string;
+};
+
+const readTurnId = (payload: unknown): string => {
+  if (!isRecord(payload) || !isRecord(payload.turn) || nonEmptyString(payload.turn.id) === undefined) {
+    throw protocolError("turn/start");
+  }
+  return payload.turn.id as string;
+};
 
 export interface AppServerCapabilities {
   dynamicTools: boolean;
@@ -38,6 +80,40 @@ export interface AppServerAccount {
   planType?: string;
 }
 
+export type AppServerUserInput =
+  | { type: "text"; text: string }
+  | { type: "image"; url: string };
+
+export interface AppServerDynamicTool {
+  type: "function";
+  name: string;
+  description: string;
+  inputSchema: JsonObject;
+  deferLoading: false;
+}
+
+export interface AppServerTurnStartParams {
+  threadId: string;
+  modelId: string;
+  input: readonly AppServerUserInput[];
+}
+
+export type AppServerNotificationMethod =
+  | "turn/started"
+  | "item/agentMessage/delta"
+  | "turn/usage"
+  | "turn/completed"
+  | "turn/failed"
+  | "turn/error";
+
+export interface AppServerSecurityFailure {
+  threadId: string;
+  turnId: string;
+  generation: number;
+  leaseId: string;
+  interruptIssued?: boolean;
+}
+
 export interface AppServerSessionClient {
   request<T>(method: string, params?: unknown, signal?: AbortSignal): Promise<T>;
   notify(method: string, params?: unknown): void;
@@ -46,7 +122,38 @@ export interface AppServerSessionClient {
     method: string,
     handler: JsonRpcServerNotificationHandler,
   ) => Disposable;
+  onDidTerminate?(handler: (error: CodexError) => void): Disposable;
   readonly isClosed?: boolean;
+}
+
+export interface AppServerTransportLease {
+  readonly generation: number;
+  readonly leaseId: string;
+  readonly capabilities: AppServerCapabilities;
+  startThread(
+    dynamicTools: readonly AppServerDynamicTool[],
+    signal?: AbortSignal,
+  ): Promise<{ threadId: string }>;
+  startTurn(
+    params: AppServerTurnStartParams,
+    signal?: AbortSignal,
+  ): Promise<{ turnId: string }>;
+  interrupt(threadId: string, turnId: string): Promise<void>;
+  unsubscribe(threadId: string): Promise<void>;
+  onNotification(
+    method: AppServerNotificationMethod,
+    handler: JsonRpcServerNotificationHandler,
+  ): Disposable;
+  onToolCall(handler: JsonRpcServerRequestHandler): Disposable;
+  onSecurityFailure(handler: (failure: AppServerSecurityFailure) => void): Disposable;
+  onProcessExit(handler: (error: CodexError) => void): Disposable;
+  release(): void;
+}
+
+export interface AppServerTransportSession {
+  acquireTransportLease(): Promise<AppServerTransportLease>;
+  listModels(): Promise<readonly CodexModel[]>;
+  dispose(): Promise<void>;
 }
 
 export interface AppServerSessionSupervisor {
@@ -72,6 +179,36 @@ interface ItemStartedParams {
   itemType?: unknown;
 }
 
+interface BufferedTransportNotification {
+  readonly method: AppServerNotificationMethod;
+  readonly params: unknown;
+}
+
+interface BufferedTransportToolCall {
+  readonly params: unknown;
+  readonly id: JsonRpcId;
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (reason?: unknown) => void;
+}
+
+interface TransportLeaseRecord {
+  readonly generation: number;
+  readonly leaseId: string;
+  readonly client: AppServerSessionClient;
+  readonly capabilities: AppServerCapabilities;
+  readonly threadIds: Set<string>;
+  readonly turnIds: Set<string>;
+  readonly pendingTurnThreads: Set<string>;
+  readonly preResponseNotifications: Map<string, BufferedTransportNotification[]>;
+  readonly preResponseToolCalls: Map<string, BufferedTransportToolCall[]>;
+  readonly notificationHandlers: Map<AppServerNotificationMethod, Set<JsonRpcServerNotificationHandler>>;
+  readonly toolHandlers: Set<JsonRpcServerRequestHandler>;
+  readonly securityHandlers: Set<(failure: AppServerSecurityFailure) => void>;
+  readonly processExitHandlers: Set<(error: CodexError) => void>;
+  released: boolean;
+  processExitNotified: boolean;
+}
+
 export class AppServerSession {
   private readonly supervisor: AppServerSessionSupervisor;
   private readonly extensionVersion: string;
@@ -81,6 +218,7 @@ export class AppServerSession {
   private restartPromise: Promise<AppServerCapabilities> | undefined;
   private disposePromise: Promise<void> | undefined;
   private nextGeneration = 1;
+  private nextLeaseId = 1;
   private initializedClient: AppServerSessionClient | undefined;
   private initializedGeneration: number | undefined;
   private capabilities: AppServerCapabilities | undefined;
@@ -88,6 +226,7 @@ export class AppServerSession {
   private modelCacheGeneration: number | undefined;
   private incompatibleFailure: CodexError | undefined;
   private handlerDisposables: Disposable[] = [];
+  private readonly transportLeases = new Set<TransportLeaseRecord>();
   private disposed = false;
   private securityProtocolFailure = false;
 
@@ -179,30 +318,185 @@ export class AppServerSession {
     return this.listModelsInternal();
   }
 
-  public getClient(): AppServerSessionClient {
-    if (this.disposed) {
-      throw new CodexError("cancelled", { action: "getAppServerClient" });
+  public async acquireTransportLease(): Promise<AppServerTransportLease> {
+    const capabilities = await this.initialize();
+    const client = this.initializedClient;
+    const generation = this.initializedGeneration;
+    if (client === undefined || generation === undefined || client.isClosed === true) {
+      throw new CodexError("process", { action: "acquireAppServerLease" });
     }
-    if (
-      this.initializedClient === undefined
-      || this.initializedGeneration === undefined
-      || this.initializedClient.isClosed === true
-    ) {
-      throw new CodexError("process", { action: "getAppServerClient" });
-    }
-    return this.initializedClient;
+    const record: TransportLeaseRecord = {
+      generation,
+      leaseId: `app-server-lease-${this.nextLeaseId++}`,
+      client,
+      capabilities,
+      threadIds: new Set(),
+      turnIds: new Set(),
+      pendingTurnThreads: new Set(),
+      preResponseNotifications: new Map(),
+      preResponseToolCalls: new Map(),
+      notificationHandlers: new Map(),
+      toolHandlers: new Set(),
+      securityHandlers: new Set(),
+      processExitHandlers: new Set(),
+      released: false,
+      processExitNotified: false,
+    };
+    this.transportLeases.add(record);
+    return this.createTransportLease(record);
   }
 
-  public async request<T>(
-    method: string,
-    params?: unknown,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    const { client, generation } = await this.requireInitializedClient();
-    this.assertCurrentClient(client, generation, method);
-    const response = await client.request<T>(method, params, signal);
-    this.assertCurrentClient(client, generation, method);
-    return response;
+  private createTransportLease(record: TransportLeaseRecord): AppServerTransportLease {
+    return {
+      generation: record.generation,
+      leaseId: record.leaseId,
+      capabilities: record.capabilities,
+      startThread: async (dynamicTools, signal) => {
+        this.assertLeaseForStart(record);
+        if (!record.capabilities.dynamicTools) {
+          throw new CodexError("incompatible", { action: "upgradeCodex" });
+        }
+        const response = await record.client.request<unknown>("thread/start", {
+          ...APP_SERVER_THREAD_CONFIG,
+          dynamicTools: dynamicTools.map((tool) => ({
+            type: tool.type,
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            deferLoading: tool.deferLoading,
+          })),
+        }, signal);
+        this.assertLeaseForStart(record);
+        const threadId = readThreadId(response);
+        record.threadIds.add(threadId);
+        return { threadId };
+      },
+      startTurn: async (params, signal) => {
+        this.assertLeaseForStart(record);
+        this.assertLeaseThread(record, params.threadId);
+        record.pendingTurnThreads.add(params.threadId);
+        try {
+          const response = await record.client.request<unknown>("turn/start", {
+            threadId: params.threadId,
+            model: params.modelId,
+            input: params.input,
+          }, signal);
+          this.assertLeaseForStart(record);
+          const turnId = readTurnId(response);
+          record.pendingTurnThreads.delete(params.threadId);
+          record.turnIds.add(turnKey(params.threadId, turnId));
+          this.flushPreResponseEvents(record, params.threadId, turnId);
+          return { turnId };
+        } catch (cause) {
+          record.pendingTurnThreads.delete(params.threadId);
+          this.rejectPreResponseToolCalls(record, params.threadId, cause);
+          throw cause;
+        }
+      },
+      interrupt: async (threadId, turnId) => {
+        this.assertLeaseForCleanup(record);
+        this.assertLeaseTurn(record, threadId, turnId);
+        await record.client.request("turn/interrupt", { threadId, turnId });
+      },
+      unsubscribe: async (threadId) => {
+        this.assertLeaseForCleanup(record);
+        this.rejectPreResponseToolCalls(
+          record,
+          threadId,
+          new CodexError("cancelled", { action: "appServerLease" }),
+        );
+        record.pendingTurnThreads.delete(threadId);
+        this.assertLeaseThread(record, threadId);
+        await record.client.request("thread/unsubscribe", { threadId });
+        record.threadIds.delete(threadId);
+        for (const key of [...record.turnIds]) {
+          if (key.startsWith(`${threadId}\u0000`)) {
+            record.turnIds.delete(key);
+          }
+        }
+      },
+      onNotification: (method, handler) => {
+        this.assertLeaseForStart(record);
+        const handlers = record.notificationHandlers.get(method) ?? new Set();
+        handlers.add(handler);
+        record.notificationHandlers.set(method, handlers);
+        return {
+          dispose: (): void => {
+            handlers.delete(handler);
+          },
+        };
+      },
+      onToolCall: (handler) => {
+        this.assertLeaseForStart(record);
+        record.toolHandlers.add(handler);
+        return { dispose: (): void => { record.toolHandlers.delete(handler); } };
+      },
+      onSecurityFailure: (handler) => {
+        this.assertLeaseForStart(record);
+        record.securityHandlers.add(handler);
+        return { dispose: (): void => { record.securityHandlers.delete(handler); } };
+      },
+      onProcessExit: (handler) => {
+        this.assertLeaseForStart(record);
+        record.processExitHandlers.add(handler);
+        return { dispose: (): void => { record.processExitHandlers.delete(handler); } };
+      },
+      release: (): void => {
+        this.releaseTransportLease(record);
+      },
+    };
+  }
+
+  private assertLeaseForStart(record: TransportLeaseRecord): void {
+    if (record.released || this.disposed) {
+      throw new CodexError("cancelled", { action: "appServerLease" });
+    }
+    if (
+      record.client.isClosed === true
+      || this.initializedClient !== record.client
+      || this.initializedGeneration !== record.generation
+    ) {
+      throw new CodexError("process", { action: "appServerLease" });
+    }
+  }
+
+  private assertLeaseForCleanup(record: TransportLeaseRecord): void {
+    if (record.released) {
+      throw new CodexError("cancelled", { action: "appServerLease" });
+    }
+  }
+
+  private assertLeaseThread(record: TransportLeaseRecord, threadId: string): void {
+    if (!record.threadIds.has(threadId)) {
+      throw protocolError("appServerThread");
+    }
+  }
+
+  private assertLeaseTurn(record: TransportLeaseRecord, threadId: string, turnId: string): void {
+    if (!record.turnIds.has(turnKey(threadId, turnId))) {
+      throw protocolError("appServerTurn");
+    }
+  }
+
+  private releaseTransportLease(record: TransportLeaseRecord): void {
+    if (record.released) {
+      return;
+    }
+    record.released = true;
+    record.notificationHandlers.clear();
+    record.toolHandlers.clear();
+    record.securityHandlers.clear();
+    record.processExitHandlers.clear();
+    record.threadIds.clear();
+    record.turnIds.clear();
+    this.rejectPreResponseToolCalls(
+      record,
+      undefined,
+      new CodexError("cancelled", { action: "appServerLease" }),
+    );
+    record.pendingTurnThreads.clear();
+    record.preResponseNotifications.clear();
+    this.transportLeases.delete(record);
   }
 
   public dispose(): Promise<void> {
@@ -254,6 +548,7 @@ export class AppServerSession {
         throw new CodexError("process", { action: "initializeCodex" });
       }
       registrations = this.registerSafetyHandlers(client);
+      registrations.push(...this.registerTransportHandlers(client, generation));
       this.handlerDisposables = registrations;
       this.throwIfDisposed("initializeCodex");
       const response = await client.request<unknown>("initialize", {
@@ -378,6 +673,13 @@ export class AppServerSession {
   }
 
   private clearInitializedState(): void {
+    if (this.initializedClient !== undefined && this.initializedGeneration !== undefined) {
+      this.notifyTransportProcessExit(
+        this.initializedClient,
+        this.initializedGeneration,
+        new CodexError("process", { action: "appServerExit" }),
+      );
+    }
     this.disposeClientHandlers();
     this.initializedClient = undefined;
     this.initializedGeneration = undefined;
@@ -480,6 +782,223 @@ export class AppServerSession {
     });
   }
 
+  private registerTransportHandlers(
+    client: AppServerSessionClient,
+    generation: number,
+  ): Disposable[] {
+    const registrations: Disposable[] = [];
+    for (const method of TRANSPORT_NOTIFICATION_METHODS) {
+      registrations.push(client.onServerNotification(method, (params) => {
+        this.dispatchTransportNotification(client, generation, method, params);
+      }));
+    }
+    registrations.push(client.onServerRequest("item/tool/call", (params, id) =>
+      this.dispatchTransportToolCall(client, generation, params, id)));
+    if (client.onDidTerminate !== undefined) {
+      registrations.push(client.onDidTerminate((error) => {
+        this.notifyTransportProcessExit(client, generation, error);
+      }));
+    }
+    return registrations;
+  }
+
+  private dispatchTransportNotification(
+    client: AppServerSessionClient,
+    generation: number,
+    method: AppServerNotificationMethod,
+    params: unknown,
+  ): void {
+    const correlation = readCorrelation(params);
+    if (correlation === undefined) {
+      return;
+    }
+    const candidates = [...this.transportLeases].filter((lease) =>
+      !lease.released
+      && lease.client === client
+      && lease.generation === generation
+      && lease.threadIds.has(correlation.threadId));
+    const active = candidates.filter((lease) =>
+      lease.turnIds.has(turnKey(correlation.threadId, correlation.turnId)));
+    if (active.length === 1) {
+      for (const handler of active[0]?.notificationHandlers.get(method) ?? []) {
+        void Promise.resolve(handler(params)).catch(() => undefined);
+      }
+      return;
+    }
+    if (active.length > 1) {
+      return;
+    }
+    const pending = candidates.filter((lease) =>
+      lease.pendingTurnThreads.has(correlation.threadId));
+    if (pending.length !== 1) {
+      return;
+    }
+    const lease = pending[0];
+    if (lease === undefined) {
+      return;
+    }
+    const key = turnKey(correlation.threadId, correlation.turnId);
+    const buffered = lease.preResponseNotifications.get(key) ?? [];
+    buffered.push({ method, params });
+    lease.preResponseNotifications.set(key, buffered);
+  }
+
+  private dispatchTransportToolCall(
+    client: AppServerSessionClient,
+    generation: number,
+    params: unknown,
+    id: JsonRpcId,
+  ): Promise<unknown> {
+    const correlation = readCorrelation(params);
+    if (correlation === undefined) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    const candidates = [...this.transportLeases].filter((lease) =>
+      !lease.released
+      && lease.client === client
+      && lease.generation === generation
+      && lease.threadIds.has(correlation.threadId));
+    const matching = candidates.filter((lease) =>
+      lease.turnIds.has(turnKey(correlation.threadId, correlation.turnId)));
+    if (matching.length > 1) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    if (matching.length === 1) {
+      const handlers = [...(matching[0]?.toolHandlers ?? [])];
+      if (handlers.length !== 1) {
+        return Promise.reject(protocolError("item/tool/call"));
+      }
+      return Promise.resolve(handlers[0]?.(params, id));
+    }
+    const pending = candidates.filter((lease) =>
+      lease.pendingTurnThreads.has(correlation.threadId)
+      && lease.toolHandlers.size > 0);
+    if (pending.length !== 1) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    const lease = pending[0];
+    if (lease === undefined) {
+      return Promise.reject(protocolError("item/tool/call"));
+    }
+    const key = turnKey(correlation.threadId, correlation.turnId);
+    return new Promise<unknown>((resolve, reject) => {
+      const buffered = lease.preResponseToolCalls.get(key) ?? [];
+      buffered.push({ params, id, resolve, reject });
+      lease.preResponseToolCalls.set(key, buffered);
+    });
+  }
+
+  private flushPreResponseEvents(
+    record: TransportLeaseRecord,
+    threadId: string,
+    turnId: string,
+  ): void {
+    if (record.released) {
+      return;
+    }
+    const key = turnKey(threadId, turnId);
+    const notifications = record.preResponseNotifications.get(key) ?? [];
+    const toolCalls = record.preResponseToolCalls.get(key) ?? [];
+    this.dropPreResponseEventsForOtherTurns(record, threadId, key);
+    record.preResponseNotifications.delete(key);
+    record.preResponseToolCalls.delete(key);
+
+    for (const notification of notifications) {
+      for (const handler of record.notificationHandlers.get(notification.method) ?? []) {
+        void Promise.resolve(handler(notification.params)).catch(() => undefined);
+      }
+    }
+
+    const handlers = [...record.toolHandlers];
+    if (handlers.length !== 1) {
+      const failure = protocolError("item/tool/call");
+      for (const toolCall of toolCalls) {
+        toolCall.reject(failure);
+      }
+      return;
+    }
+    const handler = handlers[0];
+    if (handler === undefined) {
+      return;
+    }
+    for (const toolCall of toolCalls) {
+      void Promise.resolve(handler(toolCall.params, toolCall.id))
+        .then(toolCall.resolve, toolCall.reject);
+    }
+  }
+
+  private rejectPreResponseToolCalls(
+    record: TransportLeaseRecord,
+    threadId: string | undefined,
+    cause: unknown,
+  ): void {
+    for (const [key, toolCalls] of record.preResponseToolCalls) {
+      if (threadId !== undefined && !key.startsWith(`${threadId}\u0000`)) {
+        continue;
+      }
+      record.preResponseToolCalls.delete(key);
+      for (const toolCall of toolCalls) {
+        toolCall.reject(cause);
+      }
+    }
+    if (threadId === undefined) {
+      record.preResponseNotifications.clear();
+      return;
+    }
+    for (const key of record.preResponseNotifications.keys()) {
+      if (key.startsWith(`${threadId}\u0000`)) {
+        record.preResponseNotifications.delete(key);
+      }
+    }
+  }
+
+  private dropPreResponseEventsForOtherTurns(
+    record: TransportLeaseRecord,
+    threadId: string,
+    retainedKey: string,
+  ): void {
+    for (const key of record.preResponseNotifications.keys()) {
+      if (key !== retainedKey && key.startsWith(`${threadId}\u0000`)) {
+        record.preResponseNotifications.delete(key);
+      }
+    }
+    for (const key of record.preResponseToolCalls.keys()) {
+      if (key !== retainedKey && key.startsWith(`${threadId}\u0000`)) {
+        const toolCalls = record.preResponseToolCalls.get(key) ?? [];
+        record.preResponseToolCalls.delete(key);
+        const failure = protocolError("item/tool/call");
+        for (const toolCall of toolCalls) {
+          toolCall.reject(failure);
+        }
+      }
+    }
+  }
+
+  private notifyTransportProcessExit(
+    client: AppServerSessionClient,
+    generation: number,
+    error: CodexError,
+  ): void {
+    for (const lease of this.transportLeases) {
+      if (
+        lease.released
+        || lease.processExitNotified
+        || lease.client !== client
+        || lease.generation !== generation
+      ) {
+        continue;
+      }
+      lease.processExitNotified = true;
+      for (const handler of lease.processExitHandlers) {
+        try {
+          handler(error);
+        } catch {
+          // A process-exit observer must not prevent other leases from closing.
+        }
+      }
+    }
+  }
+
   private isCapabilityUnsupportedFailure(cause: CodexError): boolean {
     if (cause.code !== "protocol") {
       return false;
@@ -545,15 +1064,40 @@ export class AppServerSession {
     }
 
     this.securityProtocolFailure = true;
+    const threadId = nonEmptyString(record.threadId);
+    const turnId = nonEmptyString(record.turnId);
     const interruptParams = {
-      ...(nonEmptyString(record.threadId) === undefined
+      ...(threadId === undefined
         ? {}
-        : { threadId: nonEmptyString(record.threadId) }),
-      ...(nonEmptyString(record.turnId) === undefined
+        : { threadId }),
+      ...(turnId === undefined
         ? {}
-        : { turnId: nonEmptyString(record.turnId) }),
+        : { turnId }),
     };
     await client.request("turn/interrupt", interruptParams).catch(() => undefined);
+    if (threadId === undefined || turnId === undefined) {
+      return;
+    }
+    for (const lease of this.transportLeases) {
+      if (
+        lease.released
+        || lease.client !== client
+        || !lease.threadIds.has(threadId)
+        || !lease.turnIds.has(turnKey(threadId, turnId))
+      ) {
+        continue;
+      }
+      const failure: AppServerSecurityFailure = {
+        threadId,
+        turnId,
+        generation: lease.generation,
+        leaseId: lease.leaseId,
+        interruptIssued: true,
+      };
+      for (const handler of lease.securityHandlers) {
+        handler(failure);
+      }
+    }
   }
 
   private recordModelDiagnostics(diagnostics: AppServerModelDiagnostics): void {

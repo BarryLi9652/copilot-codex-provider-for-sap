@@ -66,7 +66,8 @@ export class JsonlRpcClient {
   private readonly input: Writable;
   private readonly output: Readable;
   private readonly requestTimeoutMs: number;
-  private readonly onDidTerminate: ((error: CodexError) => void) | undefined;
+  private readonly terminationCallback: ((error: CodexError) => void) | undefined;
+  private readonly terminationHandlers = new Set<(error: CodexError) => void>();
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private readonly pendingRequests = new Map<JsonRpcId, PendingRequest>();
   private readonly serverRequests = new Map<JsonRpcId, ActiveServerRequest>();
@@ -97,12 +98,12 @@ export class JsonlRpcClient {
       this.output = first.output;
       const options = second as JsonlRpcClientOptions | undefined;
       this.requestTimeoutMs = validateTimeout(options);
-      this.onDidTerminate = options?.onDidTerminate;
+      this.terminationCallback = options?.onDidTerminate;
     } else {
       this.output = first;
       this.input = second as Writable;
       this.requestTimeoutMs = validateTimeout(third);
-      this.onDidTerminate = third?.onDidTerminate;
+      this.terminationCallback = third?.onDidTerminate;
     }
 
     this.output.on("data", this.handleData);
@@ -112,6 +113,18 @@ export class JsonlRpcClient {
     this.input.on("error", this.handleStreamError);
     this.input.on("finish", this.handleInputEnd);
     this.input.on("close", this.handleInputEnd);
+  }
+
+  public onDidTerminate(handler: (error: CodexError) => void): Disposable {
+    if (this.closed) {
+      return { dispose: (): void => undefined };
+    }
+    this.terminationHandlers.add(handler);
+    return {
+      dispose: (): void => {
+        this.terminationHandlers.delete(handler);
+      },
+    };
   }
 
   public request<T>(
@@ -601,10 +614,18 @@ export class JsonlRpcClient {
     this.serverNotificationHandlers.clear();
     this.lineBuffer = "";
     try {
-      this.onDidTerminate?.(error);
+      this.terminationCallback?.(error);
     } catch {
       // A termination observer must not escape a stream callback.
     }
+    for (const handler of this.terminationHandlers) {
+      try {
+        handler(error);
+      } catch {
+        // A termination observer must not escape a stream callback.
+      }
+    }
+    this.terminationHandlers.clear();
   }
 }
 

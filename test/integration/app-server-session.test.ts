@@ -522,8 +522,8 @@ test("initializes the exact client returned by supervisor.restart", async () => 
   ]);
   assert.equal(supervisor.firstClient.serverRequestHandlers.size, 0);
   assert.equal(supervisor.firstClient.serverNotificationHandlers.size, 0);
-  assert.equal(supervisor.restartClient.serverRequestHandlers.size, 5);
-  assert.equal(supervisor.restartClient.serverNotificationHandlers.size, 1);
+  assert.equal(supervisor.restartClient.serverRequestHandlers.size, 6);
+  assert.equal(supervisor.restartClient.serverNotificationHandlers.size, 7);
 
   await session.dispose();
 });

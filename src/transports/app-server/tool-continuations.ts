@@ -41,6 +41,12 @@ export interface PendingContinuation {
   readonly calls: readonly PendingToolCall[];
 }
 
+export interface ToolContinuationResumeOptions {
+  continueTurn?: boolean;
+  threadId?: string;
+  turnId?: string;
+}
+
 export interface ToolContinuationRegistryOptions {
   now?: () => number;
   timeoutMs?: number;
@@ -88,6 +94,23 @@ export class ToolContinuationRegistry {
 
   public get size(): number {
     return this.callsById.size;
+  }
+
+  public has(callId: string): boolean {
+    return this.callsById.has(callId);
+  }
+
+  public hasState(threadId: string, turnId: string): boolean {
+    return this.states.has(chainKey(threadId, turnId));
+  }
+
+  public isReady(threadId: string, turnId: string): boolean {
+    const state = this.states.get(chainKey(threadId, turnId));
+    if (state === undefined) {
+      return false;
+    }
+    return [...state.callMap.values()].every((call) =>
+      call.surfacedToCopilot && call.receivedResult !== undefined);
   }
 
   public capture(request: PendingToolCallRequest): PendingContinuation {
@@ -175,8 +198,9 @@ export class ToolContinuationRegistry {
   public resume(
     results: readonly ToolContinuationResult[],
     signal: AbortSignal,
+    options: ToolContinuationResumeOptions = {},
   ): AsyncIterable<TransportEvent> | undefined {
-    const state = this.findState(results);
+    const state = this.findState(results, options);
     if (state === undefined) {
       if (signal.aborted && this.states.size === 1) {
         const onlyState = this.states.values().next().value as ContinuationState | undefined;
@@ -233,7 +257,7 @@ export class ToolContinuationRegistry {
 
     const continueTurn = state.continueTurn;
     this.removeState(state);
-    return continueTurn?.(signal);
+    return options.continueTurn === false ? undefined : continueTurn?.(signal);
   }
 
   public expire(now = this.now()): number {
@@ -267,7 +291,18 @@ export class ToolContinuationRegistry {
     }
   }
 
-  public processExit(error: Error = new CodexError("process")): void {
+  public processExit(
+    error: Error = new CodexError("process"),
+    threadId?: string,
+    turnId?: string,
+  ): void {
+    if (threadId !== undefined && turnId !== undefined) {
+      const state = this.states.get(chainKey(threadId, turnId));
+      if (state !== undefined) {
+        this.terminate(state, error);
+      }
+      return;
+    }
     for (const state of [...this.states.values()]) {
       this.terminate(state, error);
     }
@@ -277,8 +312,14 @@ export class ToolContinuationRegistry {
     this.processExit(new CodexError("cancelled"));
   }
 
-  private findState(results: readonly ToolContinuationResult[]): ContinuationState | undefined {
+  private findState(
+    results: readonly ToolContinuationResult[],
+    options: ToolContinuationResumeOptions,
+  ): ContinuationState | undefined {
     if (results.length === 0) {
+      if (options.threadId !== undefined && options.turnId !== undefined) {
+        return this.states.get(chainKey(options.threadId, options.turnId));
+      }
       if (this.states.size !== 1) {
         return undefined;
       }
