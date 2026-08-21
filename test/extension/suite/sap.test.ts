@@ -365,9 +365,10 @@ async function fixtureRestoresEditorAndDocumentState(): Promise<void> {
   const previousEditor = vscode.window.activeTextEditor;
   const previousUri = previousEditor?.document.uri.toString(true);
   const fixturePath = "task-11-isolation";
-  const fixtureUri = `adt://DEV/src/${fixturePath}.clas.abap`;
+  const fixtureUri = vscode.Uri.parse(`adt://DEV/src/${fixturePath}.clas.abap`).toString(true);
+  const fixtureContent = "CLASS zcl_isolation.\nENDCLASS.\n";
 
-  await withAdtEditor("CLASS zcl_isolation.\nENDCLASS.\n", fixturePath, async ({ editor, uri }) => {
+  await withAdtEditor(fixtureContent, fixturePath, async ({ editor, uri }) => {
     const diagnostics = vscode.languages.createDiagnosticCollection("copilot-codex-task-11-isolation");
     await editor.edit((edit) => edit.insert(new vscode.Position(0, 0), "* temporary\n"));
     diagnostics.set(uri, [new vscode.Diagnostic(
@@ -388,10 +389,10 @@ async function fixtureRestoresEditorAndDocumentState(): Promise<void> {
     vscode.window.visibleTextEditors.some((editor) => editor.document.uri.toString(true) === fixtureUri),
     false,
   );
-  assert.equal(
-    vscode.workspace.textDocuments.some((document) => document.uri.toString(true) === fixtureUri),
-    false,
-  );
+  const retainedDocument = vscode.workspace.textDocuments.find((document) =>
+    document.uri.toString(true) === fixtureUri);
+  assert.equal(retainedDocument?.isDirty ?? false, false);
+  assert.equal(retainedDocument?.getText() ?? fixtureContent, fixtureContent);
 }
 
 async function bothProviderRoutesUseSharedSapInstructions(): Promise<void> {
