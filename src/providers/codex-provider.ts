@@ -13,6 +13,8 @@ import type {
 import { toCodexRequest } from "./message-adapter.js";
 import { reportTransportEvent } from "./response-adapter.js";
 import { countTokens } from "./token-count.js";
+import { SapContextProvider } from "../sap/context.js";
+import { buildSapInstructions } from "../sap/instructions.js";
 
 const MODEL_CACHE_TTL_MS = 300_000;
 
@@ -20,6 +22,7 @@ export interface CodexLanguageModelProviderOptions {
   modelCache?: ModelCache;
   requestIdFactory?: () => string;
   instructions?: string;
+  sapContextProvider?: SapContextProvider;
 }
 
 const isCancelledError = (error: unknown): boolean =>
@@ -71,6 +74,7 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
   private readonly modelCache: ModelCache;
   private readonly requestIdFactory: () => string;
   private readonly instructions: string;
+  private readonly sapContextProvider: SapContextProvider;
 
   public constructor(
     private readonly transport: CodexTransport,
@@ -81,6 +85,7 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     this.modelCache = resolvedOptions.modelCache ?? new ModelCache(MODEL_CACHE_TTL_MS);
     this.requestIdFactory = resolvedOptions.requestIdFactory ?? randomUUID;
     this.instructions = resolvedOptions.instructions ?? "";
+    this.sapContextProvider = resolvedOptions.sapContextProvider ?? new SapContextProvider();
   }
 
   public async provideLanguageModelChatInformation(
@@ -126,7 +131,13 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
         model,
         messages,
         options,
-        instructions: this.instructions,
+        instructions: [
+          this.instructions,
+          buildSapInstructions(
+            this.sapContextProvider.collect(),
+            (options.tools ?? []).map((tool) => tool.name),
+          ),
+        ].filter((instructions) => instructions.length > 0).join("\n\n"),
       });
       for await (const event of this.transport.generate(request, binding.signal)) {
         if (binding.signal.aborted) {
