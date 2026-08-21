@@ -474,7 +474,7 @@ async function handlesCancellation(): Promise<void> {
   cancellation.dispose();
 }
 
-async function preservesTypedTransportErrors(): Promise<void> {
+async function mapsTypedTransportErrorsToOneRecoveryAction(): Promise<void> {
   const expected = new CodexError("network", { action: "retry" });
   const provider = new CodexLanguageModelProvider({
     listModels: async () => [model],
@@ -501,9 +501,35 @@ async function preservesTypedTransportErrors(): Promise<void> {
       { report: () => undefined },
       cancellation.token,
     ),
-    (error: unknown) => error === expected,
+    (error: unknown) => error instanceof CodexError
+      && error.code === "network"
+      && error.action === "showDiagnostics",
   );
   cancellation.dispose();
+}
+
+async function mapsModelDiscoveryErrorsToOneRecoveryAction(): Promise<void> {
+  const provider = new CodexLanguageModelProvider({
+    listModels: async () => {
+      throw new CodexError("process", { action: "appServerExit" });
+    },
+    generate: async function* (): AsyncIterable<TransportEvent> {},
+    dispose: async () => undefined,
+  }, "test-vendor");
+  const cancellation = new vscode.CancellationTokenSource();
+  try {
+    await assert.rejects(
+      provider.provideLanguageModelChatInformation(
+        { silent: false },
+        cancellation.token,
+      ),
+      (error: unknown) => error instanceof CodexError
+        && error.code === "process"
+        && error.action === "restartCodex",
+    );
+  } finally {
+    cancellation.dispose();
+  }
 }
 
 export async function runProviderTests(): Promise<void> {
@@ -516,7 +542,8 @@ export async function runProviderTests(): Promise<void> {
     ["provider disposes response cancellation listeners on request-build failure", disposesResponseCancellationListenerOnRequestBuildFailure],
     ["provider counts UTF-16 text and serialized tool metadata with a minimum of one", countsTokens],
     ["provider returns quietly when transport cancellation is requested", handlesCancellation],
-    ["provider preserves typed transport errors for Copilot", preservesTypedTransportErrors],
+    ["provider maps typed errors to one recovery action", mapsTypedTransportErrorsToOneRecoveryAction],
+    ["provider maps model discovery errors to one recovery action", mapsModelDiscoveryErrorsToOneRecoveryAction],
   ];
 
   for (const [name, test] of tests) {

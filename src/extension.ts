@@ -74,6 +74,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const localTransport = new AppServerTransport(
     localSession,
     continuationRegistry,
+    { failedCallTtlMs: toolTimeoutMs },
   );
   const localProvider = new CodexLanguageModelProvider(
     localTransport,

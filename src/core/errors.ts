@@ -17,6 +17,14 @@ export interface CodexErrorOptions {
   cause?: unknown;
 }
 
+export type ProviderRecoveryAction =
+  | "signIn"
+  | "refreshModels"
+  | "selectCodex"
+  | "restartCodex"
+  | "upgradeCodex"
+  | "showDiagnostics";
+
 const DEFAULT_MESSAGES: Readonly<Record<CodexErrorCode, string>> = {
   authRequired: "Authentication is required.",
   unauthorized: "Authentication was rejected.",
@@ -46,4 +54,44 @@ export class CodexError extends Error {
     this.action = options.action;
     this.retryAfterMs = options.retryAfterMs;
   }
+}
+
+const PROVIDER_ACTIONS = new Set<ProviderRecoveryAction>([
+  "signIn",
+  "refreshModels",
+  "selectCodex",
+  "restartCodex",
+  "upgradeCodex",
+  "showDiagnostics",
+]);
+
+const DEFAULT_PROVIDER_ACTION: Readonly<Record<Exclude<CodexErrorCode, "cancelled">, ProviderRecoveryAction>> = {
+  authRequired: "signIn",
+  unauthorized: "signIn",
+  rateLimited: "showDiagnostics",
+  network: "showDiagnostics",
+  timeout: "showDiagnostics",
+  protocol: "showDiagnostics",
+  process: "restartCodex",
+  incompatible: "upgradeCodex",
+  toolContinuation: "restartCodex",
+  sapContext: "showDiagnostics",
+};
+
+export function withProviderRecoveryAction(error: CodexError): CodexError {
+  if (error.code === "cancelled") {
+    return error;
+  }
+  const existing = error.action;
+  const action = existing !== undefined && PROVIDER_ACTIONS.has(existing as ProviderRecoveryAction)
+    ? existing as ProviderRecoveryAction
+    : DEFAULT_PROVIDER_ACTION[error.code];
+  if (action === existing) {
+    return error;
+  }
+  return new CodexError(error.code, {
+    action,
+    retryAfterMs: error.retryAfterMs,
+    cause: error.cause,
+  });
 }

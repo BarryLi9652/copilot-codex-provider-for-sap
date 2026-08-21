@@ -38,6 +38,7 @@ export type {
 
 export interface AppServerTransportOptions {
   supportsImages?: boolean;
+  failedCallTtlMs?: number;
 }
 
 type QueueItem = { kind: "event"; event: TransportEvent } | { kind: "tool" };
@@ -86,6 +87,7 @@ interface TurnState {
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,128}$/;
 const CLEANUP_TIMEOUT_MS = 250;
+const DEFAULT_FAILED_CALL_TTL_MS = 300_000;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -228,8 +230,10 @@ class AsyncQueue<T> {
 
 export class AppServerTransport implements CodexTransport {
   private readonly supportsImages: boolean;
+  private readonly failedCallTtlMs: number;
   private readonly states = new Map<string, TurnState>();
   private readonly callStates = new Map<string, TurnState>();
+  private readonly failedCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private disposed = false;
 
   public constructor(
@@ -238,6 +242,10 @@ export class AppServerTransport implements CodexTransport {
     options: AppServerTransportOptions = {},
   ) {
     this.supportsImages = options.supportsImages ?? true;
+    this.failedCallTtlMs = options.failedCallTtlMs ?? DEFAULT_FAILED_CALL_TTL_MS;
+    if (!Number.isFinite(this.failedCallTtlMs) || this.failedCallTtlMs <= 0) {
+      throw new RangeError("failedCallTtlMs must be positive");
+    }
   }
 
   public async listModels(
@@ -274,6 +282,10 @@ export class AppServerTransport implements CodexTransport {
       true,
     )));
     this.registry.dispose();
+    for (const timer of this.failedCallTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.failedCallTimers.clear();
     await this.session.dispose();
   }
 
@@ -289,6 +301,9 @@ export class AppServerTransport implements CodexTransport {
     let activeState: TurnState | undefined;
     try {
       const results = this.extractToolResults(request.messages);
+      if (results.some((result) => this.failedCallTimers.has(result.callId))) {
+        throw new CodexError("toolContinuation", { action: "restartCodex" });
+      }
       const continuationState = this.findContinuationState(results);
 
       if (continuationState !== undefined) {
@@ -622,6 +637,7 @@ export class AppServerTransport implements CodexTransport {
 
     return new Promise<unknown>((resolve, reject) => {
       try {
+        this.clearFailedCall(call.callId);
         this.registry.capture({
           generation: state.generation,
           leaseId: state.leaseId,
@@ -872,6 +888,14 @@ export class AppServerTransport implements CodexTransport {
         if (this.callStates.get(key) === state) {
           this.callStates.delete(key);
         }
+        if (
+          error !== undefined
+          && !(error instanceof CodexError && error.code === "cancelled")
+          && ![...this.callStates.values()].some((candidate) =>
+            !candidate.cleaned && candidate.callIds.has(callId))
+        ) {
+          this.rememberFailedCall(callId);
+        }
       }
       const stateKey = chainKey(
         state.threadId,
@@ -925,6 +949,24 @@ export class AppServerTransport implements CodexTransport {
       if (timer !== undefined) {
         clearTimeout(timer);
       }
+    }
+  }
+
+  private rememberFailedCall(callId: string): void {
+    this.clearFailedCall(callId);
+    const timer = setTimeout(() => {
+      this.failedCallTimers.delete(callId);
+    }, this.failedCallTtlMs);
+    const unref = (timer as unknown as { unref?: () => void }).unref;
+    unref?.call(timer);
+    this.failedCallTimers.set(callId, timer);
+  }
+
+  private clearFailedCall(callId: string): void {
+    const timer = this.failedCallTimers.get(callId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.failedCallTimers.delete(callId);
     }
   }
 

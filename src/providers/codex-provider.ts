@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 
 import { toAbortSignal } from "../core/cancellation.js";
-import { CodexError } from "../core/errors.js";
+import { CodexError, withProviderRecoveryAction } from "../core/errors.js";
 import { ModelCache } from "../core/model-cache.js";
 import type {
   CodexModel,
@@ -110,6 +110,9 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
       if (binding.signal.aborted || isCancelledError(error) || isAbortError(error)) {
         return [];
       }
+      if (error instanceof CodexError) {
+        throw withProviderRecoveryAction(error);
+      }
       throw error;
     } finally {
       binding.dispose();
@@ -148,6 +151,9 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     } catch (error: unknown) {
       if (binding.signal.aborted || isCancelledError(error) || isAbortError(error)) {
         return;
+      }
+      if (error instanceof CodexError) {
+        throw withProviderRecoveryAction(error);
       }
       throw error;
     } finally {
