@@ -416,6 +416,27 @@ export class AppServerTransport implements CodexTransport {
         modelId: request.modelId,
         input: serializeTranscript(request.messages, { supportsImages }),
       }, signal);
+      const invalidLeaseIdentity = state.lease !== lease
+        || state.generation !== lease.generation
+        || state.leaseId !== lease.leaseId;
+      if (
+        state.cleaned
+        || state.cleanupStarted
+        || this.disposed
+        || signal.aborted
+        || invalidLeaseIdentity
+      ) {
+        const error = state.failure ?? (
+          invalidLeaseIdentity
+            ? protocolError("turn/start")
+            : cancellationError()
+        );
+        if (!state.cleaned && !state.cleanupStarted) {
+          state.turnId = turn.turnId;
+          await this.terminateState(state, error, true);
+        }
+        throw error;
+      }
       state.turnId = turn.turnId;
       this.states.set(chainKey(
         state.threadId,

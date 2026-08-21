@@ -113,6 +113,11 @@ const identityFrom = (identity?: ToolContinuationIdentity): ToolContinuationIden
 const hasIdentity = (options: ToolContinuationResumeOptions): boolean =>
   options.generation !== undefined || options.leaseId !== undefined;
 
+const matchesIdentity = (
+  state: PendingContinuation,
+  identity: ToolContinuationIdentity,
+): boolean => state.generation === identity.generation && state.leaseId === identity.leaseId;
+
 const chainKey = (
   threadId: string,
   turnId: string,
@@ -386,10 +391,22 @@ export class ToolContinuationRegistry {
     turnId?: string,
     identity?: ToolContinuationIdentity,
   ): void {
+    if ((threadId === undefined) !== (turnId === undefined)) {
+      return;
+    }
     if (threadId !== undefined && turnId !== undefined) {
       const state = this.states.get(chainKey(threadId, turnId, identityFrom(identity)));
       if (state !== undefined) {
         this.terminate(state, error);
+      }
+      return;
+    }
+    if (identity !== undefined) {
+      const exactIdentity = identityFrom(identity);
+      for (const state of [...this.states.values()]) {
+        if (matchesIdentity(state, exactIdentity)) {
+          this.terminate(state, error);
+        }
       }
       return;
     }
@@ -408,8 +425,16 @@ export class ToolContinuationRegistry {
   ): ContinuationState | undefined {
     const identity = identityOf(options.generation, options.leaseId);
     if (results.length === 0) {
+      if ((options.threadId === undefined) !== (options.turnId === undefined)) {
+        throw continuationError();
+      }
       if (options.threadId !== undefined && options.turnId !== undefined) {
         return this.states.get(chainKey(options.threadId, options.turnId, identity));
+      }
+      if (hasIdentity(options)) {
+        const candidates = [...this.states.values()]
+          .filter((state) => matchesIdentity(state, identity));
+        return candidates.length === 1 ? candidates[0] : undefined;
       }
       if (this.states.size !== 1) {
         return undefined;

@@ -108,6 +108,7 @@ class FakeLease implements AppServerTransportLease {
     public readonly leaseId: string,
     private readonly selectedModel: CodexModel = model,
     ids?: { threadId: string; turnId: string },
+    private readonly turnStartGate?: Promise<void>,
   ) {
     this.threadId = ids?.threadId ?? `${leaseId}-thread`;
     this.turnId = ids?.turnId ?? `${leaseId}-turn`;
@@ -121,12 +122,13 @@ class FakeLease implements AppServerTransportLease {
     return Promise.resolve({ threadId: this.threadId });
   }
 
-  public startTurn(
+  public async startTurn(
     params: AppServerTurnStartParams,
     _signal?: AbortSignal,
   ): Promise<{ turnId: string }> {
     this.turnStarts.push(params);
-    return Promise.resolve({ turnId: this.turnId });
+    await this.turnStartGate;
+    return { turnId: this.turnId };
   }
 
   public async interrupt(threadId: string, turnId: string): Promise<void> {
@@ -240,6 +242,7 @@ class FakeSession implements AppServerTransportSession {
   public constructor(
     private readonly selectedModel: CodexModel = model,
     private readonly reuseTurnIds = false,
+    private readonly turnStartGate?: Promise<void>,
   ) {}
 
   public acquireTransportLease(): Promise<AppServerTransportLease> {
@@ -250,6 +253,7 @@ class FakeSession implements AppServerTransportSession {
       this.reuseTurnIds
         ? { threadId: "reused-thread", turnId: "reused-turn" }
         : undefined,
+      this.turnStartGate,
     );
     this.nextGeneration += 1;
     this.leases.push(lease);
@@ -533,6 +537,45 @@ test("cleanup uses the old lease after the session has acquired a replacement ge
   assert.equal((replacement as FakeLease).interrupts.length, 0);
   assert.equal((replacement as FakeLease).unsubscribes.length, 0);
   await transport.dispose();
+});
+
+test("a deferred turn start cannot resurrect state after transport disposal", async () => {
+  let resolveTurnStart!: () => void;
+  const turnStartGate = new Promise<void>((resolve) => {
+    resolveTurnStart = resolve;
+  });
+  const session = new FakeSession(model, false, turnStartGate);
+  const transport = new AppServerTransport(
+    session,
+    new ToolContinuationRegistry({ now: () => 500 }),
+  );
+  const controller = new AbortController();
+  let outcome: { status: "resolved" } | { status: "rejected"; error: unknown } | undefined;
+  const observed = collect(transport.generate(request(), controller.signal)).then(
+    () => { outcome = { status: "resolved" }; },
+    (error: unknown) => { outcome = { status: "rejected", error }; },
+  );
+  await waitFor(() => session.leases.length === 1 && session.leases[0]?.turnStarts.length === 1);
+  const lease = session.leases[0] as FakeLease;
+
+  await transport.dispose();
+  resolveTurnStart();
+  try {
+    await waitFor(() => outcome !== undefined);
+  } finally {
+    controller.abort();
+    await observed;
+  }
+
+  assert.equal(outcome?.status, "rejected");
+  assert.ok(outcome?.status === "rejected"
+    && outcome.error instanceof CodexError
+    && outcome.error.code === "cancelled");
+  assert.deepEqual(lease.interrupts, [{ threadId: lease.threadId, turnId: lease.turnId }]);
+  assert.deepEqual(lease.unsubscribes, [{ threadId: lease.threadId }]);
+  assert.equal(lease.releaseCount, 1);
+  assert.equal(lease.allNotificationHandlerCount, 0);
+  assert.equal(lease.allToolHandlerCount, 0);
 });
 
 test("old generation cleanup cannot delete a replacement with reused thread, turn, and call IDs", async () => {

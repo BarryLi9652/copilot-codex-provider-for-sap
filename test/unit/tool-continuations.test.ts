@@ -235,3 +235,84 @@ test("isolates reused call and turn IDs by generation and lease identity", () =>
   registry.cleanup("reused-thread", "reused-turn", secondIdentity);
   assert.equal(registry.size, 0);
 });
+
+test("resume with empty results selects only the supplied generation and lease", () => {
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const firstIdentity = { generation: 1, leaseId: "lease-1" };
+  const secondIdentity = { generation: 2, leaseId: "lease-2" };
+  const firstResponses: unknown[] = [];
+  registry.capture({
+    ...request("first-call", "first-thread", "first-turn", {
+      respond: (value) => firstResponses.push(value),
+    }),
+    ...firstIdentity,
+  });
+  registry.capture({
+    ...request("second-call", "second-thread", "second-turn"),
+    ...secondIdentity,
+  });
+  assert.equal(registry.resume([result("first-call", "ready")], signal, {
+    ...firstIdentity,
+    continueTurn: false,
+  }), undefined);
+  registry.markSurfaced("first-call", firstIdentity);
+
+  assert.equal(registry.resume([], signal, {
+    generation: 99,
+    leaseId: "missing-lease",
+    continueTurn: false,
+  }), undefined);
+  assert.deepEqual(firstResponses, []);
+  assert.equal(registry.size, 2);
+
+  assert.equal(registry.resume([], signal, {
+    ...firstIdentity,
+    continueTurn: false,
+  }), undefined);
+  assert.deepEqual(firstResponses, [{
+    contentItems: [{ type: "inputText", text: "ready" }],
+    success: true,
+  }]);
+  assert.equal(registry.has("first-call", firstIdentity), false);
+  assert.equal(registry.has("second-call", secondIdentity), true);
+  registry.cleanup("second-thread", "second-turn", secondIdentity);
+});
+
+test("process exit without thread IDs affects only the supplied identity", () => {
+  const registry = new ToolContinuationRegistry({ now: () => 500 });
+  const firstIdentity = { generation: 1, leaseId: "lease-1" };
+  const secondIdentity = { generation: 2, leaseId: "lease-2" };
+  const rejected: string[] = [];
+  registry.capture({
+    ...request("first-call", "first-thread", "first-turn", {
+      reject: () => rejected.push("first"),
+    }),
+    ...firstIdentity,
+  });
+  registry.capture({
+    ...request("second-call", "second-thread", "second-turn", {
+      reject: () => rejected.push("second"),
+    }),
+    ...secondIdentity,
+  });
+
+  registry.processExit(
+    new CodexError("process"),
+    undefined,
+    undefined,
+    { generation: 99, leaseId: "missing-lease" },
+  );
+  assert.deepEqual(rejected, []);
+  assert.equal(registry.size, 2);
+
+  registry.processExit(
+    new CodexError("process"),
+    undefined,
+    undefined,
+    firstIdentity,
+  );
+  assert.deepEqual(rejected, ["first"]);
+  assert.equal(registry.has("first-call", firstIdentity), false);
+  assert.equal(registry.has("second-call", secondIdentity), true);
+  registry.cleanup("second-thread", "second-turn", secondIdentity);
+});
