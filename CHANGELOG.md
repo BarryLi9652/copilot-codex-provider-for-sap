@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-08-22
+
+- Local CLI now enforces Copilot required-tool turns instead of silently dropping `toolMode=required`.
+- Added explicit Copilot-mediated ABAP write guidance while keeping native App Server file and command actions blocked.
+- Added current-turn SAP capability classification for workspace URI resolution, create/edit, diagnostics and activation tools without filtering supplied tools.
+- Added metadata-only lifecycle diagnostics for requested/surfaced tools, returned results, continuation resume and interrupted pending results.
+- Added regression coverage for write-capable dynamic-tool continuation; `approvalPolicy: never` and `sandbox: read-only` remain unchanged.
+
 ## 0.1.3 — 2026-08-21
 
 - Fixed Local CLI replies for current App Server nested turn notifications, per-item final-answer reconciliation, strict completion statuses, final-message-only responses, and current dynamic-tool request fields.

@@ -5,6 +5,7 @@ import type {
   CodexTransport,
   TransportEvent,
 } from "../../core/types.js";
+import { classifySapTools } from "../../sap/tool-capabilities.js";
 import type {
   AppServerDynamicTool,
   AppServerNotificationMethod,
@@ -21,6 +22,7 @@ import {
   protocolError,
 } from "./protocol.js";
 import { serializeTranscript } from "./transcript.js";
+import { buildAppServerTurnInstructions } from "./turn-policy.js";
 import {
   ToolContinuationRegistry,
   type ToolContinuationIdentity,
@@ -39,6 +41,11 @@ export type {
 export interface AppServerTransportOptions {
   supportsImages?: boolean;
   failedCallTtlMs?: number;
+  logger?: AppServerTransportLogger;
+}
+
+export interface AppServerTransportLogger {
+  event(name: string, metadata?: Record<string, unknown>): void;
 }
 
 type QueueItem = { kind: "event"; event: TransportEvent } | { kind: "tool" };
@@ -67,10 +74,13 @@ interface TurnState {
   readonly threadId: string;
   turnId: string;
   readonly supportsImages: boolean;
+  readonly requireToolCall: boolean;
   readonly toolNames: ReadonlySet<string>;
   readonly queue: AsyncQueue<QueueItem>;
   readonly registrations: Disposable[];
   readonly callIds: Set<string>;
+  readonly callNames: Map<string, string>;
+  readonly surfacedCallIds: Set<string>;
   readonly receivedCallIds: Set<string>;
   readonly preResponseNotifications: PreResponseNotification[];
   readonly preResponseToolCalls: PreResponseToolCall[];
@@ -267,6 +277,7 @@ class AsyncQueue<T> {
 export class AppServerTransport implements CodexTransport {
   private readonly supportsImages: boolean;
   private readonly failedCallTtlMs: number;
+  private readonly logger: AppServerTransportLogger | undefined;
   private readonly states = new Map<string, TurnState>();
   private readonly callStates = new Map<string, TurnState>();
   private readonly failedCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -279,6 +290,7 @@ export class AppServerTransport implements CodexTransport {
   ) {
     this.supportsImages = options.supportsImages ?? true;
     this.failedCallTtlMs = options.failedCallTtlMs ?? DEFAULT_FAILED_CALL_TTL_MS;
+    this.logger = options.logger;
     if (!Number.isFinite(this.failedCallTtlMs) || this.failedCallTtlMs <= 0) {
       throw new RangeError("failedCallTtlMs must be positive");
     }
@@ -357,6 +369,11 @@ export class AppServerTransport implements CodexTransport {
           && this.registry.received(result.callId, stateIdentity(continuationState)) === undefined);
         this.assertContinuationImages(continuationState, newResults);
         if (newResults.length > 0) {
+          for (const result of newResults) {
+            this.logger?.event("appServer.tool.resultReceived", {
+              toolName: continuationState.callNames.get(result.callId),
+            });
+          }
           const resumed = this.registry.resume(newResults, signal, {
             generation: continuationState.generation,
             leaseId: continuationState.leaseId,
@@ -365,6 +382,11 @@ export class AppServerTransport implements CodexTransport {
             continuationState.receivedCallIds.add(result.callId);
           }
           if (resumed !== undefined) {
+            for (const result of newResults) {
+              this.logger?.event("appServer.tool.resumed", {
+                toolName: continuationState.callNames.get(result.callId),
+              });
+            }
             yield* resumed;
             return;
           }
@@ -436,6 +458,19 @@ export class AppServerTransport implements CodexTransport {
           deferLoading: false,
         };
       });
+      const toolCapabilities = classifySapTools(request.tools.map((tool) => tool.name));
+      this.logger?.event("appServer.request.tools", {
+        toolMode: request.toolMode,
+        toolCount: request.tools.length,
+        hasAbapRead: toolCapabilities.read.length > 0,
+        hasWorkspaceUriResolver: toolCapabilities.resolveWorkspaceUri.length > 0,
+        hasCreate: toolCapabilities.create.length > 0,
+        hasGenericEdit: toolCapabilities.edit.some((name) =>
+          name === "replace_string_in_file" || name === "insert_edit_into_file"),
+        hasAbapSemanticEdit: toolCapabilities.edit.includes("replace_string_in_abap_object"),
+        hasDiagnostics: toolCapabilities.diagnostics.length > 0,
+        hasActivate: toolCapabilities.activate.length > 0,
+      });
       const thread = await lease.startThread(dynamicTools, signal);
       state = {
         generation: lease.generation,
@@ -444,10 +479,13 @@ export class AppServerTransport implements CodexTransport {
         threadId: thread.threadId,
         turnId: "",
         supportsImages,
+        requireToolCall: request.toolMode === "required",
         toolNames: new Set(dynamicTools.map((tool) => tool.name)),
         queue: new AsyncQueue<QueueItem>(),
         registrations: [],
         callIds: new Set(),
+        callNames: new Map(),
+        surfacedCallIds: new Set(),
         receivedCallIds: new Set(),
         preResponseNotifications: [],
         preResponseToolCalls: [],
@@ -468,7 +506,7 @@ export class AppServerTransport implements CodexTransport {
         modelId: request.modelId,
         input: serializeTranscript(request.messages, {
           supportsImages,
-          instructions: request.instructions,
+          instructions: buildAppServerTurnInstructions(request.instructions, request.toolMode),
         }),
       }, signal);
       const invalidLeaseIdentity = state.lease !== lease
@@ -607,6 +645,15 @@ export class AppServerTransport implements CodexTransport {
         void this.terminateState(state, error, false);
         return;
       }
+      if (state.requireToolCall && state.callIds.size === 0) {
+        this.logger?.event("appServer.requiredTool.missing", { toolMode: "required" });
+        const error = new CodexError("requiredToolMissing", { action: "showDiagnostics" });
+        state.terminal = true;
+        state.failure = error;
+        state.queue.fail(error);
+        void this.terminateState(state, error, false);
+        return;
+      }
       const finalMessage = readFinalAgentMessage(turn);
       if (finalMessage !== undefined) {
         const itemId = finalMessage.id ?? LEGACY_AGENT_MESSAGE_ID;
@@ -728,6 +775,8 @@ export class AppServerTransport implements CodexTransport {
           continue: (signal) => this.consumeState(state, signal),
         });
         state.callIds.add(call.callId);
+        state.callNames.set(call.callId, call.name);
+        this.logger?.event("appServer.tool.requested", { toolName: call.name });
         this.callStates.set(callKey(call.callId, state.generation, state.leaseId), state);
         state.queue.push({ kind: "tool" });
       } catch (cause) {
@@ -797,6 +846,8 @@ export class AppServerTransport implements CodexTransport {
         if (unsurfaced.length > 0) {
           for (const call of unsurfaced) {
             this.registry.markSurfaced(call.callId, stateIdentity(state));
+            state.surfacedCallIds.add(call.callId);
+            this.logger?.event("appServer.tool.surfaced", { toolName: call.name });
             yield {
               type: "tool-call",
               callId: call.callId,
@@ -939,6 +990,15 @@ export class AppServerTransport implements CodexTransport {
     state.cleanupStarted = true;
     state.cleaned = true;
     state.terminal = true;
+    const terminationReason = this.pendingTerminationReason(error);
+    const pendingCount = [...state.surfacedCallIds].filter((callId) =>
+      !state.receivedCallIds.has(callId)).length;
+    if (terminationReason !== undefined && pendingCount > 0) {
+      this.logger?.event("appServer.tool.pendingResultTerminated", {
+        reason: terminationReason,
+        pendingCount,
+      });
+    }
     if (error !== undefined) {
       state.failure = error;
       this.registry.cancel(state.threadId, state.turnId, error, stateIdentity(state));
@@ -1006,6 +1066,16 @@ export class AppServerTransport implements CodexTransport {
     })();
     state.cleanupPromise = operation;
     await operation;
+  }
+
+  private pendingTerminationReason(error: Error | undefined): string | undefined {
+    if (!(error instanceof CodexError)) {
+      return undefined;
+    }
+    if (error.code === "cancelled" || error.code === "timeout" || error.code === "process") {
+      return error.code;
+    }
+    return error.action === "securityBoundary" ? "security" : undefined;
   }
 
   private async boundedCall(operation: () => Promise<void>): Promise<Error | undefined> {

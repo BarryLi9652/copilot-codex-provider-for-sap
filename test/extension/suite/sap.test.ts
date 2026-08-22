@@ -313,19 +313,45 @@ function buildsInstructionsFromOnlyCurrentlySuppliedAbapTools(): void {
   };
   const instructions = buildSapInstructions(context, [
     "get_abap_object_lines",
-    "write_abap_object",
-    "not-an-abap-tool",
+    "get_abap_object_workspace_uri",
+    "replace_string_in_file",
+    "get_abap_diagnostics",
+    "abap_activate",
+    "future_abap_tool",
   ]);
-  const withoutReadTool = buildSapInstructions(context, ["write_abap_object"]);
+  const withoutWriteTool = buildSapInstructions(context, ["get_abap_object_lines"]);
 
   assert.match(instructions, /prefer supplied semantic ABAP tools/i);
   assert.match(instructions, /do not recursively enumerate `adt:\/\/`/i);
   assert.match(instructions, /use open document text for unsaved content/i);
   assert.match(instructions, /modifying\/activating actions only after explicit user intent/i);
   assert.match(instructions, /Copilot owns approval and execution/i);
+  assert.match(instructions, /never use Codex-native fileChange.*patch.*command execution.*shell.*local filesystem writes/is);
+  assert.match(instructions, /complete the requested change through supplied Copilot\/ABAP tools/i);
+  assert.match(instructions, /resolve its `adt:\/\/` workspace URI/i);
+  assert.match(instructions, /verify the result using supplied read\/diagnostic tools/i);
   assert.match(instructions, /get_abap_object_lines/);
-  assert.doesNotMatch(instructions, /write_abap_object/);
-  assert.doesNotMatch(withoutReadTool, /get_abap_object_lines/);
+  assert.match(instructions, /get_abap_object_workspace_uri/);
+  assert.match(instructions, /replace_string_in_file/);
+  assert.match(instructions, /get_abap_diagnostics/);
+  assert.match(instructions, /abap_activate/);
+  assert.doesNotMatch(instructions, /future_abap_tool/);
+  assert.match(withoutWriteTool, /no write-capable supplied tool.*do not claim.*modification was completed/i);
+
+  const start = instructions.indexOf("<sap-context-data-json>") + "<sap-context-data-json>".length;
+  const end = instructions.indexOf("</sap-context-data-json>");
+  const data = JSON.parse(instructions.slice(start, end)) as {
+    toolCapabilities?: { edit?: readonly string[] };
+  };
+  assert.deepEqual(data.toolCapabilities?.edit, ["replace_string_in_file"]);
+
+  const withoutWriteStart = withoutWriteTool.indexOf("<sap-context-data-json>")
+    + "<sap-context-data-json>".length;
+  const withoutWriteEnd = withoutWriteTool.indexOf("</sap-context-data-json>");
+  const withoutWriteData = JSON.parse(
+    withoutWriteTool.slice(withoutWriteStart, withoutWriteEnd),
+  ) as { toolCapabilities?: { edit?: readonly string[] } };
+  assert.deepEqual(withoutWriteData.toolCapabilities?.edit, []);
 }
 
 function structurallyFramesUntrustedSapData(): void {

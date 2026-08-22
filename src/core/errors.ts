@@ -9,6 +9,7 @@ export type CodexErrorCode =
   | "process"
   | "incompatible"
   | "toolContinuation"
+  | "requiredToolMissing"
   | "sapContext";
 
 export interface CodexErrorOptions {
@@ -36,6 +37,7 @@ const DEFAULT_MESSAGES: Readonly<Record<CodexErrorCode, string>> = {
   process: "The Codex process failed.",
   incompatible: "The Codex transport is incompatible.",
   toolContinuation: "The Codex tool continuation could not be resumed.",
+  requiredToolMissing: "The Codex turn completed without the required tool call.",
   sapContext: "The SAP context could not be read.",
 };
 
@@ -75,6 +77,7 @@ const DEFAULT_PROVIDER_ACTION: Readonly<Record<Exclude<CodexErrorCode, "cancelle
   process: "restartCodex",
   incompatible: "upgradeCodex",
   toolContinuation: "restartCodex",
+  requiredToolMissing: "showDiagnostics",
   sapContext: "showDiagnostics",
 };
 

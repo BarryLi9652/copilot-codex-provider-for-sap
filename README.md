@@ -10,6 +10,7 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 - `Codex · Local CLI`：启动本机 `codex app-server --listen stdio://`，复用 Codex CLI 已有 ChatGPT 登录；扩展不会读取、复制或记录 `~/.codex/auth.json`。
 - 两条 route 的认证、缓存、进程、错误与失败状态完全独立，不自动 fallback。
 - Copilot 拥有工具审批与执行权；扩展只转发动态工具调用，不执行 shell、patch、SAP 写入或激活。
+- Local route 保留 Copilot 的 required-tool 语义：required turn 必须至少调用一个本轮 supplied dynamic tool，不绑定某个固定工具名。
 - 从活动编辑器、未保存选区、诊断和扩展注册表收集有界 SAP 上下文；不会递归扫描 `adt://`。
 
 ## 前置条件
@@ -22,13 +23,13 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.3.vsix`。
+1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.4.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
 4. 在 Copilot Chat 模型选择器中分别选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI`。
 
 ```powershell
-code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.3.vsix
+code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.4.vsix
 ```
 
 ## ChatGPT OAuth route
@@ -57,7 +58,9 @@ code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.3.vsix
 - `adt://` URI 保持为 URI 字符串；不会转换为本地 `fsPath`，也不会通过 Node `fs` 读取远程对象。
 - 未保存内容来自活动文档的选区；空选区不会附加整份源码。
 - 默认选区上限 16,000 字符，诊断上限 50 条，最终 SAP instruction 有 64,000 字符硬上限。
-- 只有当前 Copilot 请求实际提供的已识别 ABAP 工具名才会进入指令。
+- SAP instruction 只根据当前 Copilot 请求实际提供的工具识别 search/read/workspace URI/create/edit/diagnostics/activate 能力；该识别不会过滤或改写 supplied tools。
+- 用户明确要求修改且本轮存在 write-capable tool 时，Codex 会通过 Copilot supplied tool 请求实际修改，必要时先解析 `adt://` workspace URI，并在可用时通过 read/diagnostic tool 验证结果。
+- 本轮没有 write-capable supplied tool 时，Codex 不得声称修改已经完成。
 - 扩展不会调用 SAP ADT 私有 exports、未公开 command、ADT MCP，也不会直接修改或激活 SAP 对象。
 
 V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机制。SAP ADT 或 ABAP FS 未公开为 Copilot tool 的能力，扩展不会绕过其边界。
@@ -77,7 +80,7 @@ V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机
 
 ## 诊断与排错
 
-执行 `Copilot Codex: Show Diagnostics`。报告只包含版本、平台、provider 可用性、模型数/缓存年龄、用户名脱敏后的 executable、App Server 安全状态、SAP 扩展布尔值与安全错误码。
+执行 `Copilot Codex: Show Diagnostics`。报告只包含版本、平台、provider 可用性、模型数/缓存年龄、用户名脱敏后的 executable、App Server 安全状态、SAP 扩展布尔值与安全错误码。Local tool lifecycle 日志只记录 tool mode/count、能力布尔值、tool name、状态和 pending count。
 
 恢复动作包括 `signIn`、`refreshModels`、`selectCodex`、`restartCodex`、`upgradeCodex` 和 `showDiagnostics`。诊断和日志不应包含 token、账号邮箱、prompt、源码、工具 body、raw stderr 或 SAP system authority。
 

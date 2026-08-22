@@ -63,6 +63,33 @@ All npm downloads and test runtimes remain under the project (`.npm-cache`, `.vs
 | `npm run test:extension` | 0 | PASS — 22/22 |
 | `npm run package` | 0 | PASS — VSIX 0.1.3 created with 82 files |
 
+## 0.1.4 Copilot-mediated ABAP write evidence — 2026-08-22
+
+| Check | Exit | Result |
+|---|---:|---|
+| Required-tool contract regressions | 0 | PASS — required turns reject zero dynamic-tool calls; any supplied tool satisfies the generic contract; auto turns may complete without a call |
+| SAP capability/instruction regressions | 0 | PASS — current-turn read/workspace URI/create/edit/diagnostics/activate capabilities are classified without filtering supplied tools |
+| Write continuation regression | 0 | PASS — `replace_string_in_file` is surfaced to Copilot, its Host result resumes the original App Server turn, and the generic registry returns to size 0 |
+| Metadata-only lifecycle regression | 0 | PASS — requested → surfaced → resultReceived → resumed order is recorded without prompt, URI, arguments, source or result content |
+| Security boundary regression | 0 | PASS — approvals remain denied, native command/file actions remain interrupted, and declared dynamic tools still reach Copilot |
+| `npm run typecheck` | 0 | PASS |
+| `npm run test:unit` | 0 | PASS — 112/112 |
+| `npm run test:integration` | 0 | PASS — 108/108 |
+| `npm run test:extension` | 0 | PASS — 22/22 |
+| `npm run package` | 0 | PASS — VSIX 0.1.4 created with 86 files |
+| VSIX archive inspection | 0 | PASS — 86 entries; no `node_modules`, tests, Git/worktree data or TypeScript source files |
+
+Interactive W01–W06 results are not inferred from automation:
+
+| Case | Expected | 2026-08-22 result |
+|---|---|---|
+| W01 Local / Bypass Approvals / modify existing ABAP | resolve/read → edit dynamic tool → result → continuation → read-back/diagnostics | NOT RUN — interactive Copilot + SAP environment required |
+| W02 Local / Default Approvals / modify existing ABAP | approval UI → Continue → Host edit → result → same turn resumes | NOT RUN — interactive Copilot + SAP environment required |
+| W03 Reject approval | source unchanged; no false success; pending continuation terminates | NOT RUN — interactive Copilot + SAP environment required |
+| W04 No write-capable supplied tool | no false completion claim and no native file change | NOT RUN — interactive Copilot + SAP environment required |
+| W05 Create then edit | create → edit created object → read-back | NOT RUN — interactive Copilot + SAP environment required |
+| W06 OAuth / Local A-B | run the same ABAP modification through both routes | NOT RUN — interactive Copilot + SAP environment required |
+
 Detected local prerequisites (read-only inspection):
 
 | Component | Version/status |
