@@ -55,6 +55,10 @@ class LeaseClient implements AppServerSessionClient {
           turnId,
           usage: { inputTokens: 7, outputTokens: 3 },
         });
+        this.notificationHandlers.get("turn/completed")?.({
+          threadId,
+          turn: { id: turnId, status: "completed", items: [], error: null },
+        });
         const toolHandler = this.requestHandlers.get("item/tool/call");
         if (toolHandler !== undefined) {
           this.preResponseToolResponses.push(Promise.resolve(toolHandler({
@@ -200,9 +204,13 @@ test("buffers only exact pre-response events and rejects stale-turn tool calls",
   const lease = await session.acquireTransportLease();
   const thread = await lease.startThread([]);
   const usage: unknown[] = [];
+  const completed: unknown[] = [];
   const toolCalls: unknown[] = [];
   lease.onNotification("turn/usage", (params) => {
     usage.push(params);
+  });
+  lease.onNotification("turn/completed", (params) => {
+    completed.push(params);
   });
   lease.onToolCall((params) => {
     toolCalls.push(params);
@@ -220,6 +228,10 @@ test("buffers only exact pre-response events and rejects stale-turn tool calls",
     threadId: thread.threadId,
     turnId: turn.turnId,
     usage: { inputTokens: 7, outputTokens: 3 },
+  }]);
+  assert.deepEqual(completed, [{
+    threadId: thread.threadId,
+    turn: { id: turn.turnId, status: "completed", items: [], error: null },
   }]);
   assert.deepEqual(toolCalls, [{
     threadId: thread.threadId,

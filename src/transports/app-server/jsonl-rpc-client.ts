@@ -343,7 +343,15 @@ export class JsonlRpcClient {
     }
 
     if (typeof parsed.method === "string") {
-      if (!hasOnlyKeys(parsed, hasId ? ["id", "method", "params"] : ["method", "params"])) {
+      if (!hasOnlyKeys(
+        parsed,
+        hasId
+          ? ["id", "method", "params", "emittedAtMs"]
+          : ["method", "params", "emittedAtMs"],
+      ) || (
+        hasOwn(parsed, "emittedAtMs")
+        && (typeof parsed.emittedAtMs !== "number" || !Number.isFinite(parsed.emittedAtMs))
+      )) {
         this.terminate(protocolError("parseAppServerMessage", new Error("invalid JSON-RPC request")));
         return;
       }

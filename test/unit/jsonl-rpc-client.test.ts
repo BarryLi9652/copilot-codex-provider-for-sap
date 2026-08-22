@@ -96,6 +96,52 @@ test("correlates fragmented CRLF responses while ignoring notifications", async 
   clientInput.destroy();
 });
 
+test("accepts finite emittedAtMs metadata on App Server notifications", async () => {
+  const serverOutput = new PassThrough();
+  const clientInput = new PassThrough();
+  const client = new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    { requestTimeoutMs: 1_000 },
+  );
+  let received: unknown;
+  client.onServerNotification("thread/started", (params) => {
+    received = params;
+  });
+
+  serverOutput.write(
+    '{"method":"thread/started","params":{"thread":{"id":"thread-1"}},"emittedAtMs":1787299200000}\n',
+  );
+  await nextTick();
+
+  assert.equal(client.isClosed, false);
+  assert.deepEqual(received, { thread: { id: "thread-1" } });
+  client.dispose();
+  serverOutput.destroy();
+  clientInput.destroy();
+});
+
+test("rejects non-numeric emittedAtMs metadata before dispatch", async () => {
+  const serverOutput = new PassThrough();
+  const clientInput = new PassThrough();
+  const client = new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    { requestTimeoutMs: 1_000 },
+  );
+  let dispatched = false;
+  client.onServerNotification("thread/started", () => {
+    dispatched = true;
+  });
+
+  serverOutput.write(
+    '{"method":"thread/started","params":{},"emittedAtMs":"1787299200000"}\n',
+  );
+  await nextTick();
+
+  assert.equal(client.isClosed, true);
+  assert.equal(dispatched, false);
+  clientInput.destroy();
+});
+
 test("rejects every pending request with a redacted protocol error on malformed JSONL", async () => {
   const serverOutput = new PassThrough();
   const clientInput = new PassThrough();

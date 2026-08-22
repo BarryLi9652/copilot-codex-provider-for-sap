@@ -58,7 +58,19 @@ class FakeAppServerClient implements AppServerSessionClient {
   public readonly serverRequestHandlers = new Map<string, JsonRpcServerRequestHandler>();
   public readonly notificationHandlers = new Map<string, JsonRpcServerNotificationHandler>();
   public readonly pendingToolCalls: Promise<unknown>[] = [];
-  public mode: "parallel" | "hold" | "error" = "parallel";
+  public mode:
+    | "parallel"
+    | "hold"
+    | "error"
+    | "current-protocol"
+    | "current-protocol-final-only"
+    | "current-protocol-commentary-final"
+    | "current-protocol-partial-final"
+    | "current-protocol-tool"
+    | "current-protocol-interrupted"
+    | "malformed-direct-status"
+    | "malformed-current-turn"
+    | "current-protocol-failed" = "parallel";
   public closed = false;
   private threadNumber = 0;
   private turnNumber = 0;
@@ -124,6 +136,141 @@ class FakeAppServerClient implements AppServerSessionClient {
   }
 
   private emitTurn(turnId: string): void {
+    if (this.mode === "current-protocol-final-only") {
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [{
+            id: "agent-message-1",
+            type: "agentMessage",
+            text: "final reply only",
+            phase: "final_answer",
+          }],
+          error: null,
+        },
+      });
+      return;
+    }
+    if (this.mode === "current-protocol-failed") {
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: {
+          id: turnId,
+          status: "failed",
+          items: [],
+          error: { message: "private failure detail" },
+        },
+      });
+      return;
+    }
+    if (this.mode === "current-protocol-interrupted") {
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: { id: turnId, status: "interrupted", items: [], error: null },
+      });
+      return;
+    }
+    if (this.mode === "malformed-direct-status") {
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turnId,
+        status: 42,
+      });
+      return;
+    }
+    if (this.mode === "malformed-current-turn") {
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turnId,
+        turn: null,
+      });
+      return;
+    }
+    if (this.mode === "current-protocol-commentary-final") {
+      void this.notificationHandlers.get("item/agentMessage/delta")?.({
+        threadId: "thread-1",
+        turnId,
+        itemId: "commentary-1",
+        delta: "checking",
+      });
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [
+            {
+              id: "commentary-1",
+              type: "agentMessage",
+              text: "checking",
+              phase: "commentary",
+            },
+            {
+              id: "final-1",
+              type: "agentMessage",
+              text: "final answer",
+              phase: "final_answer",
+            },
+          ],
+          error: null,
+        },
+      });
+      return;
+    }
+    if (this.mode === "current-protocol-partial-final") {
+      void this.notificationHandlers.get("item/agentMessage/delta")?.({
+        threadId: "thread-1",
+        turnId,
+        itemId: "final-1",
+        delta: "final ",
+      });
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [{
+            id: "final-1",
+            type: "agentMessage",
+            text: "final answer",
+            phase: "final_answer",
+          }],
+          error: null,
+        },
+      });
+      return;
+    }
+    if (this.mode === "current-protocol-tool") {
+      const toolCall = this.emitServerRequest("item/tool/call", {
+        threadId: "thread-1",
+        turnId,
+        callId: "call-current-1",
+        tool: "lookup_a",
+        arguments: { key: "a" },
+      }, 201);
+      this.pendingToolCalls.push(toolCall.then(() => undefined, () => undefined));
+      return;
+    }
+    if (this.mode === "current-protocol") {
+      void this.notificationHandlers.get("item/agentMessage/delta")?.({
+        threadId: "thread-1",
+        turnId,
+        itemId: "agent-message-1",
+        delta: "hello from Codex",
+      });
+      void this.notificationHandlers.get("turn/completed")?.({
+        threadId: "thread-1",
+        turn: {
+          id: turnId,
+          status: "completed",
+          items: [{ id: "agent-message-1", type: "agentMessage", text: "hello from Codex" }],
+          error: null,
+        },
+      });
+      return;
+    }
     if (this.mode === "error") {
       void this.notificationHandlers.get("turn/failed")?.({
         threadId: "thread-1",
@@ -248,6 +395,159 @@ async function collect(iterable: AsyncIterable<TransportEvent>): Promise<Transpo
   }
   return events;
 }
+
+test("completes a reply from the current nested App Server turn notification", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol";
+  const transport = new AppServerTransport(new FakeSession(client));
+  const request: CodexRequest = {
+    ...initialRequest,
+    messages: [{ role: "user", parts: [{ kind: "text", text: "Say hello." }] }],
+    tools: [],
+  };
+
+  const completed = collect(transport.generate(request, new AbortController().signal));
+  const events = await Promise.race([
+    completed,
+    new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("current turn completion was not routed")), 100);
+    }),
+  ]);
+
+  assert.deepEqual(events, [
+    { type: "text-delta", text: "hello from Codex" },
+    { type: "completed" },
+  ]);
+  await transport.dispose();
+});
+
+test("rejects a failed status carried by the current App Server completion notification", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-failed";
+  const transport = new AppServerTransport(new FakeSession(client));
+  const request: CodexRequest = { ...initialRequest, tools: [] };
+
+  await assert.rejects(
+    collect(transport.generate(request, new AbortController().signal)),
+    (error: unknown) => error instanceof CodexError && error.code === "protocol",
+  );
+  await transport.dispose();
+});
+
+test("maps an interrupted current App Server completion to cancellation", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-interrupted";
+  const transport = new AppServerTransport(new FakeSession(client));
+
+  await assert.rejects(
+    collect(transport.generate({ ...initialRequest, tools: [] }, new AbortController().signal)),
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
+  await transport.dispose();
+});
+
+for (const [name, mode] of [
+  ["a non-string direct status", "malformed-direct-status"],
+  ["a null current turn", "malformed-current-turn"],
+] as const) {
+  test(`rejects ${name} instead of treating it as a legacy completion`, async () => {
+    const client = new FakeAppServerClient();
+    client.mode = mode;
+    const transport = new AppServerTransport(new FakeSession(client));
+
+    try {
+      await assert.rejects(
+        collect(transport.generate({ ...initialRequest, tools: [] }, new AbortController().signal)),
+        (error: unknown) => error instanceof CodexError && error.code === "protocol",
+      );
+    } finally {
+      await transport.dispose();
+    }
+  });
+}
+
+test("uses the final current App Server agent message when no delta was emitted", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-final-only";
+  const transport = new AppServerTransport(new FakeSession(client));
+  const request: CodexRequest = { ...initialRequest, tools: [] };
+
+  assert.deepEqual(
+    await collect(transport.generate(request, new AbortController().signal)),
+    [
+      { type: "text-delta", text: "final reply only" },
+      { type: "completed" },
+    ],
+  );
+  await transport.dispose();
+});
+
+test("emits a current final answer even after commentary streamed from another item", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-commentary-final";
+  const transport = new AppServerTransport(new FakeSession(client));
+  const request: CodexRequest = { ...initialRequest, tools: [] };
+
+  try {
+    assert.deepEqual(
+      await collect(transport.generate(request, new AbortController().signal)),
+      [
+        { type: "text-delta", text: "checking" },
+        { type: "text-delta", text: "final answer" },
+        { type: "completed" },
+      ],
+    );
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("emits only the missing suffix when the final item was partially streamed", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-partial-final";
+  const transport = new AppServerTransport(new FakeSession(client));
+  const request: CodexRequest = { ...initialRequest, tools: [] };
+
+  try {
+    assert.deepEqual(
+      await collect(transport.generate(request, new AbortController().signal)),
+      [
+        { type: "text-delta", text: "final " },
+        { type: "text-delta", text: "answer" },
+        { type: "completed" },
+      ],
+    );
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("accepts current App Server dynamic tool and arguments fields", async () => {
+  const client = new FakeAppServerClient();
+  client.mode = "current-protocol-tool";
+  const transport = new AppServerTransport(new FakeSession(client));
+
+  try {
+    const completed = collect(transport.generate(initialRequest, new AbortController().signal));
+    assert.deepEqual(
+      await Promise.race([
+        completed,
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("current dynamic tool call was not routed")), 100);
+        }),
+      ]),
+      [{
+        type: "tool-call",
+        callId: "call-current-1",
+        name: "lookup_a",
+        input: { key: "a" },
+      }],
+    );
+  } finally {
+    await transport.dispose();
+    await Promise.allSettled(client.pendingToolCalls);
+  }
+});
 
 test("starts a configured thread, surfaces parallel dynamic tools, and resumes the original turn", async () => {
   const client = new FakeAppServerClient();

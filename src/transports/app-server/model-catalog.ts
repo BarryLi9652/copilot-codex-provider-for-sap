@@ -3,12 +3,19 @@ import { protocolError } from "./protocol.js";
 
 type JsonRecord = Record<string, unknown>;
 
+const DEFAULT_MAX_INPUT_TOKENS = 128_000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 16_000;
+
 export interface AppServerCodexModel extends CodexModel {
   description?: string;
 }
 
 export interface AppServerModelDiagnostics {
   missingFields: readonly string[];
+}
+
+export interface AppServerModelCatalogOptions {
+  dynamicToolsAvailable: boolean;
 }
 
 const isRecord = (value: unknown): value is JsonRecord =>
@@ -20,6 +27,9 @@ const nonEmptyString = (value: unknown): string | undefined =>
 const positiveInteger = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 
+const hasOwn = (value: JsonRecord, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
 const resolveFamily = (id: string): string => {
   const separator = id.indexOf("-");
   return separator > 0 ? id.slice(0, separator) : id;
@@ -28,6 +38,7 @@ const resolveFamily = (id: string): string => {
 const resolveNumber = (
   entry: JsonRecord,
   names: readonly string[],
+  fallback: number,
 ): number | undefined => {
   for (const name of names) {
     const value = positiveInteger(entry[name]);
@@ -35,7 +46,20 @@ const resolveNumber = (
       return value;
     }
   }
-  return undefined;
+  return names.some((name) => hasOwn(entry, name)) ? undefined : fallback;
+};
+
+const resolveBoolean = (
+  entry: JsonRecord,
+  names: readonly string[],
+  fallback: boolean,
+): boolean => {
+  for (const name of names) {
+    if (typeof entry[name] === "boolean") {
+      return entry[name];
+    }
+  }
+  return names.some((name) => hasOwn(entry, name)) ? false : fallback;
 };
 
 const resolveModalities = (entry: JsonRecord): readonly string[] => {
@@ -43,12 +67,15 @@ const resolveModalities = (entry: JsonRecord): readonly string[] => {
     ? entry.inputModalities
     : Array.isArray(entry.input_modalities)
       ? entry.input_modalities
-      : [];
+      : hasOwn(entry, "inputModalities") || hasOwn(entry, "input_modalities")
+        ? []
+        : ["text", "image"];
   return value.filter((modality): modality is string => typeof modality === "string");
 };
 
 const toModel = (
   value: unknown,
+  options: AppServerModelCatalogOptions,
   onDiagnostic: ((diagnostic: AppServerModelDiagnostics) => void) | undefined,
 ): AppServerCodexModel | undefined => {
   if (!isRecord(value)) {
@@ -61,8 +88,16 @@ const toModel = (
 
   const id = nonEmptyString(value.id);
   const name = nonEmptyString(value.displayName) ?? nonEmptyString(value.display_name);
-  const inputTokens = resolveNumber(value, ["inputTokenLimit", "input_token_limit", "maxInputTokens"]);
-  const outputTokens = resolveNumber(value, ["outputTokenLimit", "output_token_limit", "maxOutputTokens"]);
+  const inputTokens = resolveNumber(
+    value,
+    ["inputTokenLimit", "input_token_limit", "maxInputTokens"],
+    DEFAULT_MAX_INPUT_TOKENS,
+  );
+  const outputTokens = resolveNumber(
+    value,
+    ["outputTokenLimit", "output_token_limit", "maxOutputTokens"],
+    DEFAULT_MAX_OUTPUT_TOKENS,
+  );
   const missingFields: string[] = [];
   if (id === undefined) {
     missingFields.push("id");
@@ -89,11 +124,16 @@ const toModel = (
     ?? id;
   const family = nonEmptyString(value.family) ?? resolveFamily(id);
   const modalities = resolveModalities(value);
-  const toolCalling = value.supportsTools === true
-    || value.supportsToolCalling === true
-    || value.toolCalling === true;
-  const parallelToolCalls = value.supportsParallelToolCalls === true
-    || value.parallelToolCalls === true;
+  const toolCalling = resolveBoolean(
+    value,
+    ["supportsTools", "supportsToolCalling", "toolCalling"],
+    options.dynamicToolsAvailable,
+  );
+  const parallelToolCalls = resolveBoolean(
+    value,
+    ["supportsParallelToolCalls", "parallelToolCalls"],
+    false,
+  );
   const description = nonEmptyString(value.description);
 
   const model: AppServerCodexModel = {
@@ -117,6 +157,7 @@ const toModel = (
 
 export function parseAppServerModels(
   payload: unknown,
+  options: AppServerModelCatalogOptions = { dynamicToolsAvailable: false },
   onDiagnostic?: (diagnostic: AppServerModelDiagnostics) => void,
 ): readonly AppServerCodexModel[] {
   if (!isRecord(payload)) {
@@ -132,6 +173,6 @@ export function parseAppServerModels(
   }
 
   return entries
-    .map((entry) => toModel(entry, onDiagnostic))
+    .map((entry) => toModel(entry, options, onDiagnostic))
     .filter((model): model is AppServerCodexModel => model !== undefined);
 }
