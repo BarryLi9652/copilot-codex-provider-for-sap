@@ -14,6 +14,10 @@ import {
   buildDiagnosticsReport,
   DiagnosticsHistory,
 } from "../../../src/commands/diagnostics.js";
+import { ModelCache } from "../../../src/core/model-cache.js";
+import type { CodexModel, CodexRequest, CodexTransport, TransportEvent } from "../../../src/core/types.js";
+import { createChatGptModelCatalogServices } from "../../../src/extension.js";
+import { CodexLanguageModelProvider } from "../../../src/providers/codex-provider.js";
 
 const expectedCommands = [
   "copilotCodex.chatgpt.signIn",
@@ -113,7 +117,9 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
   assert.equal(manualCallback, completeCallback);
   assert.deepEqual(calls, [
     "oauth.signIn",
+    "chatgpt.refresh",
     "oauth.manual",
+    "chatgpt.refresh",
     "local.select:C:\\Tools\\codex.exe",
   ]);
 
@@ -172,6 +178,119 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
   }, ui);
   await failingSignOut["copilotCodex.chatgpt.signOut"]();
   assert.deepEqual(calls, ["oauth.signOut.failed", "chatgpt.clear"]);
+}
+
+async function authenticationRefreshesModelsBeforeReportingSuccess(): Promise<void> {
+  const calls: string[] = [];
+  const dependencies: CommandDependencies = {
+    oauth: {
+      signIn: async () => { calls.push("oauth.signIn"); },
+      completeManualCallback: async () => { calls.push("oauth.manual"); },
+      signOut: async () => undefined,
+      clearSecret: async () => undefined,
+    },
+    chatgptModels: {
+      refresh: async () => { calls.push("chatgpt.refresh"); return 6; },
+      clear: () => undefined,
+    },
+    local: {
+      selectExecutable: async () => undefined,
+      start: async () => undefined,
+      restart: async () => undefined,
+      stop: async () => undefined,
+      refreshModels: async () => 0,
+      clearModels: () => undefined,
+    },
+    continuations: { clear: () => undefined },
+    diagnostics: {
+      show: async () => undefined,
+      clear: () => undefined,
+      record: () => undefined,
+    },
+  };
+  const ui: CommandUi = {
+    confirmPrivateSignIn: async () => true,
+    openExternal: async () => true,
+    promptManualCallback: async () => "http://127.0.0.1:1455/auth/callback?code=ok&state=exact",
+    selectExecutable: async () => undefined,
+    showInformation: async (message) => { calls.push(`ui.info:${message}`); },
+    showSafeError: async () => undefined,
+  };
+  const services = createCommandServices(dependencies, ui);
+
+  await services["copilotCodex.chatgpt.signIn"]();
+  assert.deepEqual(calls, [
+    "oauth.signIn",
+    "chatgpt.refresh",
+    "ui.info:ChatGPT sign-in completed (6 models).",
+  ]);
+
+  calls.length = 0;
+  await services["copilotCodex.chatgpt.signInManual"]();
+  assert.deepEqual(calls, [
+    "oauth.manual",
+    "chatgpt.refresh",
+    "ui.info:Manual ChatGPT callback completed (6 models).",
+  ]);
+}
+
+async function chatGptCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<void> {
+  const firstModel: CodexModel = {
+    id: "gpt-first",
+    name: "GPT First",
+    family: "gpt",
+    version: "1",
+    maxInputTokens: 1_000,
+    maxOutputTokens: 500,
+    capabilities: { imageInput: false, toolCalling: true, parallelToolCalls: false },
+  };
+  const refreshedModel: CodexModel = { ...firstModel, id: "gpt-refreshed", version: "2" };
+  let availableModels: readonly CodexModel[] = [firstModel];
+  const listOptions: { silent: boolean; forceRefresh?: boolean }[] = [];
+  const transport: CodexTransport = {
+    listModels: async (options) => {
+      listOptions.push(options);
+      return availableModels;
+    },
+    generate: async function* (_request: CodexRequest): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const providerCache = new ModelCache(300_000);
+  const transportCache = new ModelCache(300_000);
+  const provider = new CodexLanguageModelProvider(transport, {
+    modelCache: providerCache,
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  let changeEvents = 0;
+  const subscription = provider.onDidChangeLanguageModelChatInformation?.(() => {
+    changeEvents += 1;
+  });
+  const services = createChatGptModelCatalogServices(provider, transport, transportCache);
+
+  try {
+    await provider.provideLanguageModelChatInformation({ silent: true }, cancellation.token);
+    await transportCache.get(async () => [firstModel]);
+    availableModels = [refreshedModel];
+
+    assert.equal(await services.refresh(), 1);
+    const [refreshed] = await provider.provideLanguageModelChatInformation(
+      { silent: true },
+      cancellation.token,
+    );
+    assert.equal(refreshed?.id, "gpt-refreshed");
+    assert.deepEqual(listOptions.at(-2), { silent: false, forceRefresh: true });
+    assert.equal(changeEvents, 1);
+
+    services.clear();
+    assert.equal(providerCache.snapshot(), undefined);
+    assert.equal(transportCache.snapshot(), undefined);
+    assert.equal(changeEvents, 2);
+  } finally {
+    subscription?.dispose();
+    cancellation.dispose();
+  }
 }
 
 async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
@@ -262,6 +381,8 @@ export async function runCommandTests(): Promise<void> {
   const tests: readonly [string, () => void | Promise<void>][] = [
     ["commands register exact independent routes", registersExactCommandsAndRoutesIndependently],
     ["management services preserve route and clear boundaries", managementServicesPreserveRouteAndClearBoundaries],
+    ["authentication refreshes models before reporting success", authenticationRefreshesModelsBeforeReportingSuccess],
+    ["ChatGPT catalog services refresh and notify as one operation", chatGptCatalogServicesRefreshAndNotifyAsOneOperation],
     ["manifest contributes only safe management settings", manifestContributesOnlySafeManagementSurface],
     ["diagnostics are whitelisted and redacted", diagnosticsAreWhitelistedAndRedacted],
   ];

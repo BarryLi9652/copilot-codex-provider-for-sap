@@ -13,6 +13,7 @@ import {
 } from "./commands/register-commands";
 import { CHATGPT_VENDOR_ID, LOCAL_VENDOR_ID } from "./constants";
 import { ModelCache } from "./core/model-cache";
+import type { CodexTransport } from "./core/types";
 import { CodexLanguageModelProvider } from "./providers/codex-provider";
 import { SapContextProvider } from "./sap/context";
 import { SafeLogger, type LogLevel } from "./security/logger";
@@ -24,6 +25,25 @@ import { ToolContinuationRegistry } from "./transports/app-server/tool-continuat
 import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
+
+export const createChatGptModelCatalogServices = (
+  provider: CodexLanguageModelProvider,
+  transport: Pick<CodexTransport, "listModels">,
+  transportCache: ModelCache,
+): CommandDependencies["chatgptModels"] => ({
+  refresh: async () => {
+    const models = await transport.listModels(
+      { silent: false, forceRefresh: true },
+      new AbortController().signal,
+    );
+    provider.invalidateModelInformation();
+    return models.length;
+  },
+  clear: () => {
+    transportCache.clear();
+    provider.invalidateModelInformation();
+  },
+});
 
 export function activate(context: vscode.ExtensionContext): void {
   const configuration = vscode.workspace.getConfiguration("copilotCodex");
@@ -54,6 +74,11 @@ export function activate(context: vscode.ExtensionContext): void {
     chatGptTransport,
     CHATGPT_VENDOR_ID,
     { sapContextProvider, modelCache: chatGptProviderCache },
+  );
+  const chatGptModelCatalog = createChatGptModelCatalogServices(
+    chatGptProvider,
+    chatGptTransport,
+    chatGptModelCache,
   );
   const localExecutable = new ExecutableLocator({
     configuredExecutable: configuredExecutable || undefined,
@@ -99,20 +124,7 @@ export function activate(context: vscode.ExtensionContext): void {
       signOut: () => oauthManager.signOut(),
       clearSecret: () => oauthManager.signOut(),
     },
-    chatgptModels: {
-      refresh: async () => {
-        chatGptProviderCache.clear();
-        const models = await chatGptTransport.listModels(
-          { silent: false, forceRefresh: true },
-          new AbortController().signal,
-        );
-        return models.length;
-      },
-      clear: () => {
-        chatGptProviderCache.clear();
-        chatGptModelCache.clear();
-      },
-    },
+    chatgptModels: chatGptModelCatalog,
     local: {
       selectExecutable: async (path) => {
         new ExecutableLocator({ configuredExecutable: path }).resolve();

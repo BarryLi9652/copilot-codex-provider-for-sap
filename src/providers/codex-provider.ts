@@ -133,9 +133,12 @@ const mapModel = (model: CodexModel): CodexLanguageModelChatInformation => ({
 
 export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvider {
   private readonly modelCache: ModelCache;
+  private readonly modelInformationChanged = new vscode.EventEmitter<void>();
   private readonly requestIdFactory: () => string;
   private readonly instructions: string;
   private readonly sapContextProvider: SapContextProvider;
+  public readonly onDidChangeLanguageModelChatInformation =
+    this.modelInformationChanged.event;
 
   public constructor(
     private readonly transport: CodexTransport,
@@ -147,6 +150,11 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     this.requestIdFactory = resolvedOptions.requestIdFactory ?? randomUUID;
     this.instructions = resolvedOptions.instructions ?? "";
     this.sapContextProvider = resolvedOptions.sapContextProvider ?? new SapContextProvider();
+  }
+
+  public invalidateModelInformation(): void {
+    this.modelCache.clear();
+    this.modelInformationChanged.fire();
   }
 
   public async provideLanguageModelChatInformation(

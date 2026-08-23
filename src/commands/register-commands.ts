@@ -82,7 +82,8 @@ export function createCommandServices(
         return;
       }
       await dependencies.oauth.signIn(async (url) => ui.openExternal(url));
-      await ui.showInformation("ChatGPT sign-in completed for this extension.");
+      const count = await dependencies.chatgptModels.refresh();
+      await ui.showInformation(`ChatGPT sign-in completed (${count} models).`);
     }),
     "copilotCodex.chatgpt.signInManual": safe(async () => {
       const callbackUrl = await ui.promptManualCallback();
@@ -90,7 +91,8 @@ export function createCommandServices(
         return;
       }
       await dependencies.oauth.completeManualCallback(callbackUrl);
-      await ui.showInformation("Manual ChatGPT callback completed.");
+      const count = await dependencies.chatgptModels.refresh();
+      await ui.showInformation(`Manual ChatGPT callback completed (${count} models).`);
     }),
     "copilotCodex.chatgpt.signOut": safe(async () => {
       try {

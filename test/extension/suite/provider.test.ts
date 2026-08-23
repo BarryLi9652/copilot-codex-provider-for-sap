@@ -581,6 +581,53 @@ async function cachesModelDiscovery(): Promise<void> {
   assert.deepEqual(second, first);
 }
 
+async function invalidatesCachedModelsAndNotifiesCopilot(): Promise<void> {
+  let listCalls = 0;
+  let availableModels: readonly CodexModel[] = [model];
+  const provider = new CodexLanguageModelProvider({
+    listModels: async () => {
+      listCalls += 1;
+      return availableModels;
+    },
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  }, "test-vendor");
+  const cancellation = new vscode.CancellationTokenSource();
+  let changeEvents = 0;
+  const subscription = provider.onDidChangeLanguageModelChatInformation?.(() => {
+    changeEvents += 1;
+  });
+
+  try {
+    const [first] = await provider.provideLanguageModelChatInformation(
+      { silent: true },
+      cancellation.token,
+    );
+    availableModels = [{
+      ...model,
+      id: "gpt-refreshed",
+      name: "GPT Refreshed",
+      version: "2",
+    }];
+
+    provider.invalidateModelInformation();
+    const [refreshed] = await provider.provideLanguageModelChatInformation(
+      { silent: true },
+      cancellation.token,
+    );
+
+    assert.equal(first?.id, "gpt-test");
+    assert.equal(refreshed?.id, "gpt-refreshed");
+    assert.equal(listCalls, 2);
+    assert.equal(changeEvents, 1);
+  } finally {
+    subscription?.dispose();
+    cancellation.dispose();
+  }
+}
+
 async function preservesNonGptModelNamesDuringDiscovery(): Promise<void> {
   const nonGptModel: CodexModel = {
     ...model,
@@ -869,6 +916,7 @@ export async function runProviderTests(): Promise<void> {
     ["provider does not repeat preflight when Copilot does not expand tools", doesNotRepeatPreflightWhenCopilotDoesNotExpandTools],
     ["provider does not preactivate a cancelled SAP request", doesNotPreactivateCancelledSapRequest],
     ["provider caches model discovery and maps the normalized capabilities", cachesModelDiscovery],
+    ["provider invalidates cached models and notifies Copilot", invalidatesCachedModelsAndNotifiesCopilot],
     ["provider preserves non-GPT model names during discovery", preservesNonGptModelNamesDuringDiscovery],
     ["provider skips discovery for a pre-cancelled token", skipsModelDiscoveryForPreCancelledToken],
     ["provider keeps shared discovery alive when the first caller cancels", keepsSharedModelDiscoveryAliveWhenFirstCallerCancels],
