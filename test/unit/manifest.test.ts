@@ -75,3 +75,12 @@ test("release metadata names the 0.1.7 VSIX consistently", async () => {
     /dist\/copilot-codex-provider-for-sap-0\.1\.7\.vsix$/,
   );
 });
+
+test("release metadata resolves packaged README assets through GitHub", async () => {
+  const manifest = JSON.parse(await readFile("package.json", "utf8"));
+
+  assert.deepEqual(manifest.repository, {
+    type: "git",
+    url: "https://github.com/LeON-W666/copilot-codex-provider-for-sap.git",
+  });
+});

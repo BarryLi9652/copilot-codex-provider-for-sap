@@ -1,5 +1,9 @@
 # Copilot Codex Provider for SAP
 
+<p align="center">
+  <img src="resources/icon.png" alt="Copilot Codex Provider for SAP" width="192">
+</p>
+
 一个本地 VS Code 扩展，把 Codex 作为两个彼此独立的 GitHub Copilot Chat 模型提供方，并通过标准 VS Code API 增强 ABAP FS 与 SAP ADT for VS Code 的上下文体验。
 
 V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP。

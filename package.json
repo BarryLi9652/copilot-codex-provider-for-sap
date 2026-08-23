@@ -4,6 +4,11 @@
   "description": "Use Codex through ChatGPT OAuth or a local Codex App Server in GitHub Copilot Chat, with SAP ABAP tooling support.",
   "version": "0.1.7",
   "publisher": "leonbwang",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeON-W666/copilot-codex-provider-for-sap.git"
+  },
   "private": true,
   "license": "UNLICENSED",
   "main": "./out/src/extension.js",
