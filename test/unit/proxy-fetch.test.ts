@@ -60,3 +60,41 @@ test("routes requests through the environment proxy unless NO_PROXY matches", as
     await Promise.all([close(origin), close(proxy)]);
   }
 });
+
+test("an explicit proxy overrides the environment without mutating it", async () => {
+  const environmentTargets: string[] = [];
+  const dedicatedTargets: string[] = [];
+  const environmentProxy = createServer((request, response) => {
+    environmentTargets.push(request.url ?? "");
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ route: "environment" }));
+  });
+  const dedicatedProxy = createServer((request, response) => {
+    dedicatedTargets.push(request.url ?? "");
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ route: "dedicated" }));
+  });
+  const environmentPort = await listen(environmentProxy);
+  const dedicatedPort = await listen(dedicatedProxy);
+  const target = "http://origin.invalid/models";
+  const environment: NodeJS.ProcessEnv = {
+    HTTP_PROXY: `http://127.0.0.1:${environmentPort}`,
+    NO_PROXY: "origin.invalid",
+  };
+  const initialEnvironment = { ...environment };
+
+  try {
+    const fetch = createProxyAwareFetch(
+      environment,
+      `http://127.0.0.1:${dedicatedPort}`,
+    );
+    const response = await fetch(target);
+
+    assert.deepEqual(await response.json(), { route: "dedicated" });
+    assert.deepEqual(environmentTargets, []);
+    assert.deepEqual(dedicatedTargets, [target]);
+    assert.deepEqual(environment, initialEnvironment);
+  } finally {
+    await Promise.all([close(environmentProxy), close(dedicatedProxy)]);
+  }
+});

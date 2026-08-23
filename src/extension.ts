@@ -25,6 +25,7 @@ import { ToolContinuationRegistry } from "./transports/app-server/tool-continuat
 import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
+import { createProxyAwareFetch } from "./transports/chatgpt-oauth/proxy-fetch";
 
 export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] & {
   restore(): Promise<number>;
@@ -70,6 +71,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const toolTimeoutMs = secondsToMs(configuration.get("toolTimeoutSeconds", 300), 30);
   const catalogCacheMs = minutesToMs(configuration.get("catalogCacheMinutes", 5), 1);
   const configuredExecutable = configuration.get<string>("local.codexPath", "").trim();
+  const configuredChatGptProxy = configuration.get<string>("chatgpt.proxyUrl", "").trim();
   const diagnosticsOutput = vscode.window.createOutputChannel("Copilot Codex Diagnostics");
   const logOutput = vscode.window.createOutputChannel("Copilot Codex Log");
   const logger = new SafeLogger(
@@ -79,12 +81,17 @@ export function activate(context: vscode.ExtensionContext): void {
   const diagnostics = new DiagnosticsHistory();
   const sapContextProvider = new SapContextProvider();
   const oauthStore = new OAuthStore(context.secrets);
-  const oauthManager = new OAuthManager(oauthStore);
+  const chatGptFetch = createProxyAwareFetch(
+    process.env,
+    configuredChatGptProxy || undefined,
+  );
+  const oauthManager = new OAuthManager(oauthStore, { fetch: chatGptFetch });
   const chatGptProviderCache = new ModelCache(catalogCacheMs);
   const localProviderCache = new ModelCache(catalogCacheMs);
   const chatGptModelCache = new ModelCache(catalogCacheMs);
   const localModelCache = new ModelCache(catalogCacheMs);
   const chatGptTransport = new ChatGptOAuthTransport(oauthManager, {
+    fetch: chatGptFetch,
     timeoutMs: requestTimeoutMs,
     modelCache: chatGptModelCache,
     logger,

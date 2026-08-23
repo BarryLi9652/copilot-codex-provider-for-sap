@@ -395,6 +395,7 @@ async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
   const properties = packageJson.contributes?.configuration?.properties ?? {};
   assert.deepEqual(Object.keys(properties), [
     "copilotCodex.local.codexPath",
+    "copilotCodex.chatgpt.proxyUrl",
     "copilotCodex.requestTimeoutSeconds",
     "copilotCodex.toolTimeoutSeconds",
     "copilotCodex.catalogCacheMinutes",
@@ -402,6 +403,12 @@ async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
     "copilotCodex.logLevel",
   ]);
   assert.deepEqual(properties["copilotCodex.local.codexPath"], { type: "string", default: "" });
+  assert.deepEqual(properties["copilotCodex.chatgpt.proxyUrl"], {
+    type: "string",
+    default: "",
+    pattern: "^$|^https?://",
+    description: "Optional HTTP(S) proxy used only for ChatGPT OAuth, model discovery, and responses. Reload VS Code after changing it.",
+  });
   assert.deepEqual(properties["copilotCodex.requestTimeoutSeconds"], { type: "number", default: 600, minimum: 10 });
   assert.deepEqual(properties["copilotCodex.toolTimeoutSeconds"], { type: "number", default: 300, minimum: 30 });
   assert.deepEqual(properties["copilotCodex.catalogCacheMinutes"], { type: "number", default: 5, minimum: 1 });

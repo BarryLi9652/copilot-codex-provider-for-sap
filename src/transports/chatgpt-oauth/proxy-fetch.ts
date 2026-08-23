@@ -83,8 +83,12 @@ const fetchNode = (
 
 export const createProxyAwareFetch = (
   environment: NodeJS.ProcessEnv = process.env,
+  explicitProxyUrl?: string,
 ): ChatGptFetch => {
-  const proxyEnv = selectProxyEnv(environment);
+  const normalizedProxyUrl = explicitProxyUrl?.trim();
+  const proxyEnv: ProxyEnv = normalizedProxyUrl
+    ? { HTTP_PROXY: normalizedProxyUrl, HTTPS_PROXY: normalizedProxyUrl }
+    : selectProxyEnv(environment);
   return async (url, init = {}) => {
     const target = new URL(url);
     if (target.protocol !== "http:" && target.protocol !== "https:") {

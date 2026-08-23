@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.6 — 2026-08-23
+
+- Added an optional `copilotCodex.chatgpt.proxyUrl` setting used only by ChatGPT token exchange, token refresh, model discovery and responses.
+- A configured ChatGPT proxy now overrides inherited proxy environment variables without mutating the VS Code process environment or affecting ABAP FS/SAP connections.
+- Empty proxy configuration preserves the 0.1.5 environment-proxy fallback.
+
 ## 0.1.5 — 2026-08-23
 
 - ChatGPT OAuth requests now honor `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` without changing global proxy state.

@@ -70,6 +70,7 @@ V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机
 | 设置 | 默认值 | 说明 |
 |---|---:|---|
 | `copilotCodex.local.codexPath` | 空 | Local Codex executable 的绝对路径 |
+| `copilotCodex.chatgpt.proxyUrl` | 空 | 仅用于 ChatGPT 登录令牌、模型发现和回复请求的 HTTP(S) 代理；修改后需重载 VS Code |
 | `copilotCodex.requestTimeoutSeconds` | 600 | HTTP/RPC 请求超时，最小 10 秒 |
 | `copilotCodex.toolTimeoutSeconds` | 300 | Copilot 工具 continuation 超时，最小 30 秒 |
 | `copilotCodex.catalogCacheMinutes` | 5 | 每条 route 独立模型目录缓存时间 |
