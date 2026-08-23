@@ -10,6 +10,7 @@ import {
   registerCommands,
   type CommandDependencies,
   type CommandUi,
+  type ManagerActionId,
 } from "./commands/register-commands";
 import { CHATGPT_VENDOR_ID, LOCAL_VENDOR_ID } from "./constants";
 import { ModelCache } from "./core/model-cache";
@@ -26,6 +27,10 @@ import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
 import { createProxyAwareFetch } from "./transports/chatgpt-oauth/proxy-fetch";
+import {
+  resolveChatGptRequestOverrides,
+  type ChatGptRequestOverrides,
+} from "./transports/chatgpt-oauth/request-codec";
 
 export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] & {
   restore(): Promise<number>;
@@ -65,6 +70,39 @@ export const restorePersistedChatGptModelCatalog = async (options: {
   }
 };
 
+export interface ChatGptRequestConfiguration {
+  get(section: string): unknown;
+}
+
+export const createChatGptRequestOverridesResolver = (
+  configuration: ChatGptRequestConfiguration,
+): (() => ChatGptRequestOverrides) => () => resolveChatGptRequestOverrides(
+  configuration.get("chatgpt.reasoningEffort"),
+  configuration.get("chatgpt.speedMode"),
+);
+
+type ManagerQuickPickItem = vscode.QuickPickItem & {
+  readonly action?: ManagerActionId;
+};
+
+const MANAGER_QUICK_PICK_ITEMS: readonly ManagerQuickPickItem[] = [
+  { label: "ChatGPT OAuth", kind: vscode.QuickPickItemKind.Separator },
+  { label: "$(sign-in) Sign In with ChatGPT", action: "copilotCodex.chatgpt.signIn" },
+  { label: "$(link) Complete ChatGPT Sign-In Manually", action: "copilotCodex.chatgpt.signInManual" },
+  { label: "$(sign-out) Sign Out ChatGPT", action: "copilotCodex.chatgpt.signOut" },
+  { label: "$(refresh) Refresh ChatGPT Models", action: "copilotCodex.chatgpt.refreshModels" },
+  { label: "Local Codex", kind: vscode.QuickPickItemKind.Separator },
+  { label: "$(file-binary) Select Local Codex Executable", action: "copilotCodex.local.selectExecutable" },
+  { label: "$(play) Start Local Codex", action: "copilotCodex.local.start" },
+  { label: "$(debug-restart) Restart Local Codex", action: "copilotCodex.local.restart" },
+  { label: "$(debug-stop) Stop Local Codex", action: "copilotCodex.local.stop" },
+  { label: "$(refresh) Refresh Local Models", action: "copilotCodex.local.refreshModels" },
+  { label: "Extension", kind: vscode.QuickPickItemKind.Separator },
+  { label: "$(settings-gear) Open Settings", action: "openSettings" },
+  { label: "$(output) Show Diagnostics", action: "copilotCodex.showDiagnostics" },
+  { label: "$(trash) Clear Extension Data", action: "copilotCodex.clearExtensionData" },
+];
+
 export function activate(context: vscode.ExtensionContext): void {
   const configuration = vscode.workspace.getConfiguration("copilotCodex");
   const requestTimeoutMs = secondsToMs(configuration.get("requestTimeoutSeconds", 600), 10);
@@ -95,6 +133,7 @@ export function activate(context: vscode.ExtensionContext): void {
     timeoutMs: requestTimeoutMs,
     modelCache: chatGptModelCache,
     logger,
+    requestOverrides: createChatGptRequestOverridesResolver(configuration),
   });
   const chatGptProvider = new CodexLanguageModelProvider(
     chatGptTransport,
@@ -266,7 +305,18 @@ export function activate(context: vscode.ExtensionContext): void {
     },
     showInformation: (message) => vscode.window.showInformationMessage(message),
     showSafeError: () => vscode.window.showErrorMessage(
-      "Copilot Codex command failed. Run 'Copilot Codex: Show Diagnostics' for safe details.",
+      "Codex Copilot command failed. Open 'Codex Copilot Manager' and select 'Show Diagnostics' for safe details.",
+    ),
+    selectManagerAction: async () => {
+      const selected = await vscode.window.showQuickPick(MANAGER_QUICK_PICK_ITEMS, {
+        title: "Codex Copilot Manager",
+        placeHolder: "Select an operation",
+      });
+      return selected?.action;
+    },
+    openSettings: () => vscode.commands.executeCommand(
+      "workbench.action.openSettings",
+      "@ext:leonbwang.copilot-codex-provider-for-sap",
     ),
   };
   registerCommands(createCommandServices(dependencies, ui), context);

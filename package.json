@@ -2,7 +2,7 @@
   "name": "copilot-codex-provider-for-sap",
   "displayName": "Copilot Codex Provider for SAP",
   "description": "Use Codex through ChatGPT OAuth or a local Codex App Server in GitHub Copilot Chat, with SAP ABAP tooling support.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "leonbwang",
   "private": true,
   "license": "UNLICENSED",
@@ -10,6 +10,7 @@
   "activationEvents": [
     "onLanguageModelChatProvider:copilot-codex.chatgpt-oauth",
     "onLanguageModelChatProvider:copilot-codex.local-cli",
+    "onCommand:copilotCodex.manager",
     "onCommand:copilotCodex.chatgpt.signIn",
     "onCommand:copilotCodex.chatgpt.signInManual",
     "onCommand:copilotCodex.chatgpt.signOut",
@@ -24,17 +25,7 @@
   ],
   "contributes": {
     "commands": [
-      { "command": "copilotCodex.chatgpt.signIn", "title": "Copilot Codex: Sign In with ChatGPT" },
-      { "command": "copilotCodex.chatgpt.signInManual", "title": "Copilot Codex: Complete ChatGPT Sign-In Manually" },
-      { "command": "copilotCodex.chatgpt.signOut", "title": "Copilot Codex: Sign Out ChatGPT" },
-      { "command": "copilotCodex.chatgpt.refreshModels", "title": "Copilot Codex: Refresh ChatGPT Models" },
-      { "command": "copilotCodex.local.selectExecutable", "title": "Copilot Codex: Select Local Codex Executable" },
-      { "command": "copilotCodex.local.start", "title": "Copilot Codex: Start Local Codex" },
-      { "command": "copilotCodex.local.restart", "title": "Copilot Codex: Restart Local Codex" },
-      { "command": "copilotCodex.local.stop", "title": "Copilot Codex: Stop Local Codex" },
-      { "command": "copilotCodex.local.refreshModels", "title": "Copilot Codex: Refresh Local Models" },
-      { "command": "copilotCodex.showDiagnostics", "title": "Copilot Codex: Show Diagnostics" },
-      { "command": "copilotCodex.clearExtensionData", "title": "Copilot Codex: Clear Extension Data" }
+      { "command": "copilotCodex.manager", "title": "Codex Copilot Manager" }
     ],
     "configuration": {
       "title": "Copilot Codex Provider for SAP",
@@ -45,6 +36,31 @@
           "default": "",
           "pattern": "^$|^https?://",
           "description": "Optional HTTP(S) proxy used only for ChatGPT OAuth, model discovery, and responses. Reload VS Code after changing it."
+        },
+        "copilotCodex.chatgpt.reasoningEffort": {
+          "type": "string",
+          "enum": ["modelDefault", "none", "low", "medium", "high", "xhigh", "max"],
+          "enumDescriptions": [
+            "Use the selected model's default reasoning effort.",
+            "Disable reasoning when the selected model supports it.",
+            "Favor lower latency and lighter reasoning.",
+            "Balance reasoning depth and latency.",
+            "Use deeper reasoning for difficult tasks.",
+            "Use extra-high reasoning for very difficult tasks.",
+            "Use maximum reasoning for the hardest quality-first tasks."
+          ],
+          "default": "modelDefault",
+          "description": "ChatGPT OAuth reasoning effort. Applied to new requests without reloading VS Code."
+        },
+        "copilotCodex.chatgpt.speedMode": {
+          "type": "string",
+          "enum": ["modelDefault", "fast"],
+          "enumDescriptions": [
+            "Use the ChatGPT backend's default service tier.",
+            "Request Fast service when the account and selected model support it."
+          ],
+          "default": "modelDefault",
+          "description": "ChatGPT OAuth response speed. Applied to new requests without reloading VS Code."
         },
         "copilotCodex.requestTimeoutSeconds": { "type": "number", "default": 600, "minimum": 10 },
         "copilotCodex.toolTimeoutSeconds": { "type": "number", "default": 300, "minimum": 30 },
@@ -82,7 +98,7 @@
     "test": "npm run test:unit && npm run test:integration",
     "check": "npm run typecheck && npm test",
     "package": "npm run check && npm run test:extension && npm run package:vsix",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/copilot-codex-provider-for-sap-0.1.6.vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/copilot-codex-provider-for-sap-0.1.7.vsix",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

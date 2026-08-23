@@ -101,6 +101,27 @@ Detected local prerequisites (read-only inspection):
 
 No account identity, SAP authority, source, callback URL or tool payload was recorded.
 
+## 0.1.7 settings and Manager acceptance
+
+Automated release evidence is recorded only after the final `npm run package` verification. The required regressions are:
+
+| Check | Expected |
+|---|---|
+| Default request settings | `reasoning` and `service_tier` are absent from the ChatGPT OAuth request |
+| Explicit reasoning | The selected `none`/`low`/`medium`/`high`/`xhigh`/`max` value is sent as `reasoning.effort` |
+| Fast setting | `service_tier: fast` is sent independently and can be combined with reasoning |
+| Dynamic settings | A changed setting affects the next request without restarting VS Code |
+| Command palette | Only `Codex Copilot Manager` is contributed as a visible command |
+| Manager dispatch | Every existing management operation remains registered and the selected action reaches its existing safe handler |
+| Safety regression | Local App Server safety, Copilot tool ownership and SAP/ABAP FS boundaries remain unchanged |
+
+Interactive checks after installing the 0.1.7 VSIX:
+
+1. Open `Codex Copilot Manager` from `Ctrl+Shift+P` and verify the ChatGPT OAuth, Local Codex and Extension groups.
+2. Select `Open Settings`, leave both ChatGPT request settings at `modelDefault`, and confirm normal OAuth chat.
+3. Set reasoning to `high`, send a new OAuth turn, then enable `fast` and send another turn.
+4. Confirm Local CLI behavior and an ABAP FS edit/activation workflow are unchanged.
+
 ## Manual acceptance matrix
 
 Run in a VS Code profile where GitHub Copilot Chat, ABAP FS and SAP ADT are enabled and the user explicitly authorizes login/SAP access.

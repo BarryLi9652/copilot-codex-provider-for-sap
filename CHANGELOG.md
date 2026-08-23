@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7 — 2026-08-23
+
+- Added per-request ChatGPT OAuth reasoning overrides: model default, none, low, medium, high, xhigh and max.
+- Added an independent ChatGPT OAuth Fast service setting; reasoning effort and Fast can be combined.
+- Leaving either setting at `modelDefault` omits the corresponding request field and preserves backend defaults.
+- Replaced the command-palette command list with one `Codex Copilot Manager` Quick Pick while keeping existing internal command IDs registered for compatibility.
+- Updated the quick start, settings reference and acceptance guidance for the Manager workflow.
+
 ## 0.1.6 — 2026-08-23
 
 - Added an optional `copilotCodex.chatgpt.proxyUrl` setting used only by ChatGPT token exchange, token refresh, model discovery and responses.

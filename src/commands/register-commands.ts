@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 
-export const COMMAND_IDS = [
+export const MANAGER_COMMAND_ID = "copilotCodex.manager" as const;
+
+export const MANAGER_ACTION_IDS = [
   "copilotCodex.chatgpt.signIn",
   "copilotCodex.chatgpt.signInManual",
   "copilotCodex.chatgpt.signOut",
@@ -14,7 +16,10 @@ export const COMMAND_IDS = [
   "copilotCodex.clearExtensionData",
 ] as const;
 
+export const COMMAND_IDS = [MANAGER_COMMAND_ID, ...MANAGER_ACTION_IDS] as const;
+
 export type CommandId = typeof COMMAND_IDS[number];
+export type ManagerActionId = typeof MANAGER_ACTION_IDS[number] | "openSettings";
 export type CommandServices = Readonly<Record<CommandId, () => Promise<void>>>;
 
 export interface CommandDependencies {
@@ -51,6 +56,8 @@ export interface CommandUi {
   selectExecutable(): PromiseLike<string | undefined>;
   showInformation(message: string): PromiseLike<unknown>;
   showSafeError(): PromiseLike<unknown>;
+  selectManagerAction(): PromiseLike<ManagerActionId | undefined>;
+  openSettings(): PromiseLike<unknown>;
 }
 
 export interface CommandRegistrar {
@@ -76,7 +83,7 @@ export function createCommandServices(
 ): CommandServices {
   const safe = (operation: () => Promise<void>): (() => Promise<void>) =>
     () => runSafely(operation, dependencies, ui);
-  return {
+  const actions: Readonly<Record<typeof MANAGER_ACTION_IDS[number], () => Promise<void>>> = {
     "copilotCodex.chatgpt.signIn": safe(async () => {
       if (!await ui.confirmPrivateSignIn()) {
         return;
@@ -149,6 +156,20 @@ export function createCommandServices(
       }
       await ui.showInformation("Copilot Codex Provider extension data was cleared.");
     }),
+  };
+  return {
+    [MANAGER_COMMAND_ID]: safe(async () => {
+      const selected = await ui.selectManagerAction();
+      if (selected === undefined) {
+        return;
+      }
+      if (selected === "openSettings") {
+        await ui.openSettings();
+        return;
+      }
+      await actions[selected]();
+    }),
+    ...actions,
   };
 }
 

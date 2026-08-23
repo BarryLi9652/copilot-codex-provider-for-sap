@@ -365,6 +365,39 @@ test("OAuth transport refreshes once before replaying and preserves streamed tex
   ]);
 });
 
+test("OAuth transport reads ChatGPT request overrides for every new request", async () => {
+  let overrides: Record<string, string> = {};
+  const responseBodies: Record<string, unknown>[] = [];
+  const options = {
+    fetch: async (url: string, init: RecordedRequest["init"] = {}) => {
+      if (url.includes("/models")) {
+        return jsonResponse(validModelPayload());
+      }
+      responseBodies.push(JSON.parse(init.body ?? "{}") as Record<string, unknown>);
+      return streamResponse([
+        encoder.encode("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"),
+      ]);
+    },
+    requestOverrides: () => overrides,
+  };
+  const transport = new ChatGptOAuthTransport({
+    getAccessToken: async () => ({ token: "access" }),
+  }, options);
+
+  for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
+    // Exhaust the first response using model defaults.
+  }
+  overrides = { reasoningEffort: "high", serviceTier: "fast" };
+  for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
+    // Exhaust the second response using the updated settings.
+  }
+
+  assert.equal("reasoning" in (responseBodies[0] ?? {}), false);
+  assert.equal("service_tier" in (responseBodies[0] ?? {}), false);
+  assert.deepEqual(responseBodies[1]?.reasoning, { effort: "high" });
+  assert.equal(responseBodies[1]?.service_tier, "fast");
+});
+
 test("401 body cleanup, forced refresh, and replay all happen before the first yielded event", async () => {
   const timeline: string[] = [];
   let responseCalls = 0;

@@ -23,31 +23,40 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.4.vsix`。
+1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.7.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
-4. 在 Copilot Chat 模型选择器中分别选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI`。
 
 ```powershell
-code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.4.vsix
+code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.7.vsix
 ```
+
+## 快速开始
+
+1. 按 `Ctrl+Shift+P`，执行 `Codex Copilot Manager`。命令面板只保留这一个扩展入口。
+2. 使用 ChatGPT OAuth：选择 `Sign In with ChatGPT` 并完成浏览器登录；扩展会自动刷新模型，只有模型列表异常时才需要手动选择 `Refresh ChatGPT Models`。
+3. 使用 Local CLI：先选择 `Select Local Codex Executable`，重载 VS Code，再选择 `Start Local Codex` 或 `Refresh Local Models`。
+4. 打开 GitHub Copilot Chat，在模型选择器中选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI` 下的具体模型。
+5. 如需调整思考深度或 Fast 服务，在 Manager 中选择 `Open Settings`，修改 ChatGPT OAuth 设置；新设置从下一轮请求开始生效，无需重载。
+
+Manager 还提供 ChatGPT 退出、Local Codex 重启/停止、诊断和扩展数据清理。底层命令 ID 继续注册用于兼容，但不会占满命令面板。
 
 ## ChatGPT OAuth route
 
-1. 执行 `Copilot Codex: Sign In with ChatGPT`。
+1. 打开 `Codex Copilot Manager`，选择 `Sign In with ChatGPT`。
 2. 阅读私有接口风险提示并确认。
 3. 在浏览器完成登录。
-4. 如果 loopback 回调没有自动完成，保持登录流程打开，执行 `Copilot Codex: Complete ChatGPT Sign-In Manually`，粘贴完整 callback URL，不要编辑或裁剪。
-5. 执行 `Copilot Codex: Refresh ChatGPT Models` 或重新打开模型选择器。
+4. 如果 loopback 回调没有自动完成，保持登录流程打开，在 Manager 中选择 `Complete ChatGPT Sign-In Manually`，粘贴完整 callback URL，不要编辑或裁剪。
+5. 在 Manager 中选择 `Refresh ChatGPT Models`，或重新打开模型选择器。
 
 回调仅监听 loopback 地址，并按顺序尝试端口 1455、1457。OAuth session 不与 Local route 或 Codex CLI 共享。
 
 ## Local Codex CLI route
 
 1. 在终端确认 `codex --version` 可用，并由 Codex CLI 自身完成 ChatGPT 登录。
-2. 如果 `codex` 不在 PATH，执行 `Copilot Codex: Select Local Codex Executable`。
+2. 如果 `codex` 不在 PATH，在 `Codex Copilot Manager` 中选择 `Select Local Codex Executable`。
 3. 重载 VS Code，使 executable 设置生效。
-4. 执行 `Copilot Codex: Start Local Codex` 或直接选择 Local 模型。
+4. 在 Manager 中选择 `Start Local Codex`，或直接选择 Local 模型。
 5. 可使用 Start、Restart、Stop、Refresh Local Models 管理该 route。
 
 扩展固定使用 `codex app-server --listen stdio://`，不允许配置任意 App Server 参数或 shell command。App Server thread 使用 `approvalPolicy: never`、`sandbox: read-only`、ephemeral thread，并关闭 native command/file/web/browser/app/plugin/multi-agent 等能力。
@@ -71,23 +80,27 @@ V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机
 |---|---:|---|
 | `copilotCodex.local.codexPath` | 空 | Local Codex executable 的绝对路径 |
 | `copilotCodex.chatgpt.proxyUrl` | 空 | 仅用于 ChatGPT 登录令牌、模型发现和回复请求的 HTTP(S) 代理；修改后需重载 VS Code |
+| `copilotCodex.chatgpt.reasoningEffort` | modelDefault | ChatGPT OAuth 思考深度：`modelDefault`、`none`、`low`、`medium`、`high`、`xhigh` 或 `max`；下一轮请求立即生效 |
+| `copilotCodex.chatgpt.speedMode` | modelDefault | ChatGPT OAuth 服务速度：`modelDefault` 或 `fast`；Fast 需要账号和模型支持，下一轮请求立即生效 |
 | `copilotCodex.requestTimeoutSeconds` | 600 | HTTP/RPC 请求超时，最小 10 秒 |
 | `copilotCodex.toolTimeoutSeconds` | 300 | Copilot 工具 continuation 超时，最小 30 秒 |
 | `copilotCodex.catalogCacheMinutes` | 5 | 每条 route 独立模型目录缓存时间 |
 | `copilotCodex.sapSelectionMaxChars` | 16000 | 活动选区最大字符数 |
 | `copilotCodex.logLevel` | info | `error`、`warn`、`info` 或 `debug` |
 
+`modelDefault` 表示扩展不发送对应覆盖字段，由所选模型和 ChatGPT 后端决定默认值。显式设置 reasoning 或 Fast 后，扩展会按设置发送，不会静默替换为其他级别。两个设置只作用于 ChatGPT OAuth route，不改变 Local CLI。
+
 没有 endpoint、token、Cookie、ADT token、App Server args 或 shell command 设置。
 
 ## 诊断与排错
 
-执行 `Copilot Codex: Show Diagnostics`。报告只包含版本、平台、provider 可用性、模型数/缓存年龄、用户名脱敏后的 executable、App Server 安全状态、SAP 扩展布尔值与安全错误码。Local tool lifecycle 日志只记录 tool mode/count、能力布尔值、tool name、状态和 pending count。
+打开 `Codex Copilot Manager` 并选择 `Show Diagnostics`。报告只包含版本、平台、provider 可用性、模型数/缓存年龄、用户名脱敏后的 executable、App Server 安全状态、SAP 扩展布尔值与安全错误码。Local tool lifecycle 日志只记录 tool mode/count、能力布尔值、tool name、状态和 pending count。
 
 恢复动作包括 `signIn`、`refreshModels`、`selectCodex`、`restartCodex`、`upgradeCodex` 和 `showDiagnostics`。诊断和日志不应包含 token、账号邮箱、prompt、源码、工具 body、raw stderr 或 SAP system authority。
 
 ## 卸载与数据清理
 
-先执行 `Copilot Codex: Clear Extension Data`，再卸载 VSIX。该命令只清除本扩展的 OAuth session/secret、两条 route 的模型缓存、continuation 状态、诊断与安全日志；不会注销 Codex App Server 账号、删除 Codex 配置或修改 SAP 连接。
+先在 `Codex Copilot Manager` 中选择 `Clear Extension Data`，再卸载 VSIX。该操作只清除本扩展的 OAuth session/secret、两条 route 的模型缓存、continuation 状态、诊断与安全日志；不会注销 Codex App Server 账号、删除 Codex 配置或修改 SAP 连接。
 
 卸载扩展不会删除 Codex CLI 自身管理的登录数据。
 

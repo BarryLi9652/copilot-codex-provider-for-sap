@@ -9,6 +9,7 @@ import {
   type CommandDependencies,
   type CommandServices,
   type CommandUi,
+  type ManagerActionId,
 } from "../../../src/commands/register-commands.js";
 import {
   buildDiagnosticsReport,
@@ -18,11 +19,13 @@ import { ModelCache } from "../../../src/core/model-cache.js";
 import type { CodexModel, CodexRequest, CodexTransport, TransportEvent } from "../../../src/core/types.js";
 import {
   createChatGptModelCatalogServices,
+  createChatGptRequestOverridesResolver,
   restorePersistedChatGptModelCatalog,
 } from "../../../src/extension.js";
 import { CodexLanguageModelProvider } from "../../../src/providers/codex-provider.js";
 
 const expectedCommands = [
+  "copilotCodex.manager",
   "copilotCodex.chatgpt.signIn",
   "copilotCodex.chatgpt.signInManual",
   "copilotCodex.chatgpt.signOut",
@@ -68,6 +71,7 @@ async function registersExactCommandsAndRoutesIndependently(): Promise<void> {
 
 async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void> {
   const calls: string[] = [];
+  let managerSelection: ManagerActionId | undefined;
   let manualCallback: string | undefined;
   let openedAuthorizationUrl: string | undefined;
   const dependencies: CommandDependencies = {
@@ -110,6 +114,8 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
     selectExecutable: async () => "C:\\Tools\\codex.exe",
     showInformation: async () => undefined,
     showSafeError: async () => undefined,
+    selectManagerAction: async () => managerSelection,
+    openSettings: async () => { calls.push("ui.openSettings"); },
   };
   const services = createCommandServices(dependencies, ui);
 
@@ -125,6 +131,22 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
     "chatgpt.refresh",
     "local.select:C:\\Tools\\codex.exe",
   ]);
+
+  const manager = services as CommandServices & Record<"copilotCodex.manager", () => Promise<void>>;
+  calls.length = 0;
+  managerSelection = "copilotCodex.local.restart";
+  await manager["copilotCodex.manager"]();
+  assert.deepEqual(calls, ["local.restart"]);
+
+  calls.length = 0;
+  managerSelection = "openSettings";
+  await manager["copilotCodex.manager"]();
+  assert.deepEqual(calls, ["ui.openSettings"]);
+
+  calls.length = 0;
+  managerSelection = undefined;
+  await manager["copilotCodex.manager"]();
+  assert.equal(calls.length, 0);
 
   calls.length = 0;
   await services["copilotCodex.clearExtensionData"]();
@@ -218,6 +240,8 @@ async function authenticationRefreshesModelsBeforeReportingSuccess(): Promise<vo
     selectExecutable: async () => undefined,
     showInformation: async (message) => { calls.push(`ui.info:${message}`); },
     showSafeError: async () => undefined,
+    selectManagerAction: async () => undefined,
+    openSettings: async () => undefined,
   };
   const services = createCommandServices(dependencies, ui);
 
@@ -375,6 +399,24 @@ async function recordsPersistedCatalogRestoreFailureWithoutRejectingActivation()
   assert.equal(recordedFailure, failure);
 }
 
+function chatGptRequestOverridesReadCurrentSettingsOnEveryCall(): void {
+  const values = new Map<string, unknown>();
+  const resolveOverrides = createChatGptRequestOverridesResolver({
+    get: (section: string) => values.get(section),
+  });
+
+  assert.deepEqual(resolveOverrides(), {});
+  values.set("chatgpt.reasoningEffort", "high");
+  values.set("chatgpt.speedMode", "fast");
+  assert.deepEqual(resolveOverrides(), {
+    reasoningEffort: "high",
+    serviceTier: "fast",
+  });
+  values.set("chatgpt.reasoningEffort", "modelDefault");
+  values.set("chatgpt.speedMode", "modelDefault");
+  assert.deepEqual(resolveOverrides(), {});
+}
+
 async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
   const extension = vscode.extensions.getExtension("leonbwang.copilot-codex-provider-for-sap");
   assert.ok(extension);
@@ -385,7 +427,7 @@ async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
     };
   };
   const commandIds = packageJson.contributes?.commands?.map((entry) => entry.command) ?? [];
-  assert.deepEqual(commandIds, expectedCommands);
+  assert.deepEqual(commandIds, ["copilotCodex.manager"]);
   await extension.activate();
   const availableCommands = await vscode.commands.getCommands(true);
   for (const id of expectedCommands) {
@@ -396,6 +438,8 @@ async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
   assert.deepEqual(Object.keys(properties), [
     "copilotCodex.local.codexPath",
     "copilotCodex.chatgpt.proxyUrl",
+    "copilotCodex.chatgpt.reasoningEffort",
+    "copilotCodex.chatgpt.speedMode",
     "copilotCodex.requestTimeoutSeconds",
     "copilotCodex.toolTimeoutSeconds",
     "copilotCodex.catalogCacheMinutes",
@@ -475,6 +519,7 @@ export async function runCommandTests(): Promise<void> {
     ["persisted ChatGPT catalog restore uses shared discovery and notifies Copilot", persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot],
     ["persisted ChatGPT catalog restores only when a session exists", restoresPersistedCatalogOnlyWhenSessionExists],
     ["persisted ChatGPT catalog restore failure is recorded without rejecting activation", recordsPersistedCatalogRestoreFailureWithoutRejectingActivation],
+    ["ChatGPT request overrides read current settings on every call", chatGptRequestOverridesReadCurrentSettingsOnEveryCall],
     ["manifest contributes only safe management settings", manifestContributesOnlySafeManagementSurface],
     ["diagnostics are whitelisted and redacted", diagnosticsAreWhitelistedAndRedacted],
   ];

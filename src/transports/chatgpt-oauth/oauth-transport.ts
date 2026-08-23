@@ -13,7 +13,10 @@ import {
   type ChatGptTokenSource,
 } from "./http-client.js";
 import { parseChatGptModels } from "./model-catalog.js";
-import { buildResponsesRequest } from "./request-codec.js";
+import {
+  buildResponsesRequest,
+  type ChatGptRequestOverrides,
+} from "./request-codec.js";
 import {
   ResponsesSseParser,
   type ResponsesSseLogger,
@@ -34,6 +37,7 @@ export interface ChatGptOAuthTransportOptions extends ChatGptHttpClientOptions {
   modelCache?: ModelCache;
   logger?: ResponsesSseLogger;
   httpClient?: ChatGptHttpClient;
+  requestOverrides?: () => ChatGptRequestOverrides;
 }
 
 export class ChatGptOAuthTransport implements CodexTransport {
@@ -50,9 +54,11 @@ export class ChatGptOAuthTransport implements CodexTransport {
     this.modelCache = options.modelCache ?? new ModelCache(MODEL_CACHE_TTL_MS);
     this.httpClient = options.httpClient ?? new ChatGptHttpClient(tokenSource, options);
     this.logger = options.logger;
+    this.requestOverrides = options.requestOverrides;
   }
 
   private readonly logger: ResponsesSseLogger | undefined;
+  private readonly requestOverrides: (() => ChatGptRequestOverrides) | undefined;
 
   public async listModels(
     options: { silent: boolean; forceRefresh?: boolean },
@@ -136,7 +142,7 @@ export class ChatGptOAuthTransport implements CodexTransport {
       }
 
       const parser = new ResponsesSseParser(this.logger);
-      const body = buildResponsesRequest(request, model);
+      const body = buildResponsesRequest(request, model, this.requestOverrides?.());
       let completed = false;
       for await (const chunk of this.httpClient.streamResponses(body, operation.signal)) {
         if (operation.signal.aborted) {

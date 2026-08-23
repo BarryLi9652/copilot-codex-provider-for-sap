@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import type { CodexModel, CodexRequest } from "../../src/core/types.js";
-import { buildResponsesRequest } from "../../src/transports/chatgpt-oauth/request-codec.js";
+import {
+  buildResponsesRequest,
+  resolveChatGptRequestOverrides,
+} from "../../src/transports/chatgpt-oauth/request-codec.js";
 
 const model: CodexModel = {
   id: "gpt-5-codex",
@@ -144,4 +147,35 @@ test("uses automatic tool choice and disables parallel calls from model capabili
 
   assert.equal(body.tool_choice, "auto");
   assert.equal(body.parallel_tool_calls, false);
+});
+
+test("sends explicit reasoning effort and Fast service tier together", () => {
+  const body = buildResponsesRequest(request, model, {
+    reasoningEffort: "high",
+    serviceTier: "fast",
+  });
+
+  assert.deepEqual(body.reasoning, { effort: "high" });
+  assert.equal(body.service_tier, "fast");
+});
+
+test("omits reasoning and service tier when no override is configured", () => {
+  const body = buildResponsesRequest(request, model);
+
+  assert.equal("reasoning" in body, false);
+  assert.equal("service_tier" in body, false);
+});
+
+test("resolves explicit ChatGPT settings without changing model defaults", () => {
+  assert.deepEqual(resolveChatGptRequestOverrides("max", "fast"), {
+    reasoningEffort: "max",
+    serviceTier: "fast",
+  });
+  assert.deepEqual(resolveChatGptRequestOverrides("modelDefault", "modelDefault"), {});
+  assert.deepEqual(resolveChatGptRequestOverrides(undefined, undefined), {});
+});
+
+test("ignores malformed ChatGPT request override settings", () => {
+  assert.deepEqual(resolveChatGptRequestOverrides("turbo", "ultrafast"), {});
+  assert.deepEqual(resolveChatGptRequestOverrides(42, true), {});
 });

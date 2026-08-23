@@ -8,6 +8,34 @@ import type {
 
 type ResponsesInputItem = Record<string, unknown>;
 
+export type ChatGptReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface ChatGptRequestOverrides {
+  reasoningEffort?: ChatGptReasoningEffort;
+  serviceTier?: "fast";
+}
+
+const CHATGPT_REASONING_EFFORTS = new Set<unknown>([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+export function resolveChatGptRequestOverrides(
+  reasoningEffort: unknown,
+  speedMode: unknown,
+): ChatGptRequestOverrides {
+  return {
+    ...(CHATGPT_REASONING_EFFORTS.has(reasoningEffort)
+      ? { reasoningEffort: reasoningEffort as ChatGptReasoningEffort }
+      : {}),
+    ...(speedMode === "fast" ? { serviceTier: "fast" as const } : {}),
+  };
+}
+
 const toDataUrl = (mimeType: string, data: Uint8Array): string =>
   `data:${mimeType};base64,${Buffer.from(data).toString("base64")}`;
 
@@ -92,6 +120,7 @@ const toMessageItems = (message: CodexMessage): ResponsesInputItem[] => {
 export function buildResponsesRequest(
   request: CodexRequest,
   modelMetadata: CodexModel,
+  overrides: ChatGptRequestOverrides = {},
 ): Record<string, unknown> {
   return {
     model: modelMetadata.id,
@@ -108,5 +137,11 @@ export function buildResponsesRequest(
     })),
     parallel_tool_calls: modelMetadata.capabilities.parallelToolCalls,
     tool_choice: request.toolMode === "required" ? "required" : "auto",
+    ...(overrides.reasoningEffort === undefined
+      ? {}
+      : { reasoning: { effort: overrides.reasoningEffort } }),
+    ...(overrides.serviceTier === undefined
+      ? {}
+      : { service_tier: overrides.serviceTier }),
   };
 }
