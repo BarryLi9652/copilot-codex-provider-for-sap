@@ -26,24 +26,43 @@ import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
 
+export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] & {
+  restore(): Promise<number>;
+};
+
 export const createChatGptModelCatalogServices = (
   provider: CodexLanguageModelProvider,
   transport: Pick<CodexTransport, "listModels">,
   transportCache: ModelCache,
-): CommandDependencies["chatgptModels"] => ({
-  refresh: async () => {
-    const models = await transport.listModels(
-      { silent: false, forceRefresh: true },
-      new AbortController().signal,
-    );
+): ChatGptModelCatalogServices => {
+  const load = async (options: { silent: boolean; forceRefresh?: boolean }): Promise<number> => {
+    const models = await transport.listModels(options, new AbortController().signal);
     provider.invalidateModelInformation();
     return models.length;
-  },
-  clear: () => {
-    transportCache.clear();
-    provider.invalidateModelInformation();
-  },
-});
+  };
+  return {
+    refresh: () => load({ silent: false, forceRefresh: true }),
+    restore: () => load({ silent: true }),
+    clear: () => {
+      transportCache.clear();
+      provider.invalidateModelInformation();
+    },
+  };
+};
+
+export const restorePersistedChatGptModelCatalog = async (options: {
+  loadSession(): Promise<unknown | undefined>;
+  restore(): Promise<unknown>;
+  recordFailure(error: unknown): void;
+}): Promise<void> => {
+  try {
+    if (await options.loadSession() !== undefined) {
+      await options.restore();
+    }
+  } catch (error) {
+    options.recordFailure(error);
+  }
+};
 
 export function activate(context: vscode.ExtensionContext): void {
   const configuration = vscode.workspace.getConfiguration("copilotCodex");
@@ -259,6 +278,11 @@ export function activate(context: vscode.ExtensionContext): void {
     chatGptTransport,
     localTransport,
   );
+  void restorePersistedChatGptModelCatalog({
+    loadSession: () => oauthStore.load(),
+    restore: () => chatGptModelCatalog.restore(),
+    recordFailure: (error) => diagnostics.record(error),
+  });
 }
 
 const secondsToMs = (value: number, minimum: number): number =>

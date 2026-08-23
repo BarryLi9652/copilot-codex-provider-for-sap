@@ -5,6 +5,7 @@ import { OAuthError } from "./oauth-manager.js";
 import {
   CHATGPT_CODEX_PROFILE,
 } from "./profile.js";
+import { createProxyAwareFetch } from "./proxy-fetch.js";
 import type { OAuthCredentials } from "./oauth-store.js";
 
 export const CHATGPT_DEFAULT_REQUEST_TIMEOUT_MS = 600_000;
@@ -57,16 +58,6 @@ interface RequestIds {
   readonly threadId: string;
 }
 
-const defaultFetch: ChatGptFetch = async (url, init = {}) => {
-  const response = await globalThis.fetch(url, {
-    method: init.method,
-    headers: init.headers,
-    body: init.body,
-    signal: init.signal,
-  });
-  return response as unknown as ChatGptHttpResponse;
-};
-
 const isAbortError = (error: unknown): boolean =>
   error instanceof DOMException && error.name === "AbortError" ||
   error instanceof Error && error.name === "AbortError";
@@ -85,7 +76,7 @@ export class ChatGptHttpClient {
     private readonly tokenSource: ChatGptTokenSource,
     options: ChatGptHttpClientOptions = {},
   ) {
-    this.fetch = options.fetch ?? defaultFetch;
+    this.fetch = options.fetch ?? createProxyAwareFetch();
     const timeoutMs = options.timeoutMs ?? CHATGPT_DEFAULT_REQUEST_TIMEOUT_MS;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
       throw new RangeError("timeoutMs must be a finite number greater than zero");

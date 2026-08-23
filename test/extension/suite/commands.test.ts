@@ -16,7 +16,10 @@ import {
 } from "../../../src/commands/diagnostics.js";
 import { ModelCache } from "../../../src/core/model-cache.js";
 import type { CodexModel, CodexRequest, CodexTransport, TransportEvent } from "../../../src/core/types.js";
-import { createChatGptModelCatalogServices } from "../../../src/extension.js";
+import {
+  createChatGptModelCatalogServices,
+  restorePersistedChatGptModelCatalog,
+} from "../../../src/extension.js";
 import { CodexLanguageModelProvider } from "../../../src/providers/codex-provider.js";
 
 const expectedCommands = [
@@ -293,6 +296,85 @@ async function chatGptCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<v
   }
 }
 
+async function persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot(): Promise<void> {
+  const restoredModel: CodexModel = {
+    id: "gpt-restored",
+    name: "GPT Restored",
+    family: "gpt",
+    version: "1",
+    maxInputTokens: 1_000,
+    maxOutputTokens: 500,
+    capabilities: { imageInput: false, toolCalling: true, parallelToolCalls: false },
+  };
+  const listOptions: { silent: boolean; forceRefresh?: boolean }[] = [];
+  const transport: CodexTransport = {
+    listModels: async (options) => {
+      listOptions.push(options);
+      return [restoredModel];
+    },
+    generate: async function* (_request: CodexRequest): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport);
+  const transportCache = new ModelCache(300_000);
+  let changeEvents = 0;
+  const subscription = provider.onDidChangeLanguageModelChatInformation?.(() => {
+    changeEvents += 1;
+  });
+  const services = createChatGptModelCatalogServices(provider, transport, transportCache);
+
+  try {
+    assert.equal(await services.restore(), 1);
+    assert.deepEqual(listOptions, [{ silent: true }]);
+    assert.equal(changeEvents, 1);
+  } finally {
+    subscription?.dispose();
+  }
+}
+
+async function restoresPersistedCatalogOnlyWhenSessionExists(): Promise<void> {
+  const calls: string[] = [];
+  await restorePersistedChatGptModelCatalog({
+    loadSession: async () => {
+      calls.push("session.load");
+      return { stored: true };
+    },
+    restore: async () => {
+      calls.push("catalog.restore");
+    },
+    recordFailure: () => undefined,
+  });
+  assert.deepEqual(calls, ["session.load", "catalog.restore"]);
+
+  calls.length = 0;
+  await restorePersistedChatGptModelCatalog({
+    loadSession: async () => {
+      calls.push("session.load");
+      return undefined;
+    },
+    restore: async () => {
+      calls.push("catalog.restore");
+    },
+    recordFailure: () => undefined,
+  });
+  assert.deepEqual(calls, ["session.load"]);
+}
+
+async function recordsPersistedCatalogRestoreFailureWithoutRejectingActivation(): Promise<void> {
+  const failure = { code: "network" };
+  let recordedFailure: unknown;
+
+  await restorePersistedChatGptModelCatalog({
+    loadSession: async () => ({ stored: true }),
+    restore: async () => { throw failure; },
+    recordFailure: (error) => { recordedFailure = error; },
+  });
+
+  assert.equal(recordedFailure, failure);
+}
+
 async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
   const extension = vscode.extensions.getExtension("leonbwang.copilot-codex-provider-for-sap");
   assert.ok(extension);
@@ -383,6 +465,9 @@ export async function runCommandTests(): Promise<void> {
     ["management services preserve route and clear boundaries", managementServicesPreserveRouteAndClearBoundaries],
     ["authentication refreshes models before reporting success", authenticationRefreshesModelsBeforeReportingSuccess],
     ["ChatGPT catalog services refresh and notify as one operation", chatGptCatalogServicesRefreshAndNotifyAsOneOperation],
+    ["persisted ChatGPT catalog restore uses shared discovery and notifies Copilot", persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot],
+    ["persisted ChatGPT catalog restores only when a session exists", restoresPersistedCatalogOnlyWhenSessionExists],
+    ["persisted ChatGPT catalog restore failure is recorded without rejecting activation", recordsPersistedCatalogRestoreFailureWithoutRejectingActivation],
     ["manifest contributes only safe management settings", manifestContributesOnlySafeManagementSurface],
     ["diagnostics are whitelisted and redacted", diagnosticsAreWhitelistedAndRedacted],
   ];

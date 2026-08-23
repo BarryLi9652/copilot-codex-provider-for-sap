@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5 — 2026-08-23
+
+- ChatGPT OAuth requests now honor `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` without changing global proxy state.
+- Successful ChatGPT sign-in and manual callback completion now refresh the model catalog and notify Copilot with the actual model count.
+- Existing ChatGPT sessions now restore the model catalog after VS Code reload without requiring another login.
+- Startup restore failures remain non-interactive, preserve the stored session and record only safe diagnostics.
+
 ## 0.1.4 — 2026-08-22
 
 - Local CLI now enforces Copilot required-tool turns instead of silently dropping `toolMode=required`.
