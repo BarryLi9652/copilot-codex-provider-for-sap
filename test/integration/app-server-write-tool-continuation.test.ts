@@ -60,6 +60,16 @@ const suppliedTools = [
     description: "Read ABAP diagnostics.",
     inputSchema: { type: "object" },
   },
+  {
+    name: "activate_virtual_workspace_editing",
+    description: "Load tools that edit existing files in virtual workspaces.",
+    inputSchema: { type: "object" },
+  },
+  {
+    name: "activate_abap_activation",
+    description: "Load tools that activate ABAP development objects.",
+    inputSchema: { type: "object" },
+  },
 ] as const;
 
 class WriteContinuationLease implements AppServerTransportLease {
@@ -252,7 +262,7 @@ test("surfaces a supplied ABAP edit tool and resumes the original App Server tur
       name: "appServer.request.tools",
       metadata: {
         toolMode: "required",
-        toolCount: 3,
+        toolCount: 5,
         hasAbapRead: false,
         hasWorkspaceUriResolver: true,
         hasCreate: false,
@@ -260,6 +270,9 @@ test("surfaces a supplied ABAP edit tool and resumes the original App Server tur
         hasAbapSemanticEdit: false,
         hasDiagnostics: true,
         hasActivate: false,
+        virtualActivatorCount: 2,
+        hasVirtualEditActivator: true,
+        hasVirtualActivateActivator: true,
       },
     });
     assert.deepEqual(

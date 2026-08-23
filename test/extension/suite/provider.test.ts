@@ -10,6 +10,7 @@ import type {
 } from "../../../src/core/types.js";
 import { CodexError } from "../../../src/core/errors.js";
 import { CodexLanguageModelProvider } from "../../../src/providers/codex-provider.js";
+import { SapContextProvider } from "../../../src/sap/context.js";
 
 const model: CodexModel = {
   id: "gpt-test",
@@ -24,6 +25,47 @@ const model: CodexModel = {
     parallelToolCalls: false,
   },
 };
+
+const modelInformation: vscode.LanguageModelChatInformation = {
+  id: model.id,
+  name: model.name,
+  family: model.family,
+  version: model.version,
+  maxInputTokens: model.maxInputTokens,
+  maxOutputTokens: model.maxOutputTokens,
+  capabilities: { imageInput: false, toolCalling: 128 },
+};
+
+const virtualEditActivator: vscode.LanguageModelChatTool = {
+  name: "activate_virtual_workspace_editing",
+  description: "Load tools that edit existing files in virtual workspaces.",
+  inputSchema: { type: "object" },
+};
+
+const virtualActivateActivator: vscode.LanguageModelChatTool = {
+  name: "activate_abap_activation",
+  description: "Load tools that activate ABAP development objects.",
+  inputSchema: { type: "object" },
+};
+
+const createAdtSapContextProvider = (): SapContextProvider => new SapContextProvider({
+  activeTextEditor: () => ({
+    document: {
+      uri: vscode.Uri.parse("adt://DEV/src/zcl_demo.clas.abap"),
+      languageId: "abap",
+      isDirty: false,
+    },
+    selection: { isEmpty: true },
+  }) as unknown as vscode.TextEditor,
+  getDiagnostics: () => [],
+  getExtension: () => ({}),
+});
+
+const userMessage = (text: string): vscode.LanguageModelChatRequestMessage => ({
+  role: vscode.LanguageModelChatMessageRole.User,
+  name: undefined,
+  content: [new vscode.LanguageModelTextPart(text)],
+});
 
 interface TrackableCancellation {
   token: vscode.CancellationToken;
@@ -253,6 +295,253 @@ async function preservesStableMessageParts(): Promise<void> {
   assert.equal(receivedRequest.toolMode, "required");
 }
 
+async function preactivatesSapVirtualWriteToolsBeforeStartingTransport(): Promise<void> {
+  let generateCalls = 0;
+  const transport: CodexTransport = {
+    listModels: async () => [model],
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      generateCalls += 1;
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, {
+    requestIdFactory: () => "request-preflight-1",
+    sapContextProvider: createAdtSapContextProvider(),
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  const parts: vscode.LanguageModelResponsePart[] = [];
+
+  try {
+    await provider.provideLanguageModelChatResponse(
+      modelInformation,
+      [userMessage("Modify and activate this ABAP object.")],
+      {
+        toolMode: vscode.LanguageModelChatToolMode.Auto,
+        tools: [
+          virtualEditActivator,
+          virtualActivateActivator,
+          {
+            name: "activate_workspace_search",
+            description: "Load tools that search the workspace.",
+            inputSchema: { type: "object" },
+          },
+        ],
+      },
+      { report: (part) => parts.push(part) },
+      cancellation.token,
+    );
+  } finally {
+    cancellation.dispose();
+  }
+
+  assert.equal(generateCalls, 0);
+  assert.equal(parts.length, 2);
+  assert.deepEqual(
+    parts.map((part) => part instanceof vscode.LanguageModelToolCallPart
+      ? { callId: part.callId, name: part.name, input: part.input }
+      : part),
+    [
+      {
+        callId: "copilot_codex_preflight_request-preflight-1_0",
+        name: "activate_virtual_workspace_editing",
+        input: {},
+      },
+      {
+        callId: "copilot_codex_preflight_request-preflight-1_1",
+        name: "activate_abap_activation",
+        input: {},
+      },
+    ],
+  );
+}
+
+async function filtersCompletedPreflightBeforeForwardingExpandedTools(): Promise<void> {
+  let receivedRequest: CodexRequest | undefined;
+  const transport: CodexTransport = {
+    listModels: async () => [model],
+    generate: async function* (request: CodexRequest): AsyncIterable<TransportEvent> {
+      receivedRequest = request;
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, {
+    requestIdFactory: () => "request-expanded-1",
+    sapContextProvider: createAdtSapContextProvider(),
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  const editCallId = "copilot_codex_preflight_request-preflight-1_0";
+  const activateCallId = "copilot_codex_preflight_request-preflight-1_1";
+  const suppliedTools: readonly vscode.LanguageModelChatTool[] = [
+    {
+      name: "replace_string_in_file",
+      description: "Replace text in an existing file.",
+      inputSchema: { type: "object" },
+    },
+    {
+      name: "abap_activate",
+      description: "Activate an ABAP object.",
+      inputSchema: { type: "object" },
+    },
+    virtualEditActivator,
+    virtualActivateActivator,
+  ];
+
+  try {
+    await provider.provideLanguageModelChatResponse(
+      modelInformation,
+      [
+        userMessage("Modify and activate this ABAP object."),
+        {
+          role: vscode.LanguageModelChatMessageRole.Assistant,
+          name: undefined,
+          content: [
+            new vscode.LanguageModelToolCallPart(
+              editCallId,
+              "activate_virtual_workspace_editing",
+              {},
+            ),
+            new vscode.LanguageModelToolCallPart(
+              activateCallId,
+              "activate_abap_activation",
+              {},
+            ),
+          ],
+        },
+        {
+          role: vscode.LanguageModelChatMessageRole.User,
+          name: undefined,
+          content: [
+            new vscode.LanguageModelToolResultPart(editCallId, [
+              new vscode.LanguageModelTextPart("Tools activated."),
+            ]),
+            new vscode.LanguageModelToolResultPart(activateCallId, [
+              new vscode.LanguageModelTextPart("Tools activated."),
+            ]),
+          ],
+        },
+      ],
+      {
+        toolMode: vscode.LanguageModelChatToolMode.Required,
+        tools: suppliedTools,
+      },
+      { report: () => undefined },
+      cancellation.token,
+    );
+  } finally {
+    cancellation.dispose();
+  }
+
+  assert.ok(receivedRequest !== undefined);
+  assert.deepEqual(receivedRequest.messages, [{
+    role: "user",
+    parts: [{ kind: "text", text: "Modify and activate this ABAP object." }],
+  }]);
+  assert.deepEqual(receivedRequest.tools, suppliedTools);
+  assert.equal(receivedRequest.toolMode, "required");
+}
+
+async function doesNotRepeatPreflightWhenCopilotDoesNotExpandTools(): Promise<void> {
+  let receivedRequest: CodexRequest | undefined;
+  const transport: CodexTransport = {
+    listModels: async () => [model],
+    generate: async function* (request: CodexRequest): AsyncIterable<TransportEvent> {
+      receivedRequest = request;
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, {
+    requestIdFactory: () => "request-unexpanded-1",
+    sapContextProvider: createAdtSapContextProvider(),
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  const parts: vscode.LanguageModelResponsePart[] = [];
+  const callId = "copilot_codex_preflight_request-preflight-1_0";
+  const suppliedTools: readonly vscode.LanguageModelChatTool[] = [virtualEditActivator];
+
+  try {
+    await provider.provideLanguageModelChatResponse(
+      modelInformation,
+      [
+        userMessage("Modify this ABAP object."),
+        {
+          role: vscode.LanguageModelChatMessageRole.Assistant,
+          name: undefined,
+          content: [new vscode.LanguageModelToolCallPart(
+            callId,
+            "activate_virtual_workspace_editing",
+            {},
+          )],
+        },
+        {
+          role: vscode.LanguageModelChatMessageRole.User,
+          name: undefined,
+          content: [new vscode.LanguageModelToolResultPart(callId, [
+            new vscode.LanguageModelTextPart("No tools expanded."),
+          ])],
+        },
+      ],
+      {
+        toolMode: vscode.LanguageModelChatToolMode.Auto,
+        tools: suppliedTools,
+      },
+      { report: (part) => parts.push(part) },
+      cancellation.token,
+    );
+  } finally {
+    cancellation.dispose();
+  }
+
+  assert.ok(receivedRequest !== undefined);
+  assert.deepEqual(receivedRequest.messages, [{
+    role: "user",
+    parts: [{ kind: "text", text: "Modify this ABAP object." }],
+  }]);
+  assert.deepEqual(receivedRequest.tools, suppliedTools);
+  assert.deepEqual(parts, []);
+}
+
+async function doesNotPreactivateCancelledSapRequest(): Promise<void> {
+  let generateCalls = 0;
+  let receivedSignal: AbortSignal | undefined;
+  const transport: CodexTransport = {
+    listModels: async () => [model],
+    generate: (_request: CodexRequest, signal: AbortSignal): AsyncIterable<TransportEvent> => {
+      generateCalls += 1;
+      receivedSignal = signal;
+      throw new CodexError("cancelled");
+    },
+    dispose: async () => undefined,
+  };
+  const provider = new CodexLanguageModelProvider(transport, {
+    sapContextProvider: createAdtSapContextProvider(),
+  });
+  const cancellation = new vscode.CancellationTokenSource();
+  cancellation.cancel();
+  const parts: vscode.LanguageModelResponsePart[] = [];
+
+  try {
+    await provider.provideLanguageModelChatResponse(
+      modelInformation,
+      [userMessage("Modify this ABAP object.")],
+      {
+        toolMode: vscode.LanguageModelChatToolMode.Auto,
+        tools: [virtualEditActivator],
+      },
+      { report: (part) => parts.push(part) },
+      cancellation.token,
+    );
+  } finally {
+    cancellation.dispose();
+  }
+
+  assert.equal(generateCalls, 1);
+  assert.equal(receivedSignal?.aborted, true);
+  assert.deepEqual(parts, []);
+}
+
 async function cachesModelDiscovery(): Promise<void> {
   let listCalls = 0;
   const transport: CodexTransport = {
@@ -281,14 +570,52 @@ async function cachesModelDiscovery(): Promise<void> {
   assert.equal(listCalls, 1);
   assert.deepEqual(first, [{
     id: "gpt-test",
-    name: "GPT Test",
+    name: "Codex Test",
     family: "gpt",
     version: "1",
     maxInputTokens: 1_000,
     maxOutputTokens: 500,
-    capabilities: { imageInput: false, toolCalling: true },
+    isBYOK: true,
+    capabilities: { imageInput: false, toolCalling: 128 },
   }]);
   assert.deepEqual(second, first);
+}
+
+async function preservesNonGptModelNamesDuringDiscovery(): Promise<void> {
+  const nonGptModel: CodexModel = {
+    ...model,
+    id: "codex-test",
+    name: "Codex Test",
+    family: "codex",
+  };
+  const provider = new CodexLanguageModelProvider({
+    listModels: async () => [nonGptModel],
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  }, "test-vendor");
+  const cancellation = new vscode.CancellationTokenSource();
+
+  try {
+    const [discovered] = await provider.provideLanguageModelChatInformation(
+      { silent: true },
+      cancellation.token,
+    );
+
+    assert.deepEqual(discovered, {
+      id: "codex-test",
+      name: "Codex Test",
+      family: "codex",
+      version: "1",
+      maxInputTokens: 1_000,
+      maxOutputTokens: 500,
+      isBYOK: true,
+      capabilities: { imageInput: false, toolCalling: 128 },
+    });
+  } finally {
+    cancellation.dispose();
+  }
 }
 
 async function skipsModelDiscoveryForPreCancelledToken(): Promise<void> {
@@ -380,12 +707,13 @@ async function keepsSharedModelDiscoveryAliveWhenFirstCallerCancels(): Promise<v
     assert.deepEqual(firstModels, []);
     assert.deepEqual(secondModels, [{
       id: "gpt-test",
-      name: "GPT Test",
+      name: "Codex Test",
       family: "gpt",
       version: "1",
       maxInputTokens: 1_000,
       maxOutputTokens: 500,
-      capabilities: { imageInput: false, toolCalling: true },
+      isBYOK: true,
+      capabilities: { imageInput: false, toolCalling: 128 },
     }]);
     assert.equal(listCalls, 1);
     assert.equal(loaderSignal?.aborted, false);
@@ -536,7 +864,12 @@ export async function runProviderTests(): Promise<void> {
   const tests: readonly (readonly [string, () => Promise<void>])[] = [
     ["provider streams text and tool calls as Copilot response parts", streamsTextAndToolCalls],
     ["provider preserves stable Copilot message parts and required tools", preservesStableMessageParts],
+    ["provider preactivates SAP virtual write tools before starting transport", preactivatesSapVirtualWriteToolsBeforeStartingTransport],
+    ["provider filters completed preflight before forwarding expanded tools", filtersCompletedPreflightBeforeForwardingExpandedTools],
+    ["provider does not repeat preflight when Copilot does not expand tools", doesNotRepeatPreflightWhenCopilotDoesNotExpandTools],
+    ["provider does not preactivate a cancelled SAP request", doesNotPreactivateCancelledSapRequest],
     ["provider caches model discovery and maps the normalized capabilities", cachesModelDiscovery],
+    ["provider preserves non-GPT model names during discovery", preservesNonGptModelNamesDuringDiscovery],
     ["provider skips discovery for a pre-cancelled token", skipsModelDiscoveryForPreCancelledToken],
     ["provider keeps shared discovery alive when the first caller cancels", keepsSharedModelDiscoveryAliveWhenFirstCallerCancels],
     ["provider disposes response cancellation listeners on request-build failure", disposesResponseCancellationListenerOnRequestBuildFailure],

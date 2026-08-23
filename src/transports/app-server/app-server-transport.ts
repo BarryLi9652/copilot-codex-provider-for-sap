@@ -459,6 +459,13 @@ export class AppServerTransport implements CodexTransport {
         };
       });
       const toolCapabilities = classifySapTools(request.tools.map((tool) => tool.name));
+      const virtualActivatorCapabilities = request.tools
+        .filter((tool) => tool.name.startsWith("activate_"))
+        .map((tool) => [
+          tool.name.slice("activate_".length),
+          tool.description,
+          JSON.stringify(tool.inputSchema),
+        ].join(" ").toLowerCase());
       this.logger?.event("appServer.request.tools", {
         toolMode: request.toolMode,
         toolCount: request.tools.length,
@@ -470,6 +477,11 @@ export class AppServerTransport implements CodexTransport {
         hasAbapSemanticEdit: toolCapabilities.edit.includes("replace_string_in_abap_object"),
         hasDiagnostics: toolCapabilities.diagnostics.length > 0,
         hasActivate: toolCapabilities.activate.length > 0,
+        virtualActivatorCount: virtualActivatorCapabilities.length,
+        hasVirtualEditActivator: virtualActivatorCapabilities.some((capability) =>
+          /\b(edit|editing|replace|write|writing)\b/u.test(capability)),
+        hasVirtualActivateActivator: virtualActivatorCapabilities.some((capability) =>
+          /\b(activate|activation)\b/u.test(capability)),
       });
       const thread = await lease.startThread(dynamicTools, signal);
       state = {

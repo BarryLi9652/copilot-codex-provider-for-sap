@@ -15,8 +15,16 @@ import { reportTransportEvent } from "./response-adapter.js";
 import { countTokens } from "./token-count.js";
 import { SapContextProvider } from "../sap/context.js";
 import { buildSapInstructions } from "../sap/instructions.js";
+import { classifySapTools } from "../sap/tool-capabilities.js";
 
 const MODEL_CACHE_TTL_MS = 300_000;
+const MAX_TOOL_COUNT = 128;
+const VIRTUAL_TOOL_ACTIVATOR_PREFIX = "activate_";
+const PREFLIGHT_CALL_ID_PREFIX = "copilot_codex_preflight_";
+
+type CodexLanguageModelChatInformation = vscode.LanguageModelChatInformation & {
+  readonly isBYOK: true;
+};
 
 export interface CodexLanguageModelProviderOptions {
   modelCache?: ModelCache;
@@ -31,6 +39,58 @@ const isCancelledError = (error: unknown): boolean =>
 const isAbortError = (error: unknown): boolean =>
   error instanceof DOMException && error.name === "AbortError" ||
   error instanceof Error && error.name === "AbortError";
+
+const virtualActivatorCapabilityText = (tool: vscode.LanguageModelChatTool): string => [
+  tool.name.slice(VIRTUAL_TOOL_ACTIVATOR_PREFIX.length),
+  tool.description,
+  JSON.stringify(tool.inputSchema ?? {}),
+].join(" ").toLowerCase();
+
+const selectSapVirtualToolActivators = (
+  tools: readonly vscode.LanguageModelChatTool[],
+): readonly vscode.LanguageModelChatTool[] => {
+  const capabilities = classifySapTools(tools.map((tool) => tool.name));
+  const needsEdit = capabilities.edit.length === 0;
+  const needsActivate = capabilities.activate.length === 0;
+
+  return tools.filter((tool) => {
+    if (!tool.name.startsWith(VIRTUAL_TOOL_ACTIVATOR_PREFIX)) {
+      return false;
+    }
+    const capability = virtualActivatorCapabilityText(tool);
+    return (needsEdit && /\b(edit|editing|replace|write|writing)\b/u.test(capability))
+      || (needsActivate && /\b(activate|activation)\b/u.test(capability));
+  });
+};
+
+const isPreflightPart = (part: unknown): boolean =>
+  (part instanceof vscode.LanguageModelToolCallPart
+    || part instanceof vscode.LanguageModelToolResultPart)
+  && part.callId.startsWith(PREFLIGHT_CALL_ID_PREFIX);
+
+const filterPreflightMessages = (
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+): readonly vscode.LanguageModelChatRequestMessage[] => messages.flatMap((message) => {
+  const content = message.content.filter((part) => !isPreflightPart(part));
+  return content.length === 0 ? [] : [{ ...message, content }];
+});
+
+const hasCurrentTurnPreflight = (
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+): boolean => {
+  let latestHumanUserMessageIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === vscode.LanguageModelChatMessageRole.User
+      && message.content.some((part) => !(part instanceof vscode.LanguageModelToolResultPart))) {
+      latestHumanUserMessageIndex = index;
+      break;
+    }
+  }
+
+  return messages.slice(latestHumanUserMessageIndex + 1)
+    .some((message) => message.content.some(isPreflightPart));
+};
 
 function waitForCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
   if (signal.aborted) {
@@ -57,16 +117,17 @@ function waitForCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promi
   });
 }
 
-const mapModel = (model: CodexModel): vscode.LanguageModelChatInformation => ({
+const mapModel = (model: CodexModel): CodexLanguageModelChatInformation => ({
   id: model.id,
-  name: model.name,
+  name: model.name.replace(/^gpt(?:[\s-]+|$)/iu, "Codex ").trim(),
   family: model.family,
   version: model.version,
   maxInputTokens: model.maxInputTokens,
   maxOutputTokens: model.maxOutputTokens,
+  isBYOK: true,
   capabilities: {
     imageInput: model.capabilities.imageInput,
-    toolCalling: model.capabilities.toolCalling,
+    toolCalling: model.capabilities.toolCalling ? MAX_TOOL_COUNT : false,
   },
 });
 
@@ -129,15 +190,32 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     const binding = toAbortSignal(token);
 
     try {
+      const requestId = this.requestIdFactory();
+      const sapContext = this.sapContextProvider.collect();
+      const preflightTools = !binding.signal.aborted
+        && sapContext.activeDocument?.uri.startsWith("adt://") === true
+        && !hasCurrentTurnPreflight(messages)
+        ? selectSapVirtualToolActivators(options.tools ?? [])
+        : [];
+      if (preflightTools.length > 0) {
+        preflightTools.forEach((tool, index) => progress.report(
+          new vscode.LanguageModelToolCallPart(
+            `${PREFLIGHT_CALL_ID_PREFIX}${requestId}_${index}`,
+            tool.name,
+            {},
+          ),
+        ));
+        return;
+      }
       const request = toCodexRequest({
-        requestId: this.requestIdFactory(),
+        requestId,
         model,
-        messages,
+        messages: filterPreflightMessages(messages),
         options,
         instructions: [
           this.instructions,
           buildSapInstructions(
-            this.sapContextProvider.collect(),
+            sapContext,
             (options.tools ?? []).map((tool) => tool.name),
           ),
         ].filter((instructions) => instructions.length > 0).join("\n\n"),
