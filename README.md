@@ -1,7 +1,7 @@
-# Copilot Codex Provider for SAP
+# Codex Copilot Manager for SAP
 
 <p align="center">
-  <img src="resources/icon.png" alt="Copilot Codex Provider for SAP" width="192">
+  <img src="resources/icon.png" alt="Codex Copilot Manager for SAP" width="192">
 </p>
 
 一个本地 VS Code 扩展，把 Codex 作为两个彼此独立的 GitHub Copilot Chat 模型提供方，并通过标准 VS Code API 增强 ABAP FS 与 SAP ADT for VS Code 的上下文体验。
@@ -27,17 +27,17 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/copilot-codex-provider-for-sap-0.1.7.vsix`。
+1. 构建或取得 `dist/codex-copilot-provider-for-sap-0.1.8.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
 
 ```powershell
-code --install-extension .\dist\copilot-codex-provider-for-sap-0.1.7.vsix
+code --install-extension .\dist\codex-copilot-provider-for-sap-0.1.8.vsix
 ```
 
 ## 快速开始
 
-1. 按 `Ctrl+Shift+P`，执行 `Codex Copilot Manager`。命令面板只保留这一个扩展入口。
+1. 按 `Ctrl+Shift+P`，执行 `Codex Copilot Manager`。首次打开且尚未配置代理时，Manager 会先显示一次代理引导。
 2. 使用 ChatGPT OAuth：选择 `Sign In with ChatGPT` 并完成浏览器登录；扩展会自动刷新模型，只有模型列表异常时才需要手动选择 `Refresh ChatGPT Models`。
 3. 使用 Local CLI：先选择 `Select Local Codex Executable`，重载 VS Code，再选择 `Start Local Codex` 或 `Refresh Local Models`。
 4. 打开 GitHub Copilot Chat，在模型选择器中选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI` 下的具体模型。
@@ -54,6 +54,33 @@ Manager 还提供 ChatGPT 退出、Local Codex 重启/停止、诊断和扩展�
 5. 在 Manager 中选择 `Refresh ChatGPT Models`，或重新打开模型选择器。
 
 回调仅监听 loopback 地址，并按顺序尝试端口 1455、1457。OAuth session 不与 Local route 或 Codex CLI 共享。
+
+## 代理配置：Clash/Mihomo 与 SAP
+
+首次打开 `Codex Copilot Manager` 且 `copilotCodex.chatgpt.proxyUrl` 为空时，扩展提供以下选择：
+
+- `Configure ChatGPT-only proxy`：推荐用于 Clash/Mihomo，只代理 ChatGPT OAuth、token 刷新、模型发现和回复请求。
+- `Use environment proxy`：保持扩展专用代理为空，使用 VS Code 进程继承的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`。
+- `Configure later`：不修改任何代理设置；之后可在 Manager 中选择 `Configure ChatGPT Proxy`。
+
+Clash/Mihomo 使用 HTTP 或 Mixed 端口时，常见用户设置如下；端口必须以本机实际配置为准：
+
+```jsonc
+{
+  "copilotCodex.chatgpt.proxyUrl": "http://127.0.0.1:7897"
+}
+```
+
+保存后需要重载 VS Code。扩展不会自动修改 Windows 系统代理、VS Code 全局 `http.proxy`、环境变量、`NO_PROXY`、ABAP FS 连接或 SAP ADT 连接。
+
+ChatGPT 专用代理与 SAP 的边界：
+
+- `copilotCodex.chatgpt.proxyUrl` 仅注入 ChatGPT OAuth route，显式配置时优先于继承的环境代理。
+- Local CLI route 不读取该设置；它使用 Codex CLI/App Server 自身的网络环境。
+- ABAP FS 和 SAP ADT 不读取该设置。若开启 Windows/VS Code 全局代理或共享的环境代理，它们仍可能被全局代理影响。
+- 如果启用环境代理，应将 SAP 主机名/IP 加入 `NO_PROXY`，例如 `localhost,127.0.0.1,::1,<sap-host>,<sap-ip>`；不要在仓库或诊断中提交真实 SAP authority。
+- 如果开启系统代理后 `adt://`、KIC 或 SAP 登录失败，优先关闭全局代理或补充 `NO_PROXY`，同时保留 ChatGPT 专用代理。
+- 不要使用 `NODE_TLS_REJECT_UNAUTHORIZED=0` 解决代理或证书问题；它不会修复路由，并会禁用 TLS 证书校验。
 
 ## Local Codex CLI route
 

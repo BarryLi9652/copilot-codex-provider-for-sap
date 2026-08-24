@@ -63,16 +63,20 @@ test("manifest exposes one Codex Copilot Manager command", async () => {
   }]);
 });
 
-test("release metadata names the 0.1.7 VSIX consistently", async () => {
+test("release metadata uses the new Marketplace identity and names the 0.1.8 VSIX consistently", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8"));
   const lockfile = JSON.parse(await readFile("package-lock.json", "utf8"));
 
-  assert.equal(manifest.version, "0.1.7");
-  assert.equal(lockfile.version, "0.1.7");
-  assert.equal(lockfile.packages[""].version, "0.1.7");
+  assert.equal(manifest.name, "codex-copilot-provider-for-sap");
+  assert.equal(manifest.displayName, "Codex Copilot Manager for SAP");
+  assert.equal(lockfile.name, "codex-copilot-provider-for-sap");
+  assert.equal(lockfile.packages[""].name, "codex-copilot-provider-for-sap");
+  assert.equal(manifest.version, "0.1.8");
+  assert.equal(lockfile.version, "0.1.8");
+  assert.equal(lockfile.packages[""].version, "0.1.8");
   assert.match(
     manifest.scripts["package:vsix"],
-    /dist\/copilot-codex-provider-for-sap-0\.1\.7\.vsix$/,
+    /dist\/codex-copilot-provider-for-sap-0\.1\.8\.vsix$/,
   );
 });
 

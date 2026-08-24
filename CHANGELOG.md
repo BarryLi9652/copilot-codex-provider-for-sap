@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8 — 2026-08-24
+
+- Changed the Marketplace package identity to `leonbwang.codex-copilot-provider-for-sap` because the removed original identity is permanently reserved.
+- Changed the Marketplace display name to `Codex Copilot Manager for SAP`; command IDs, provider IDs and settings keys remain unchanged.
+- Added first-use ChatGPT proxy onboarding in `Codex Copilot Manager` plus a reusable `Configure ChatGPT Proxy` action.
+- Documented Clash/Mihomo, environment-proxy fallback, Local CLI isolation, and SAP/ABAP FS `NO_PROXY` guidance without modifying system proxy settings.
+
 ## 0.1.7 — 2026-08-23
 
 - Added per-request ChatGPT OAuth reasoning overrides: model default, none, low, medium, high, xhigh and max.

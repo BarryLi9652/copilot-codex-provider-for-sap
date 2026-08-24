@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import * as vscode from "vscode";
+import * as commandModule from "../../../src/commands/register-commands.js";
 
 import {
   COMMAND_IDS,
@@ -75,6 +76,10 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
   let manualCallback: string | undefined;
   let openedAuthorizationUrl: string | undefined;
   const dependencies: CommandDependencies = {
+    proxySetup: {
+      ensureFirstUse: async () => undefined,
+      configure: async () => undefined,
+    },
     oauth: {
       signIn: async (openExternal) => {
         await openExternal("https://auth.example/authorize");
@@ -205,9 +210,155 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
   assert.deepEqual(calls, ["oauth.signOut.failed", "chatgpt.clear"]);
 }
 
+async function managerRunsFirstUseProxySetupAndAllowsManualReconfiguration(): Promise<void> {
+  const calls: string[] = [];
+  const dependencies = {
+    proxySetup: {
+      ensureFirstUse: async () => { calls.push("proxy.ensure"); },
+      configure: async () => { calls.push("proxy.configure"); },
+    },
+    oauth: {
+      signIn: async () => undefined,
+      completeManualCallback: async () => undefined,
+      signOut: async () => undefined,
+      clearSecret: async () => undefined,
+    },
+    chatgptModels: { refresh: async () => 0, clear: () => undefined },
+    local: {
+      selectExecutable: async () => undefined,
+      start: async () => undefined,
+      restart: async () => undefined,
+      stop: async () => undefined,
+      refreshModels: async () => 0,
+      clearModels: () => undefined,
+    },
+    continuations: { clear: () => undefined },
+    diagnostics: {
+      show: async () => undefined,
+      clear: () => undefined,
+      record: () => { calls.push("diagnostics.record"); },
+    },
+  } satisfies CommandDependencies;
+  const ui = {
+    confirmPrivateSignIn: async () => true,
+    openExternal: async () => true,
+    promptManualCallback: async () => undefined,
+    selectExecutable: async () => undefined,
+    showInformation: async () => undefined,
+    showSafeError: async () => { calls.push("ui.error"); },
+    selectManagerAction: async () => "configureProxy" as ManagerActionId,
+    openSettings: async () => undefined,
+  } satisfies CommandUi;
+
+  await createCommandServices(dependencies, ui)["copilotCodex.manager"]();
+
+  assert.deepEqual(calls, ["proxy.ensure", "proxy.configure"]);
+}
+
+async function proxyOnboardingPersistsOnlyExplicitSafeChoices(): Promise<void> {
+  type ProxySetupServices = {
+    ensureFirstUse(): Promise<void>;
+    configure(): Promise<void>;
+  };
+  type CreateProxySetupServices = (
+    store: {
+      getProxyUrl(): string;
+      setProxyUrl(value: string): Promise<void>;
+      hasCompletedOnboarding(): boolean;
+      markOnboardingCompleted(): Promise<void>;
+    },
+    ui: {
+      choose(onboarding: boolean): Promise<"configure" | "environment" | "skip" | undefined>;
+      promptProxyUrl(defaultValue: string): Promise<string | undefined>;
+      showInvalidProxy(): Promise<void>;
+      showReloadRequired(): Promise<void>;
+    },
+  ) => ProxySetupServices;
+  const createProxySetupServices = (
+    commandModule as unknown as { createProxySetupServices?: CreateProxySetupServices }
+  ).createProxySetupServices;
+  if (createProxySetupServices === undefined) {
+    assert.fail("createProxySetupServices is not implemented");
+  }
+
+  let proxyUrl = "";
+  let completed = false;
+  let choice: "configure" | "environment" | "skip" | undefined = "configure";
+  let promptValue: string | undefined = "  http://127.0.0.1:7897  ";
+  const calls: string[] = [];
+  const services = createProxySetupServices({
+    getProxyUrl: () => proxyUrl,
+    setProxyUrl: async (value) => { proxyUrl = value; calls.push(`store.proxy:${value}`); },
+    hasCompletedOnboarding: () => completed,
+    markOnboardingCompleted: async () => { completed = true; calls.push("store.completed"); },
+  }, {
+    choose: async (onboarding) => { calls.push(`ui.choose:${onboarding}`); return choice; },
+    promptProxyUrl: async (defaultValue) => {
+      calls.push(`ui.prompt:${defaultValue}`);
+      return promptValue;
+    },
+    showInvalidProxy: async () => { calls.push("ui.invalid"); },
+    showReloadRequired: async () => { calls.push("ui.reload"); },
+  });
+
+  proxyUrl = "http://proxy.example:8080";
+  await services.ensureFirstUse();
+  assert.deepEqual(calls, []);
+
+  proxyUrl = "";
+  await services.ensureFirstUse();
+  assert.equal(proxyUrl, "http://127.0.0.1:7897");
+  assert.equal(completed, true);
+  assert.deepEqual(calls, [
+    "ui.choose:true",
+    "ui.prompt:http://127.0.0.1:7897",
+    "store.proxy:http://127.0.0.1:7897",
+    "store.completed",
+    "ui.reload",
+  ]);
+
+  calls.length = 0;
+  await services.ensureFirstUse();
+  assert.deepEqual(calls, []);
+
+  calls.length = 0;
+  choice = "environment";
+  await services.configure();
+  assert.equal(proxyUrl, "");
+  assert.deepEqual(calls, [
+    "ui.choose:false",
+    "store.proxy:",
+    "store.completed",
+    "ui.reload",
+  ]);
+
+  calls.length = 0;
+  completed = false;
+  choice = "skip";
+  await services.ensureFirstUse();
+  assert.equal(completed, true);
+  assert.deepEqual(calls, ["ui.choose:true", "store.completed"]);
+
+  calls.length = 0;
+  completed = false;
+  choice = "configure";
+  promptValue = "socks5://127.0.0.1:7897";
+  await services.ensureFirstUse();
+  assert.equal(completed, false);
+  assert.deepEqual(calls, [
+    "ui.choose:true",
+    "ui.prompt:http://127.0.0.1:7897",
+    "ui.invalid",
+  ]);
+}
+
 async function authenticationRefreshesModelsBeforeReportingSuccess(): Promise<void> {
   const calls: string[] = [];
   const dependencies: CommandDependencies = {
+    proxySetup: {
+      ensureFirstUse: async () => undefined,
+      configure: async () => undefined,
+    },
     oauth: {
       signIn: async () => { calls.push("oauth.signIn"); },
       completeManualCallback: async () => { calls.push("oauth.manual"); },
@@ -418,7 +569,7 @@ function chatGptRequestOverridesReadCurrentSettingsOnEveryCall(): void {
 }
 
 async function manifestContributesOnlySafeManagementSurface(): Promise<void> {
-  const extension = vscode.extensions.getExtension("leonbwang.copilot-codex-provider-for-sap");
+  const extension = vscode.extensions.getExtension("leonbwang.codex-copilot-provider-for-sap");
   assert.ok(extension);
   const packageJson = extension.packageJSON as {
     contributes?: {
@@ -514,6 +665,8 @@ export async function runCommandTests(): Promise<void> {
   const tests: readonly [string, () => void | Promise<void>][] = [
     ["commands register exact independent routes", registersExactCommandsAndRoutesIndependently],
     ["management services preserve route and clear boundaries", managementServicesPreserveRouteAndClearBoundaries],
+    ["manager runs first-use proxy setup and allows manual reconfiguration", managerRunsFirstUseProxySetupAndAllowsManualReconfiguration],
+    ["proxy onboarding persists only explicit safe choices", proxyOnboardingPersistsOnlyExplicitSafeChoices],
     ["authentication refreshes models before reporting success", authenticationRefreshesModelsBeforeReportingSuccess],
     ["ChatGPT catalog services refresh and notify as one operation", chatGptCatalogServicesRefreshAndNotifyAsOneOperation],
     ["persisted ChatGPT catalog restore uses shared discovery and notifies Copilot", persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot],

@@ -19,10 +19,95 @@ export const MANAGER_ACTION_IDS = [
 export const COMMAND_IDS = [MANAGER_COMMAND_ID, ...MANAGER_ACTION_IDS] as const;
 
 export type CommandId = typeof COMMAND_IDS[number];
-export type ManagerActionId = typeof MANAGER_ACTION_IDS[number] | "openSettings";
+export type ManagerActionId = typeof MANAGER_ACTION_IDS[number] | "configureProxy" | "openSettings";
 export type CommandServices = Readonly<Record<CommandId, () => Promise<void>>>;
 
+export const DEFAULT_CHATGPT_PROXY_URL = "http://127.0.0.1:7897";
+
+export type ProxySetupChoice = "configure" | "environment" | "skip";
+
+export interface ProxySetupServices {
+  ensureFirstUse(): Promise<void>;
+  configure(): Promise<void>;
+}
+
+export interface ProxySetupStore {
+  getProxyUrl(): string;
+  setProxyUrl(value: string): Promise<void>;
+  hasCompletedOnboarding(): boolean;
+  markOnboardingCompleted(): Promise<void>;
+}
+
+export interface ProxySetupUi {
+  choose(onboarding: boolean): Promise<ProxySetupChoice | undefined>;
+  promptProxyUrl(defaultValue: string): Promise<string | undefined>;
+  showInvalidProxy(): Promise<void>;
+  showReloadRequired(): Promise<void>;
+}
+
+const normalizeHttpProxyUrl = (value: string): string | undefined => {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && parsed.hostname.length > 0
+      ? trimmed
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+export function createProxySetupServices(
+  store: ProxySetupStore,
+  ui: ProxySetupUi,
+): ProxySetupServices {
+  const run = async (onboarding: boolean): Promise<void> => {
+    const choice = await ui.choose(onboarding);
+    if (choice === undefined) {
+      return;
+    }
+    if (choice === "skip") {
+      await store.markOnboardingCompleted();
+      return;
+    }
+    if (choice === "environment") {
+      await store.setProxyUrl("");
+      await store.markOnboardingCompleted();
+      await ui.showReloadRequired();
+      return;
+    }
+
+    const entered = await ui.promptProxyUrl(store.getProxyUrl() || DEFAULT_CHATGPT_PROXY_URL);
+    if (entered === undefined) {
+      return;
+    }
+    const proxyUrl = normalizeHttpProxyUrl(entered);
+    if (proxyUrl === undefined) {
+      await ui.showInvalidProxy();
+      return;
+    }
+    await store.setProxyUrl(proxyUrl);
+    await store.markOnboardingCompleted();
+    await ui.showReloadRequired();
+  };
+
+  return {
+    ensureFirstUse: async () => {
+      if (store.getProxyUrl().trim().length > 0 || store.hasCompletedOnboarding()) {
+        return;
+      }
+      await run(true);
+    },
+    configure: () => run(false),
+  };
+}
+
 export interface CommandDependencies {
+  readonly proxySetup: ProxySetupServices;
   readonly oauth: {
     signIn(openExternal: (url: string) => Promise<boolean>): Promise<unknown>;
     completeManualCallback(url: string): Promise<unknown>;
@@ -159,8 +244,13 @@ export function createCommandServices(
   };
   return {
     [MANAGER_COMMAND_ID]: safe(async () => {
+      await dependencies.proxySetup.ensureFirstUse();
       const selected = await ui.selectManagerAction();
       if (selected === undefined) {
+        return;
+      }
+      if (selected === "configureProxy") {
+        await dependencies.proxySetup.configure();
         return;
       }
       if (selected === "openSettings") {
