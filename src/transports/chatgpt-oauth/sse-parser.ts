@@ -106,17 +106,24 @@ export class ResponsesSseParser {
     }
 
     let decoded = "";
-    for (let index = 0; index < chunk.length; index += 1) {
-      try {
-        decoded += this.decoder.decode(chunk.subarray(index, index + 1), { stream: true });
-      } catch {
-        this.pending += decoded;
-        const events = this.drainFrames();
-        this.pending = "";
-        this.decoderFailed = true;
-        this.report("chatgpt.sse.malformed_utf8", undefined);
-        return events;
+    let batchStart = 0;
+    try {
+      for (let index = 0; index < chunk.length; index += 1) {
+        if (chunk[index] === 0x0a || chunk[index] === 0x0d) {
+          decoded += this.decoder.decode(chunk.subarray(batchStart, index + 1), { stream: true });
+          batchStart = index + 1;
+        }
       }
+      if (batchStart < chunk.length) {
+        decoded += this.decoder.decode(chunk.subarray(batchStart), { stream: true });
+      }
+    } catch {
+      this.pending += decoded;
+      const events = this.drainFrames();
+      this.pending = "";
+      this.decoderFailed = true;
+      this.report("chatgpt.sse.malformed_utf8", undefined);
+      return events;
     }
 
     this.pending += decoded;

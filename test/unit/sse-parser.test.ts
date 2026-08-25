@@ -177,6 +177,75 @@ test("preserves complete frames before malformed UTF-8 bytes", () => {
   assert.deepEqual(reports, [{ name: "chatgpt.sse.malformed_utf8", metadata: {} }]);
 });
 
+test("preserves a CR-delimited frame before malformed UTF-8 bytes", () => {
+  const reports: Array<{ name: string; metadata?: Record<string, unknown> }> = [];
+  const parser = new ResponsesSseParser({
+    event: (name, metadata) => reports.push({ name, metadata }),
+  });
+  const validFrame = encoder.encode([
+    "event: response.output_text.delta\r",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"safe\"}\r\r",
+  ].join(""));
+  const chunk = new Uint8Array(validFrame.length + 2);
+  chunk.set(validFrame);
+  chunk.set([0xc3, 0x28], validFrame.length);
+
+  assert.deepEqual(parser.push(chunk), [{ type: "text-delta", text: "safe" }]);
+  assert.deepEqual(parser.finish(), []);
+  assert.deepEqual(reports, [{ name: "chatgpt.sse.malformed_utf8", metadata: {} }]);
+});
+
+test("preserves a split UTF-8 frame before later malformed bytes", () => {
+  const reports: Array<{ name: string; metadata?: Record<string, unknown> }> = [];
+  const parser = new ResponsesSseParser({
+    event: (name, metadata) => reports.push({ name, metadata }),
+  });
+  const validFrame = encoder.encode([
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+  ].join(""));
+  const split = validFrame.indexOf(0xe4) + 1;
+  assert.notEqual(split, 0);
+  const remainder = new Uint8Array(validFrame.length - split + 2);
+  remainder.set(validFrame.slice(split));
+  remainder.set([0xc3, 0x28], validFrame.length - split);
+
+  assert.deepEqual(parser.push(validFrame.slice(0, split)), []);
+  assert.deepEqual(parser.push(remainder), [{ type: "text-delta", text: "你好" }]);
+  assert.deepEqual(parser.finish(), []);
+  assert.deepEqual(reports, [{ name: "chatgpt.sse.malformed_utf8", metadata: {} }]);
+});
+
+test("decodes a large valid SSE chunk in bounded batches", () => {
+  const NativeTextDecoder = globalThis.TextDecoder;
+  let decodeCalls = 0;
+  class CountingTextDecoder extends NativeTextDecoder {
+    public override decode(
+      input?: Parameters<InstanceType<typeof NativeTextDecoder>["decode"]>[0],
+      options?: Parameters<InstanceType<typeof NativeTextDecoder>["decode"]>[1],
+    ): string {
+      decodeCalls += 1;
+      return super.decode(input, options);
+    }
+  }
+  globalThis.TextDecoder = CountingTextDecoder;
+
+  try {
+    const delta = "A".repeat(65_536);
+    const stream = encoder.encode([
+      "event: response.output_text.delta\n",
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta })}\n\n`,
+    ].join(""));
+
+    assert.deepEqual(new ResponsesSseParser().push(stream), [
+      { type: "text-delta", text: delta },
+    ]);
+    assert.ok(decodeCalls <= 8, `expected at most 8 decoder calls, received ${decodeCalls}`);
+  } finally {
+    globalThis.TextDecoder = NativeTextDecoder;
+  }
+});
+
 test("does not duplicate a tool call when arguments.done precedes output_item.done", () => {
   const parser = new ResponsesSseParser();
   const stream = [

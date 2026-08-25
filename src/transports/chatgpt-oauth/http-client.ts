@@ -402,6 +402,8 @@ export class ChatGptHttpClient {
           controller.abort();
         }
       }, this.timeoutMs);
+      const unref = (timeout as unknown as { unref?: () => void }).unref;
+      unref?.call(timeout);
     }
 
     return {
