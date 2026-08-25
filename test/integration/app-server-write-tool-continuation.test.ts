@@ -78,6 +78,7 @@ class WriteContinuationLease implements AppServerTransportLease {
   public readonly capabilities = { dynamicTools: true };
   public readonly startedWith: AppServerDynamicTool[][] = [];
   public startTurnCount = 0;
+  public releaseCount = 0;
   public pendingToolCall: Promise<unknown> | undefined;
 
   private readonly notifications = new Map<string, JsonRpcServerNotificationHandler>();
@@ -123,7 +124,7 @@ class WriteContinuationLease implements AppServerTransportLease {
           turnId: "turn-write",
           status: "completed",
         });
-      });
+      }).catch(() => undefined);
     });
     return Promise.resolve({ turnId: "turn-write" });
   }
@@ -163,7 +164,17 @@ class WriteContinuationLease implements AppServerTransportLease {
     return { dispose: () => undefined };
   }
 
-  public release(): void {}
+  public completeTurn(): void {
+    void this.notifications.get("turn/completed")?.({
+      threadId: "thread-write",
+      turnId: "turn-write",
+      status: "completed",
+    });
+  }
+
+  public release(): void {
+    this.releaseCount += 1;
+  }
 }
 
 class WriteContinuationSession implements AppServerTransportSession {
@@ -257,6 +268,7 @@ test("surfaces a supplied ABAP edit tool and resumes the original App Server tur
     assert.equal(session.lease.startTurnCount, 1);
     assert.equal(registry.size, 0);
     await session.lease.pendingToolCall;
+    assert.equal(session.lease.releaseCount, 1);
 
     assert.deepEqual(logged[0], {
       name: "appServer.request.tools",
@@ -295,6 +307,69 @@ test("surfaces a supplied ABAP edit tool and resumes the original App Server tur
     assert.doesNotMatch(serializedLogs, /METHOD old|METHOD new/);
     assert.doesNotMatch(serializedLogs, /Edit applied by VS Code/);
     assert.doesNotMatch(serializedLogs, /Rename the method/);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("tool timeout releases the retained write turn and lease exactly once", async () => {
+  const session = new WriteContinuationSession();
+  const registry = new ToolContinuationRegistry({ timeoutMs: 20 });
+  const transport = new AppServerTransport(session, registry);
+
+  try {
+    const events = await collect(transport.generate(
+      request([{
+        role: "user",
+        parts: [{ kind: "text", text: "Edit ABAP." }],
+      }], "timeout-1"),
+      new AbortController().signal,
+    ));
+    assert.equal(events[0]?.type, "tool-call");
+    assert.ok(session.lease.pendingToolCall);
+    await assert.rejects(session.lease.pendingToolCall);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(registry.size, 0);
+    assert.equal(session.lease.releaseCount, 1);
+  } finally {
+    await transport.dispose();
+  }
+});
+
+test("records cleanup behavior when the server completes before Copilot returns the tool result", async () => {
+  const session = new WriteContinuationSession();
+  const registry = new ToolContinuationRegistry({ timeoutMs: 2_000 });
+  const transport = new AppServerTransport(session, registry);
+
+  try {
+    const events = await collect(transport.generate(
+      request([{
+        role: "user",
+        parts: [{ kind: "text", text: "Edit ABAP." }],
+      }], "early-completion-1"),
+      new AbortController().signal,
+    ));
+    assert.equal(events[0]?.type, "tool-call");
+    assert.ok(session.lease.pendingToolCall);
+    const pendingToolCall = session.lease.pendingToolCall;
+
+    session.lease.completeTurn();
+    const outcome = await Promise.race([
+      pendingToolCall.then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"waiting">((resolve) => setImmediate(() => resolve("waiting"))),
+    ]);
+
+    assert.equal(outcome, "waiting");
+    assert.equal(registry.size, 1);
+    assert.equal(session.lease.releaseCount, 0);
+
+    await transport.dispose();
+    await assert.rejects(pendingToolCall);
+    assert.equal(registry.size, 0);
+    assert.equal(session.lease.releaseCount, 1);
   } finally {
     await transport.dispose();
   }

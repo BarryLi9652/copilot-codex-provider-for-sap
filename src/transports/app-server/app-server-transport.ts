@@ -797,7 +797,14 @@ export class AppServerTransport implements CodexTransport {
           leaseId: state.leaseId,
           ...call,
           respond: (result) => resolve(result),
-          reject,
+          reject: (error) => {
+            reject(error);
+            queueMicrotask(() => {
+              if (!state.cleaned && !state.cleanupStarted) {
+                void this.terminateState(state, error, !state.terminal);
+              }
+            });
+          },
           continue: (signal) => this.consumeState(state, signal),
         });
         state.callIds.add(call.callId);
