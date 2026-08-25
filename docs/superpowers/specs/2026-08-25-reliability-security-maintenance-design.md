@@ -128,6 +128,7 @@ Required tests:
 - A callback with the wrong state cannot consume the valid callback opportunity.
 - After a wrong-state callback, the selected callback listener remains bounded by correct callback, explicit cancellation, or the existing callback timeout; fallback selection across ports `1455` and `1457` remains intact.
 - A keep-alive callback client receives completion promptly and the listener closes.
+- Callback timeout is represented by a structured loopback error code rather than matching error-message text.
 - PKCE, loopback-only binding, redirect path validation, and secret storage behavior remain unchanged.
 
 The refresh flight owns its AbortController and is not owned by the first caller. Each caller may stop waiting with its own signal; the shared request continues while another caller still depends on it. The manager may terminate the flight on lifecycle invalidation, sign-out/disposal, or its own timeout.
@@ -196,6 +197,7 @@ Required tests:
 - Oversized unterminated JSONL and SSE input fails with a typed bounded-resource/protocol error.
 - Valid large tool payloads below the selected limit continue to parse.
 - Existing chunk-boundary and Unicode streaming tests remain green.
+- Remote SSE failure payloads map only allow-listed code/status categories to local typed errors and never surface the remote message.
 
 Limits must be selected from repository fixtures or explicit stress tests. A limit is not accepted merely because it appears in the external review.
 
