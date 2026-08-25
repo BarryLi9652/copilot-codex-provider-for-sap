@@ -247,10 +247,14 @@ export function activate(context: vscode.ExtensionContext): void {
     localModelCache,
   );
   const disposeExtension = createIdempotentAsyncDisposer(async () => {
-    await Promise.allSettled([
-      chatGptTransport.dispose(),
-      localTransport.dispose(),
-    ]);
+    try {
+      await Promise.allSettled([
+        chatGptTransport.dispose(),
+        localTransport.dispose(),
+      ]);
+    } finally {
+      chatGptFetch.dispose();
+    }
   });
   activeExtensionDisposal = disposeExtension;
   const proxySetup = createProxySetupServices({

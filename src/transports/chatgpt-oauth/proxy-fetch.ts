@@ -50,15 +50,18 @@ const toResponse = (message: IncomingMessage, method: string | undefined): Respo
 
 const createAgent = (url: URL, proxyEnv: ProxyEnv): HttpAgent =>
   url.protocol === "https:"
-    ? new HttpsAgent({ proxyEnv })
-    : new HttpAgent({ proxyEnv });
+    ? new HttpsAgent({ keepAlive: true, proxyEnv })
+    : new HttpAgent({ keepAlive: true, proxyEnv });
+
+export interface ProxyAwareFetch extends ChatGptFetch {
+  dispose(): void;
+}
 
 const fetchNode = (
   url: URL,
   init: ChatGptRequestInit,
-  proxyEnv: ProxyEnv,
+  agent: HttpAgent,
 ): Promise<ChatGptHttpResponse> => new Promise((resolve, reject) => {
-  const agent = createAgent(url, proxyEnv);
   const requestFn = url.protocol === "https:" ? httpsRequest : httpRequest;
   const request = requestFn(url, {
     method: init.method,
@@ -66,34 +69,55 @@ const fetchNode = (
     signal: init.signal,
     agent,
   }, (response) => {
-    response.once("close", () => agent.destroy());
     try {
       resolve(toResponse(response, init.method));
     } catch (error) {
-      agent.destroy();
+      response.destroy();
       reject(error);
     }
   });
-  request.once("error", (error) => {
-    agent.destroy();
-    reject(error);
-  });
+  request.once("error", reject);
   request.end(init.body);
 });
 
 export const createProxyAwareFetch = (
   environment: NodeJS.ProcessEnv = process.env,
   explicitProxyUrl?: string,
-): ChatGptFetch => {
+): ProxyAwareFetch => {
   const normalizedProxyUrl = explicitProxyUrl?.trim();
   const proxyEnv: ProxyEnv = normalizedProxyUrl
     ? { HTTP_PROXY: normalizedProxyUrl, HTTPS_PROXY: normalizedProxyUrl }
     : selectProxyEnv(environment);
-  return async (url, init = {}) => {
+  const agents = new Map<"http:" | "https:", HttpAgent>();
+  let disposed = false;
+  const agentFor = (target: URL): HttpAgent => {
+    const protocol = target.protocol as "http:" | "https:";
+    let agent = agents.get(protocol);
+    if (agent === undefined) {
+      agent = createAgent(target, proxyEnv);
+      agents.set(protocol, agent);
+    }
+    return agent;
+  };
+  const fetch = async (url: string, init: ChatGptRequestInit = {}) => {
+    if (disposed) {
+      throw new TypeError("The ChatGPT proxy-aware fetch has been disposed.");
+    }
     const target = new URL(url);
     if (target.protocol !== "http:" && target.protocol !== "https:") {
       throw new TypeError(`Unsupported protocol: ${target.protocol}`);
     }
-    return fetchNode(target, init, proxyEnv);
+    return fetchNode(target, init, agentFor(target));
   };
+  fetch.dispose = (): void => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    for (const agent of agents.values()) {
+      agent.destroy();
+    }
+    agents.clear();
+  };
+  return fetch;
 };

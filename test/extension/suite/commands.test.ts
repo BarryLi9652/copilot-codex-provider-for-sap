@@ -616,13 +616,14 @@ async function idempotentExtensionShutdownSharesAndAwaitsCleanup(): Promise<void
     await Promise.allSettled([
       Promise.resolve().then(() => { transportCalls.push("chatgpt"); }),
       Promise.resolve().then(() => { transportCalls.push("local"); }),
+      Promise.resolve().then(() => { transportCalls.push("fetch"); }),
     ]);
   });
   assert.equal(await Promise.race([
     responsiveCleanup().then(() => "disposed" as const),
     new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 50)),
   ]), "disposed");
-  assert.deepEqual(transportCalls.sort(), ["chatgpt", "local"]);
+  assert.deepEqual(transportCalls.sort(), ["chatgpt", "fetch", "local"]);
 
   const deactivation = (extensionModule.deactivate as unknown as () => unknown)();
   assert.ok(deactivation instanceof Promise);
