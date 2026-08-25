@@ -23,6 +23,7 @@ import type { CodexModel, CodexRequest, CodexTransport, TransportEvent } from ".
 import {
   createChatGptModelCatalogServices,
   createChatGptRequestOverridesResolver,
+  createLocalModelCatalogServices,
   restorePersistedChatGptModelCatalog,
 } from "../../../src/extension.js";
 import { CodexLanguageModelProvider } from "../../../src/providers/codex-provider.js";
@@ -581,6 +582,66 @@ async function chatGptCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<v
   }
 }
 
+async function localCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<void> {
+  const localModel: CodexModel = {
+    id: "local-codex",
+    name: "Local Codex",
+    family: "codex",
+    version: "1",
+    maxInputTokens: 1_000,
+    maxOutputTokens: 500,
+    capabilities: { imageInput: false, toolCalling: true, parallelToolCalls: false },
+  };
+  const providerCache = new ModelCache(300_000);
+  const transportCache = new ModelCache(300_000);
+  const provider = new CodexLanguageModelProvider({
+    listModels: async () => [localModel],
+    generate: async function* (): AsyncIterable<TransportEvent> {
+      yield { type: "completed" };
+    },
+    dispose: async () => undefined,
+  }, "local-test", { modelCache: providerCache });
+  const forceRefreshCalls: Array<boolean | undefined> = [];
+  type LocalModelSession = {
+    listModels(forceRefresh?: boolean): Promise<readonly CodexModel[]>;
+  };
+  const session: LocalModelSession = {
+    listModels: async (forceRefresh?: boolean): Promise<readonly CodexModel[]> => {
+      forceRefreshCalls.push(forceRefresh);
+      return [localModel];
+    },
+  };
+  const services = createLocalModelCatalogServices(
+    provider,
+    session,
+    providerCache,
+    transportCache,
+  );
+  let changeEvents = 0;
+  const subscription = provider.onDidChangeLanguageModelChatInformation?.(() => {
+    changeEvents += 1;
+  });
+
+  try {
+    await providerCache.get(async () => [localModel]);
+    await transportCache.get(async () => [localModel]);
+    assert.equal(await services.refresh(), 1);
+    assert.deepEqual(forceRefreshCalls, [true]);
+    assert.equal(providerCache.snapshot(), undefined);
+    assert.equal(transportCache.snapshot(), undefined);
+    assert.equal(changeEvents, 1);
+
+    await providerCache.get(async () => [localModel]);
+    await transportCache.get(async () => [localModel]);
+    services.clear();
+    assert.equal(providerCache.snapshot(), undefined);
+    assert.equal(transportCache.snapshot(), undefined);
+    assert.equal(changeEvents, 2);
+  } finally {
+    subscription?.dispose();
+  }
+}
+
 async function persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot(): Promise<void> {
   const restoredModel: CodexModel = {
     id: "gpt-restored",
@@ -782,6 +843,7 @@ export async function runCommandTests(): Promise<void> {
     ["SAP proxy bypass reads only user-level no-proxy entries", sapProxyBypassReadsOnlyUserLevelNoProxyEntries],
     ["authentication refreshes models before reporting success", authenticationRefreshesModelsBeforeReportingSuccess],
     ["ChatGPT catalog services refresh and notify as one operation", chatGptCatalogServicesRefreshAndNotifyAsOneOperation],
+    ["Local catalog services refresh and notify as one operation", localCatalogServicesRefreshAndNotifyAsOneOperation],
     ["persisted ChatGPT catalog restore uses shared discovery and notifies Copilot", persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot],
     ["persisted ChatGPT catalog restores only when a session exists", restoresPersistedCatalogOnlyWhenSessionExists],
     ["persisted ChatGPT catalog restore failure is recorded without rejecting activation", recordsPersistedCatalogRestoreFailureWithoutRejectingActivation],

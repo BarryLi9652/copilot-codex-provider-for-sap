@@ -63,6 +63,26 @@ export const createChatGptModelCatalogServices = (
   };
 };
 
+export const createLocalModelCatalogServices = (
+  provider: CodexLanguageModelProvider,
+  session: Pick<AppServerSession, "listModels">,
+  providerCache: ModelCache,
+  transportCache: ModelCache,
+) => ({
+  refresh: async (): Promise<number> => {
+    providerCache.clear();
+    transportCache.clear();
+    const models = await session.listModels(true);
+    provider.invalidateModelInformation();
+    return models.length;
+  },
+  clear: (): void => {
+    providerCache.clear();
+    transportCache.clear();
+    provider.invalidateModelInformation();
+  },
+});
+
 export const restorePersistedChatGptModelCatalog = async (options: {
   loadSession(): Promise<unknown | undefined>;
   restore(): Promise<unknown>;
@@ -208,6 +228,12 @@ export function activate(context: vscode.ExtensionContext): void {
     LOCAL_VENDOR_ID,
     { sapContextProvider, modelCache: localProviderCache },
   );
+  const localModelCatalog = createLocalModelCatalogServices(
+    localProvider,
+    localSession,
+    localProviderCache,
+    localModelCache,
+  );
   const proxySetup = createProxySetupServices({
     getProxyUrl: () => configuration.get<string>("chatgpt.proxyUrl", ""),
     setProxyUrl: async (value) => {
@@ -320,18 +346,12 @@ export function activate(context: vscode.ExtensionContext): void {
         appServerAccountType = undefined;
       },
       refreshModels: async () => {
-        localProviderCache.clear();
-        localModelCache.clear();
-        await localSession.initialize();
-        const models = await localSession.listModels();
+        const modelCount = await localModelCatalog.refresh();
         const account = await localSession.readAccount();
         appServerAccountType = account.type;
-        return models.length;
+        return modelCount;
       },
-      clearModels: () => {
-        localProviderCache.clear();
-        localModelCache.clear();
-      },
+      clearModels: () => localModelCatalog.clear(),
     },
     continuations: { clear: () => continuationRegistry.dispose() },
     diagnostics: {

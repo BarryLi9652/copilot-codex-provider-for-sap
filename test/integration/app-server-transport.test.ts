@@ -373,10 +373,18 @@ class FakeLease implements AppServerTransportLease {
 }
 
 class FakeSession implements AppServerTransportSession {
+  public readonly modelForceRefreshCalls: Array<boolean | undefined> = [];
+  public models: readonly CodexModel[] = [model];
+  public modelFailure: unknown;
+
   public constructor(public readonly client: FakeAppServerClient) {}
 
-  public listModels(): Promise<readonly CodexModel[]> {
-    return Promise.resolve([model]);
+  public listModels(forceRefresh?: boolean): Promise<readonly CodexModel[]> {
+    this.modelForceRefreshCalls.push(forceRefresh);
+    if (this.modelFailure !== undefined) {
+      return Promise.reject(this.modelFailure);
+    }
+    return Promise.resolve(this.models);
   }
 
   public acquireTransportLease(): Promise<AppServerTransportLease> {
@@ -387,6 +395,33 @@ class FakeSession implements AppServerTransportSession {
     return Promise.resolve();
   }
 }
+
+test("forwards force refresh and hides only recoverable silent Local availability failures", async () => {
+  const session = new FakeSession(new FakeAppServerClient());
+  const transport = new AppServerTransport(session);
+  const signal = new AbortController().signal;
+
+  assert.deepEqual(await transport.listModels({ silent: false }, signal), [model]);
+  assert.deepEqual(
+    await transport.listModels({ silent: false, forceRefresh: true }, signal),
+    [model],
+  );
+  assert.deepEqual(session.modelForceRefreshCalls, [false, true]);
+
+  session.modelFailure = new CodexError("process", { action: "startCodex" });
+  assert.deepEqual(await transport.listModels({ silent: true }, signal), []);
+  await assert.rejects(
+    transport.listModels({ silent: false }, signal),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+
+  session.modelFailure = new CodexError("protocol", { action: "model/list" });
+  await assert.rejects(
+    transport.listModels({ silent: true }, signal),
+    (error: unknown) => error instanceof CodexError && error.code === "protocol",
+  );
+  await transport.dispose();
+});
 
 async function collect(iterable: AsyncIterable<TransportEvent>): Promise<TransportEvent[]> {
   const events: TransportEvent[] = [];

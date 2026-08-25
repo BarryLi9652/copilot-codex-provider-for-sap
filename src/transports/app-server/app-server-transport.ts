@@ -297,14 +297,28 @@ export class AppServerTransport implements CodexTransport {
   }
 
   public async listModels(
-    _options: { silent: boolean; forceRefresh?: boolean },
+    options: { silent: boolean; forceRefresh?: boolean },
     signal: AbortSignal,
   ): Promise<readonly CodexModel[]> {
     this.throwIfDisposed();
     if (signal.aborted) {
       throw cancellationError();
     }
-    const models = await this.session.listModels();
+    let models: readonly CodexModel[];
+    try {
+      models = await this.session.listModels(options.forceRefresh === true);
+    } catch (error) {
+      if (
+        options.silent
+        && error instanceof CodexError
+        && (error.code === "process"
+          || error.code === "authRequired"
+          || error.code === "incompatible")
+      ) {
+        return [];
+      }
+      throw error;
+    }
     if (signal.aborted) {
       throw cancellationError();
     }

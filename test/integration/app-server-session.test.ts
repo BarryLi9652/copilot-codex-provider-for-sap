@@ -320,6 +320,30 @@ test("initializes once, sends initialized, probes dynamic tools, reads account, 
   await session.dispose();
 });
 
+test("force-refreshing models bypasses the current App Server catalog cache", async () => {
+  const supervisor = new FakeAppServerSupervisor();
+  const client = supervisor.clients[0] as FakeAppServerClient;
+  const session = new AppServerSession(supervisor, { extensionVersion: "0.1.0" });
+
+  assert.equal((await session.listModels())[0]?.id, "fake-codex");
+  client.modelCatalog = {
+    models: [{
+      ...modelList.models[0],
+      id: "refreshed-codex",
+      displayName: "Refreshed Codex",
+    }],
+  };
+  assert.equal((await session.listModels())[0]?.id, "fake-codex");
+
+  const listModels = session.listModels.bind(session) as (
+    forceRefresh?: boolean,
+  ) => Promise<readonly { id: string }[]>;
+  assert.equal((await listModels(true))[0]?.id, "refreshed-codex");
+  assert.equal(client.modelListCalls, 2);
+
+  await session.dispose();
+});
+
 test("rejects API-key-only accounts and reports the exact client generation on initialization failure", async () => {
   const supervisor = new FakeAppServerSupervisor();
   const client = supervisor.clients[0] as FakeAppServerClient;

@@ -22,7 +22,7 @@ const join = (directory: string, filename: string, platform: NodeJS.Platform): s
   platform === "win32" ? path.win32.join(directory, filename) : path.posix.join(directory, filename);
 
 const candidateNames = (platform: NodeJS.Platform): readonly string[] =>
-  platform === "win32" ? ["codex.exe", "codex"] : ["codex"];
+  platform === "win32" ? ["codex.exe"] : ["codex"];
 
 const pathDelimiter = (platform: NodeJS.Platform): string =>
   platform === "win32" ? ";" : ":";

@@ -153,7 +153,7 @@ export interface AppServerTransportLease {
 
 export interface AppServerTransportSession {
   acquireTransportLease(): Promise<AppServerTransportLease>;
-  listModels(): Promise<readonly CodexModel[]>;
+  listModels(forceRefresh?: boolean): Promise<readonly CodexModel[]>;
   dispose(): Promise<void>;
 }
 
@@ -316,7 +316,10 @@ export class AppServerSession {
     return this.readAccountInternal();
   }
 
-  public listModels(): Promise<readonly CodexModel[]> {
+  public listModels(forceRefresh = false): Promise<readonly CodexModel[]> {
+    if (forceRefresh) {
+      this.modelCache.clear();
+    }
     return this.listModelsInternal();
   }
 
