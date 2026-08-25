@@ -47,10 +47,10 @@ test("manifest contributes model-default ChatGPT reasoning and speed overrides",
     enum: ["modelDefault", "fast"],
     enumDescriptions: [
       "Use the ChatGPT backend's default service tier.",
-      "Request Fast service when the account and selected model support it.",
+      "Request Fast service through the ChatGPT priority tier when the account and selected model support it.",
     ],
     default: "modelDefault",
-    description: "ChatGPT OAuth response speed. Applied to new requests without reloading VS Code.",
+    description: "ChatGPT OAuth response speed. Fast maps to the ChatGPT priority service tier and applies to new requests without reloading VS Code.",
   });
 });
 
@@ -63,7 +63,7 @@ test("manifest exposes one Codex Copilot Manager command", async () => {
   }]);
 });
 
-test("release metadata uses the new Marketplace identity and names the 0.1.8 VSIX consistently", async () => {
+test("release metadata uses the new Marketplace identity and names the 0.1.9 VSIX consistently", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8"));
   const lockfile = JSON.parse(await readFile("package-lock.json", "utf8"));
 
@@ -71,12 +71,12 @@ test("release metadata uses the new Marketplace identity and names the 0.1.8 VSI
   assert.equal(manifest.displayName, "Codex Copilot Manager for SAP");
   assert.equal(lockfile.name, "codex-copilot-provider-for-sap");
   assert.equal(lockfile.packages[""].name, "codex-copilot-provider-for-sap");
-  assert.equal(manifest.version, "0.1.8");
-  assert.equal(lockfile.version, "0.1.8");
-  assert.equal(lockfile.packages[""].version, "0.1.8");
+  assert.equal(manifest.version, "0.1.9");
+  assert.equal(lockfile.version, "0.1.9");
+  assert.equal(lockfile.packages[""].version, "0.1.9");
   assert.match(
     manifest.scripts["package:vsix"],
-    /dist\/codex-copilot-provider-for-sap-0\.1\.8\.vsix$/,
+    /dist\/codex-copilot-provider-for-sap-0\.1\.9\.vsix$/,
   );
 });
 

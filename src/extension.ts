@@ -8,6 +8,7 @@ import {
 import {
   createCommandServices,
   createProxySetupServices,
+  createSapProxyBypassServices,
   registerCommands,
   type CommandDependencies,
   type CommandUi,
@@ -37,6 +38,10 @@ import {
 export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] & {
   restore(): Promise<number>;
 };
+
+export const readGlobalNoProxyHosts = (configuration: {
+  inspect<T>(section: string): { globalValue?: T } | undefined;
+}): readonly string[] => configuration.inspect<readonly string[]>("noProxy")?.globalValue ?? [];
 
 export const createChatGptModelCatalogServices = (
   provider: CodexLanguageModelProvider,
@@ -100,6 +105,7 @@ const MANAGER_QUICK_PICK_ITEMS: readonly ManagerQuickPickItem[] = [
   { label: "$(sign-out) Sign Out ChatGPT", action: "copilotCodex.chatgpt.signOut" },
   { label: "$(refresh) Refresh ChatGPT Models", action: "copilotCodex.chatgpt.refreshModels" },
   { label: "$(globe) Configure ChatGPT Proxy", action: "configureProxy" },
+  { label: "$(shield) Configure SAP Proxy Bypass", action: "configureSapProxyBypass" },
   { label: "Local Codex", kind: vscode.QuickPickItemKind.Separator },
   { label: "$(file-binary) Select Local Codex Executable", action: "copilotCodex.local.selectExecutable" },
   { label: "$(play) Start Local Codex", action: "copilotCodex.local.start" },
@@ -135,6 +141,7 @@ const PROXY_SETUP_QUICK_PICK_ITEMS: readonly ProxySetupQuickPickItem[] = [
 
 export function activate(context: vscode.ExtensionContext): void {
   const configuration = vscode.workspace.getConfiguration("copilotCodex");
+  const httpConfiguration = vscode.workspace.getConfiguration("http");
   const requestTimeoutMs = secondsToMs(configuration.get("requestTimeoutSeconds", 600), 10);
   const toolTimeoutMs = secondsToMs(configuration.get("toolTimeoutSeconds", 300), 30);
   const catalogCacheMs = minutesToMs(configuration.get("catalogCacheMinutes", 5), 1);
@@ -246,6 +253,32 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     },
   });
+  const sapProxyBypass = createSapProxyBypassServices({
+    getNoProxyHosts: () => readGlobalNoProxyHosts(httpConfiguration),
+    setNoProxyHosts: async (value) => {
+      await httpConfiguration.update(
+        "noProxy",
+        value,
+        vscode.ConfigurationTarget.Global,
+      );
+    },
+  }, {
+    promptNoProxyHosts: async (defaultValue) => vscode.window.showInputBox({
+      title: "SAP Proxy Bypass Hosts",
+      prompt: "Enter SAP hostnames or IP addresses separated by commas or new lines.",
+      value: defaultValue,
+      ignoreFocusOut: true,
+    }),
+    showReloadRequired: async () => {
+      const selected = await vscode.window.showInformationMessage(
+        "SAP hosts were added to VS Code http.noProxy. Reload VS Code to apply the shared proxy bypass.",
+        "Reload Now",
+      );
+      if (selected === "Reload Now") {
+        await vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    },
+  });
 
   let appServerAccountType: "chatgpt" | "personalAccessToken" | undefined;
   const cacheSnapshot = (
@@ -259,6 +292,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const dependencies: CommandDependencies = {
     proxySetup,
+    sapProxyBypass,
     oauth: {
       signIn: (openExternal) => oauthManager.signIn(openExternal),
       completeManualCallback: (url) => oauthManager.completeManualCallback(url),

@@ -12,7 +12,7 @@ export type ChatGptReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh
 
 export interface ChatGptRequestOverrides {
   reasoningEffort?: ChatGptReasoningEffort;
-  serviceTier?: "fast";
+  serviceTier?: "priority";
 }
 
 const CHATGPT_REASONING_EFFORTS = new Set<unknown>([
@@ -32,7 +32,7 @@ export function resolveChatGptRequestOverrides(
     ...(CHATGPT_REASONING_EFFORTS.has(reasoningEffort)
       ? { reasoningEffort: reasoningEffort as ChatGptReasoningEffort }
       : {}),
-    ...(speedMode === "fast" ? { serviceTier: "fast" as const } : {}),
+    ...(speedMode === "fast" ? { serviceTier: "priority" as const } : {}),
   };
 }
 

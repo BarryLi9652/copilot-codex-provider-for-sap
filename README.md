@@ -27,12 +27,12 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/codex-copilot-provider-for-sap-0.1.8.vsix`。
+1. 构建或取得 `dist/codex-copilot-provider-for-sap-0.1.9.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
 
 ```powershell
-code --install-extension .\dist\codex-copilot-provider-for-sap-0.1.8.vsix
+code --install-extension .\dist\codex-copilot-provider-for-sap-0.1.9.vsix
 ```
 
 ## 快速开始
@@ -43,7 +43,7 @@ code --install-extension .\dist\codex-copilot-provider-for-sap-0.1.8.vsix
 4. 打开 GitHub Copilot Chat，在模型选择器中选择 `Codex · ChatGPT OAuth` 或 `Codex · Local CLI` 下的具体模型。
 5. 如需调整思考深度或 Fast 服务，在 Manager 中选择 `Open Settings`，修改 ChatGPT OAuth 设置；新设置从下一轮请求开始生效，无需重载。
 
-Manager 还提供 ChatGPT 退出、Local Codex 重启/停止、诊断和扩展数据清理。底层命令 ID 继续注册用于兼容，但不会占满命令面板。
+Manager 还提供 ChatGPT 退出、Local Codex 重启/停止、SAP 代理绕过、诊断和扩展数据清理。底层命令 ID 继续注册用于兼容，但不会占满命令面板。
 
 ## ChatGPT OAuth route
 
@@ -67,19 +67,28 @@ Clash/Mihomo 使用 HTTP 或 Mixed 端口时，常见用户设置如下；端口
 
 ```jsonc
 {
-  "copilotCodex.chatgpt.proxyUrl": "http://127.0.0.1:7897"
+  "copilotCodex.chatgpt.proxyUrl": "http://127.0.0.1:7897",
+  "http.noProxy": [
+    "localhost",
+    "127.0.0.1",
+    "<sap-host>",
+    "<sap-ip>"
+  ]
 }
 ```
 
-保存后需要重载 VS Code。扩展不会自动修改 Windows 系统代理、VS Code 全局 `http.proxy`、环境变量、`NO_PROXY`、ABAP FS 连接或 SAP ADT 连接。
+`http.noProxy` 是 VS Code 的共享代理绕过设置。也可以在 Manager 选择 `Configure SAP Proxy Bypass`，输入逗号或换行分隔的 SAP 主机名/IP；扩展只会把新值合并到用户级 `http.noProxy`，保留并去重已有条目，然后提示重载。
+
+扩展不会自动修改 Windows 系统代理、VS Code 全局 `http.proxy`、环境变量、`NO_PROXY`、ABAP FS 连接或 SAP ADT 连接。只有用户明确执行 `Configure SAP Proxy Bypass` 时才更新 `http.noProxy`。
 
 ChatGPT 专用代理与 SAP 的边界：
 
 - `copilotCodex.chatgpt.proxyUrl` 仅注入 ChatGPT OAuth route，显式配置时优先于继承的环境代理。
 - Local CLI route 不读取该设置；它使用 Codex CLI/App Server 自身的网络环境。
-- ABAP FS 和 SAP ADT 不读取该设置。若开启 Windows/VS Code 全局代理或共享的环境代理，它们仍可能被全局代理影响。
-- 如果启用环境代理，应将 SAP 主机名/IP 加入 `NO_PROXY`，例如 `localhost,127.0.0.1,::1,<sap-host>,<sap-ip>`；不要在仓库或诊断中提交真实 SAP authority。
+- ABAP FS 和 SAP ADT 不读取 `copilotCodex.chatgpt.proxyUrl`。VS Code `http.noProxy` 可覆盖遵循 VS Code 共享代理层的请求，但不能保证覆盖它们启动的全部 Node/Java 子进程。
+- 如果启用环境代理，应同时将 SAP 主机名/IP 加入系统/启动环境的 `NO_PROXY`，例如 `localhost,127.0.0.1,::1,<sap-host>,<sap-ip>`；SAP ADT 的独立 Java 进程还可能需要组织网络或 JVM 级绕过配置。不要在仓库或诊断中提交真实 SAP authority。
 - 如果开启系统代理后 `adt://`、KIC 或 SAP 登录失败，优先关闭全局代理或补充 `NO_PROXY`，同时保留 ChatGPT 专用代理。
+- Clash/Mihomo 必须将相同 SAP 主机配置为 `DIRECT`；`http.noProxy` 不会自动改写 Clash/Mihomo 规则或 Windows 系统代理绕过列表。
 - 不要使用 `NODE_TLS_REJECT_UNAUTHORIZED=0` 解决代理或证书问题；它不会修复路由，并会禁用 TLS 证书校验。
 
 ## Local Codex CLI route
@@ -111,15 +120,16 @@ V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机
 |---|---:|---|
 | `copilotCodex.local.codexPath` | 空 | Local Codex executable 的绝对路径 |
 | `copilotCodex.chatgpt.proxyUrl` | 空 | 仅用于 ChatGPT 登录令牌、模型发现和回复请求的 HTTP(S) 代理；修改后需重载 VS Code |
+| `http.noProxy`（VS Code 内置） | 空数组 | VS Code 共享代理绕过主机；可通过 Manager 的 `Configure SAP Proxy Bypass` 合并配置，修改后需重载 |
 | `copilotCodex.chatgpt.reasoningEffort` | modelDefault | ChatGPT OAuth 思考深度：`modelDefault`、`none`、`low`、`medium`、`high`、`xhigh` 或 `max`；下一轮请求立即生效 |
-| `copilotCodex.chatgpt.speedMode` | modelDefault | ChatGPT OAuth 服务速度：`modelDefault` 或 `fast`；Fast 需要账号和模型支持，下一轮请求立即生效 |
+| `copilotCodex.chatgpt.speedMode` | modelDefault | ChatGPT OAuth 服务速度：`modelDefault` 或 `fast`；Fast 在私有后端请求中映射为 `priority` service tier，需要账号和模型支持，下一轮请求立即生效 |
 | `copilotCodex.requestTimeoutSeconds` | 600 | HTTP/RPC 请求超时，最小 10 秒 |
 | `copilotCodex.toolTimeoutSeconds` | 300 | Copilot 工具 continuation 超时，最小 30 秒 |
 | `copilotCodex.catalogCacheMinutes` | 5 | 每条 route 独立模型目录缓存时间 |
 | `copilotCodex.sapSelectionMaxChars` | 16000 | 活动选区最大字符数 |
 | `copilotCodex.logLevel` | info | `error`、`warn`、`info` 或 `debug` |
 
-`modelDefault` 表示扩展不发送对应覆盖字段，由所选模型和 ChatGPT 后端决定默认值。显式设置 reasoning 或 Fast 后，扩展会按设置发送，不会静默替换为其他级别。两个设置只作用于 ChatGPT OAuth route，不改变 Local CLI。
+`modelDefault` 表示扩展不发送对应覆盖字段，由所选模型和 ChatGPT 后端决定默认值。用户设置仍使用 `fast`；扩展仅在协议层将其编码为私有后端接受的 `service_tier: priority`，这不会改变界面设置。两个设置只作用于 ChatGPT OAuth route，不改变 Local CLI。
 
 没有 endpoint、token、Cookie、ADT token、App Server args 或 shell command 设置。
 
