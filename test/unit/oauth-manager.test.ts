@@ -30,6 +30,20 @@ const waitForCondition = async (
   throw new Error(`Timed out waiting for ${description}.`);
 };
 
+const outcomeWithin = async <T>(
+  promise: Promise<T>,
+  milliseconds = 100,
+): Promise<{ status: "resolved"; value: T } | { status: "rejected"; error: unknown } | { status: "waiting" }> =>
+  Promise.race([
+    promise.then(
+      (value) => ({ status: "resolved" as const, value }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    ),
+    new Promise<{ status: "waiting" }>((resolve) => {
+      setTimeout(() => resolve({ status: "waiting" }), milliseconds);
+    }),
+  ]);
+
 class MemorySecretStore implements SecretStore {
   public value: string | undefined;
   public readonly keys: string[] = [];
@@ -331,6 +345,230 @@ test("forced refresh shares one request for concurrent callers", async () => {
   assert.equal(refreshCalls, 1);
 });
 
+test("one cancelled waiter does not abort a refresh shared by another caller", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  let refreshCalls = 0;
+  let refreshSignal: AbortSignal | undefined;
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const fetch: OAuthFetch = async (_url, init) => {
+    refreshCalls += 1;
+    refreshSignal = (init as { signal?: AbortSignal } | undefined)?.signal;
+    await refreshReleased;
+    return response({ access_token: "access-shared", expires_in: 3_600 });
+  };
+  const manager = new OAuthManager(secrets, { fetch, now: () => 1_000 });
+  const getAccessToken = manager.getAccessToken.bind(manager) as (
+    forceRefresh: boolean,
+    signal: AbortSignal,
+  ) => Promise<{ token: string }>;
+  const first = getAccessToken(true, firstController.signal);
+  const second = getAccessToken(true, secondController.signal);
+
+  try {
+    await waitForCondition(() => refreshCalls === 1, "one shared refresh request");
+    firstController.abort();
+    const firstOutcome = await outcomeWithin(first);
+    assert.equal(firstOutcome.status, "rejected");
+    if (firstOutcome.status === "rejected") {
+      assert.ok(firstOutcome.error instanceof OAuthError);
+      assert.equal(firstOutcome.error.code as string, "token_request_cancelled");
+    }
+    assert.equal(refreshSignal?.aborted, false);
+
+    releaseRefresh();
+    assert.deepEqual(await second, { token: "access-shared" });
+    assert.equal(refreshCalls, 1);
+  } finally {
+    releaseRefresh();
+    await Promise.allSettled([first, second]);
+  }
+});
+
+test("cancelling the last refresh waiter aborts the token request", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  const caller = new AbortController();
+  let refreshSignal: AbortSignal | undefined;
+  const fetch: OAuthFetch = async (_url, init) => {
+    refreshSignal = init?.signal;
+    return new Promise<OAuthHttpResponse>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const manager = new OAuthManager(secrets, { fetch, now: () => 1_000 });
+  const refresh = manager.getAccessToken(true, caller.signal);
+  await waitForCondition(() => refreshSignal !== undefined, "refresh token signal");
+
+  caller.abort();
+  await assert.rejects(
+    refresh,
+    (error: unknown) => error instanceof OAuthError
+      && (error.code as string) === "token_request_cancelled",
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(refreshSignal?.aborted, true);
+});
+
+test("refresh timeout aborts one flight and a later retry remains single-flight", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  let refreshCalls = 0;
+  let firstSignal: AbortSignal | undefined;
+  let releaseFirst!: () => void;
+  const firstReleased = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let releaseLater!: () => void;
+  const laterReleased = new Promise<void>((resolve) => {
+    releaseLater = resolve;
+  });
+  const fetch: OAuthFetch = async (_url, init) => {
+    refreshCalls += 1;
+    if (refreshCalls === 1) {
+      firstSignal = init?.signal;
+      return new Promise<OAuthHttpResponse>((resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+        void firstReleased.then(() => {
+          resolve(response({ access_token: "released-first", expires_in: 3_600 }));
+        });
+      });
+    }
+    await laterReleased;
+    return response({ access_token: "access-after-timeout", expires_in: 3_600 });
+  };
+  const managerOptions = { fetch, now: () => 1_000, tokenTimeoutMs: 20 };
+  const manager = new OAuthManager(secrets, managerOptions);
+  const first = manager.getAccessToken(true);
+
+  try {
+    const firstOutcome = await outcomeWithin(first);
+    assert.equal(firstOutcome.status, "rejected");
+    if (firstOutcome.status === "rejected") {
+      assert.ok(firstOutcome.error instanceof OAuthError);
+      assert.equal(firstOutcome.error.code as string, "token_request_timeout");
+    }
+    assert.equal(firstSignal?.aborted, true);
+
+    const retryA = manager.getAccessToken(true);
+    const retryB = manager.getAccessToken(true);
+    await waitForCondition(() => refreshCalls === 2, "one later refresh request");
+    releaseLater();
+    assert.deepEqual(await Promise.all([retryA, retryB]), [
+      { token: "access-after-timeout" },
+      { token: "access-after-timeout" },
+    ]);
+    assert.equal(refreshCalls, 2);
+  } finally {
+    releaseFirst();
+    releaseLater();
+    await Promise.allSettled([first]);
+  }
+});
+
+test("sign-out aborts an active authorization-code token exchange", async () => {
+  const secrets = new MemorySecretStore();
+  const loopback = new FakeLoopbackServer();
+  let authorizeUrl = "";
+  let tokenSignal: AbortSignal | undefined;
+  let releaseToken!: () => void;
+  const tokenReleased = new Promise<void>((resolve) => {
+    releaseToken = resolve;
+  });
+  const fetch: OAuthFetch = async (_url, init) => {
+    tokenSignal = init?.signal;
+    return new Promise<OAuthHttpResponse>((resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+      void tokenReleased.then(() => {
+        resolve(response({ access_token: "late", refresh_token: "late" }));
+      });
+    });
+  };
+  const manager = new OAuthManager(secrets, { fetch, loopbackServer: loopback });
+  const signIn = manager.signIn(async (url) => {
+    authorizeUrl = url;
+    return true;
+  });
+  const signInOutcome = signIn.then(
+    (value) => ({ status: "resolved" as const, value }),
+    (error: unknown) => ({ status: "rejected" as const, error }),
+  );
+
+  await waitForCondition(() => authorizeUrl.length > 0, "authorize URL");
+  const state = new URL(authorizeUrl).searchParams.get("state");
+  assert.ok(state);
+  const callback = manager.completeManualCallback(
+    `http://localhost:1455/auth/callback?code=code&state=${encodeURIComponent(state)}`,
+  );
+  const callbackOutcome = outcomeWithin(callback);
+
+  try {
+    await waitForCondition(() => tokenSignal !== undefined, "authorization token signal");
+    await manager.signOut();
+    assert.equal(tokenSignal?.aborted, true);
+    assert.equal((await callbackOutcome).status, "rejected");
+    assert.equal((await signInOutcome).status, "rejected");
+    assert.equal(secrets.value, undefined);
+  } finally {
+    releaseToken();
+    await Promise.allSettled([signIn, callback]);
+  }
+});
+
+test("sign-out aborts an active shared refresh flight", async () => {
+  const secrets = new MemorySecretStore();
+  secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
+  let refreshSignal: AbortSignal | undefined;
+  let releaseRefresh!: () => void;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const fetch: OAuthFetch = async (_url, init) => {
+    refreshSignal = init?.signal;
+    return new Promise<OAuthHttpResponse>((resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+      void refreshReleased.then(() => {
+        resolve(response({ access_token: "late", expires_in: 3_600 }));
+      });
+    });
+  };
+  const manager = new OAuthManager(secrets, { fetch, now: () => 1_000 });
+  const refresh = manager.getAccessToken(true);
+  const refreshOutcome = outcomeWithin(refresh);
+
+  try {
+    await waitForCondition(() => refreshSignal !== undefined, "shared refresh signal");
+    await manager.signOut();
+    assert.equal(refreshSignal?.aborted, true);
+    assert.equal((await refreshOutcome).status, "rejected");
+    assert.equal(secrets.value, undefined);
+  } finally {
+    releaseRefresh();
+    await Promise.allSettled([refresh]);
+  }
+});
+
 test("a new sign-in prevents an old refresh success from replacing the new account", async () => {
   const secrets = new MemorySecretStore();
   secrets.value = JSON.stringify(session({ expiresAt: 1_030 }));
@@ -342,10 +580,12 @@ test("a new sign-in prevents an old refresh success from replacing the new accou
   const refreshReleased = new Promise<void>((resolve) => {
     releaseRefresh = resolve;
   });
+  let refreshSignal: AbortSignal | undefined;
   const loopback = new FakeLoopbackServer();
   const fetch: OAuthFetch = async (_url, init) => {
     const fields = new URLSearchParams(String(init?.body));
     if (fields.get("grant_type") === "refresh_token") {
+      refreshSignal = init?.signal;
       refreshStarted();
       await refreshReleased;
       return response({ access_token: "access-account-a", expires_in: 3_600 });
@@ -363,17 +603,23 @@ test("a new sign-in prevents an old refresh success from replacing the new accou
   });
 
   const staleRefresh = manager.getAccessToken();
+  const staleOutcome = staleRefresh.then(
+    (value) => ({ status: "resolved" as const, value }),
+    (error: unknown) => ({ status: "rejected" as const, error }),
+  );
   await refreshStartedSignal;
   const accountB = await completeManualSignIn(manager, "account-b-code");
   assert.equal(accountB.accessToken, "access-account-b");
   assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
+  assert.equal(refreshSignal?.aborted, true);
 
   releaseRefresh();
-  await assert.rejects(
-    staleRefresh,
-    (error: unknown) =>
-      error instanceof OAuthError && error.code === "callback_closed",
-  );
+  const staleResult = await staleOutcome;
+  assert.equal(staleResult.status, "rejected");
+  if (staleResult.status === "rejected") {
+    assert.ok(staleResult.error instanceof OAuthError);
+    assert.equal(staleResult.error.code, "callback_closed");
+  }
   assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
   assert.deepEqual(await manager.getAccessToken(), { token: "access-account-b" });
 });
@@ -410,17 +656,22 @@ test("a new sign-in prevents an old invalid_grant from clearing the new account"
   });
 
   const staleRefresh = manager.getAccessToken();
+  const staleOutcome = staleRefresh.then(
+    (value) => ({ status: "resolved" as const, value }),
+    (error: unknown) => ({ status: "rejected" as const, error }),
+  );
   await refreshStartedSignal;
   const accountB = await completeManualSignIn(manager, "account-b-code");
   assert.equal(accountB.accessToken, "access-account-b");
   assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
 
   releaseRefresh();
-  await assert.rejects(
-    staleRefresh,
-    (error: unknown) =>
-      error instanceof OAuthError && error.code === "callback_closed",
-  );
+  const staleResult = await staleOutcome;
+  assert.equal(staleResult.status, "rejected");
+  if (staleResult.status === "rejected") {
+    assert.ok(staleResult.error instanceof OAuthError);
+    assert.equal(staleResult.error.code, "callback_closed");
+  }
   assert.deepEqual(JSON.parse(secrets.value ?? "null"), accountB);
   assert.deepEqual(await manager.getAccessToken(), { token: "access-account-b" });
 });

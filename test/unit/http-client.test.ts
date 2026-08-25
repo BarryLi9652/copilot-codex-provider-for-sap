@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { CodexError } from "../../src/core/errors.js";
 import {
   ChatGptHttpClient,
   type ChatGptFetch,
   type ChatGptHttpResponse,
 } from "../../src/transports/chatgpt-oauth/http-client.js";
+import { OAuthError } from "../../src/transports/chatgpt-oauth/oauth-manager.js";
 
 test("a pending request timeout does not keep the Node event loop alive", async () => {
   const nativeSetTimeout = globalThis.setTimeout;
@@ -50,4 +52,40 @@ test("a pending request timeout does not keep the Node event loop alive", async 
       await Promise.allSettled([pending]);
     }
   }
+});
+
+test("maps an OAuth token timeout to a typed request timeout", async () => {
+  const client = new ChatGptHttpClient({
+    getAccessToken: async () => {
+      throw new OAuthError(
+        "token_request_timeout",
+        "The ChatGPT OAuth token request timed out.",
+      );
+    },
+  }, {
+    fetch: async () => assert.fail("model request must not start without a token"),
+  });
+
+  await assert.rejects(
+    client.getModels(new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "timeout",
+  );
+});
+
+test("maps an OAuth token cancellation to a typed request cancellation", async () => {
+  const client = new ChatGptHttpClient({
+    getAccessToken: async () => {
+      throw new OAuthError(
+        "token_request_cancelled",
+        "The ChatGPT OAuth token request was cancelled.",
+      );
+    },
+  }, {
+    fetch: async () => assert.fail("model request must not start without a token"),
+  });
+
+  await assert.rejects(
+    client.getModels(new AbortController().signal),
+    (error: unknown) => error instanceof CodexError && error.code === "cancelled",
+  );
 });
