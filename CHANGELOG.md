@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9 — 2026-08-24
+
+- Fixed ChatGPT OAuth Fast mode by encoding the user-facing `fast` choice as the private backend's `service_tier: priority` value while continuing to omit the field for `modelDefault`.
+- Added `Configure SAP Proxy Bypass` to the Manager; it explicitly merges SAP hosts into the VS Code user-level `http.noProxy` list without changing system proxy or process environment variables.
+- Documented the boundary between VS Code `http.noProxy`, inherited `NO_PROXY`, Clash/Mihomo `DIRECT` rules, and independent ABAP FS/SAP ADT child processes.
+
 ## 0.1.8 — 2026-08-24
 
 - Changed the Marketplace package identity to `leonbwang.codex-copilot-provider-for-sap` because the removed original identity is permanently reserved.

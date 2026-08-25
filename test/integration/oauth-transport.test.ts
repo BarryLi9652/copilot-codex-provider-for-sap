@@ -24,6 +24,10 @@ import type {
   ChatGptFetch,
   ChatGptHttpResponse,
 } from "../../src/transports/chatgpt-oauth/http-client.js";
+import {
+  resolveChatGptRequestOverrides,
+  type ChatGptRequestOverrides,
+} from "../../src/transports/chatgpt-oauth/request-codec.js";
 
 const encoder = new TextEncoder();
 
@@ -366,7 +370,7 @@ test("OAuth transport refreshes once before replaying and preserves streamed tex
 });
 
 test("OAuth transport reads ChatGPT request overrides for every new request", async () => {
-  let overrides: Record<string, string> = {};
+  let overrides: ChatGptRequestOverrides = {};
   const responseBodies: Record<string, unknown>[] = [];
   const options = {
     fetch: async (url: string, init: RecordedRequest["init"] = {}) => {
@@ -387,7 +391,7 @@ test("OAuth transport reads ChatGPT request overrides for every new request", as
   for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
     // Exhaust the first response using model defaults.
   }
-  overrides = { reasoningEffort: "high", serviceTier: "fast" };
+  overrides = resolveChatGptRequestOverrides("high", "fast");
   for await (const _event of transport.generate(createRequest(), new AbortController().signal)) {
     // Exhaust the second response using the updated settings.
   }
@@ -395,7 +399,7 @@ test("OAuth transport reads ChatGPT request overrides for every new request", as
   assert.equal("reasoning" in (responseBodies[0] ?? {}), false);
   assert.equal("service_tier" in (responseBodies[0] ?? {}), false);
   assert.deepEqual(responseBodies[1]?.reasoning, { effort: "high" });
-  assert.equal(responseBodies[1]?.service_tier, "fast");
+  assert.equal(responseBodies[1]?.service_tier, "priority");
 });
 
 test("401 body cleanup, forced refresh, and replay all happen before the first yielded event", async () => {

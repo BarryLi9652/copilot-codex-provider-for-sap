@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 
 import * as vscode from "vscode";
 import * as commandModule from "../../../src/commands/register-commands.js";
+import * as extensionModule from "../../../src/extension.js";
 
 import {
   COMMAND_IDS,
   createCommandServices,
+  createSapProxyBypassServices,
   registerCommands,
   type CommandDependencies,
   type CommandServices,
@@ -80,6 +82,7 @@ async function managementServicesPreserveRouteAndClearBoundaries(): Promise<void
       ensureFirstUse: async () => undefined,
       configure: async () => undefined,
     },
+    sapProxyBypass: { configure: async () => undefined },
     oauth: {
       signIn: async (openExternal) => {
         await openExternal("https://auth.example/authorize");
@@ -217,6 +220,7 @@ async function managerRunsFirstUseProxySetupAndAllowsManualReconfiguration(): Pr
       ensureFirstUse: async () => { calls.push("proxy.ensure"); },
       configure: async () => { calls.push("proxy.configure"); },
     },
+    sapProxyBypass: { configure: async () => undefined },
     oauth: {
       signIn: async () => undefined,
       completeManualCallback: async () => undefined,
@@ -352,6 +356,111 @@ async function proxyOnboardingPersistsOnlyExplicitSafeChoices(): Promise<void> {
   ]);
 }
 
+async function managerRoutesSapProxyBypassConfiguration(): Promise<void> {
+  const calls: string[] = [];
+  const dependencies = {
+    proxySetup: {
+      ensureFirstUse: async () => { calls.push("proxy.ensure"); },
+      configure: async () => undefined,
+    },
+    sapProxyBypass: {
+      configure: async () => { calls.push("sapProxy.configure"); },
+    },
+    oauth: {
+      signIn: async () => undefined,
+      completeManualCallback: async () => undefined,
+      signOut: async () => undefined,
+      clearSecret: async () => undefined,
+    },
+    chatgptModels: { refresh: async () => 0, clear: () => undefined },
+    local: {
+      selectExecutable: async () => undefined,
+      start: async () => undefined,
+      restart: async () => undefined,
+      stop: async () => undefined,
+      refreshModels: async () => 0,
+      clearModels: () => undefined,
+    },
+    continuations: { clear: () => undefined },
+    diagnostics: {
+      show: async () => undefined,
+      clear: () => undefined,
+      record: () => { calls.push("diagnostics.record"); },
+    },
+  } satisfies CommandDependencies;
+  const ui = {
+    confirmPrivateSignIn: async () => true,
+    openExternal: async () => true,
+    promptManualCallback: async () => undefined,
+    selectExecutable: async () => undefined,
+    showInformation: async () => undefined,
+    showSafeError: async () => { calls.push("ui.error"); },
+    selectManagerAction: async () => "configureSapProxyBypass" as ManagerActionId,
+    openSettings: async () => undefined,
+  } satisfies CommandUi;
+
+  await createCommandServices(dependencies, ui)["copilotCodex.manager"]();
+
+  assert.deepEqual(calls, ["proxy.ensure", "sapProxy.configure"]);
+}
+
+async function sapProxyBypassMergesHostsWithoutOverwritingExistingEntries(): Promise<void> {
+  let hosts: readonly string[] = ["localhost", "SAP.EXAMPLE.COM", "LOCALHOST"];
+  let entered: string | undefined = "sap.example.com, 10.0.0.15\nkic.internal";
+  const calls: string[] = [];
+  const services = createSapProxyBypassServices({
+    getNoProxyHosts: () => hosts,
+    setNoProxyHosts: async (value) => {
+      hosts = value;
+      calls.push(`store.noProxy:${value.join("|")}`);
+    },
+  }, {
+    promptNoProxyHosts: async (defaultValue) => {
+      calls.push(`ui.prompt:${defaultValue}`);
+      return entered;
+    },
+    showReloadRequired: async () => { calls.push("ui.reload"); },
+  });
+
+  await services.configure();
+  assert.deepEqual(hosts, ["localhost", "SAP.EXAMPLE.COM", "10.0.0.15", "kic.internal"]);
+  assert.deepEqual(calls, [
+    "ui.prompt:localhost, SAP.EXAMPLE.COM",
+    "store.noProxy:localhost|SAP.EXAMPLE.COM|10.0.0.15|kic.internal",
+    "ui.reload",
+  ]);
+
+  calls.length = 0;
+  entered = undefined;
+  await services.configure();
+  assert.deepEqual(hosts, ["localhost", "SAP.EXAMPLE.COM", "10.0.0.15", "kic.internal"]);
+  assert.deepEqual(calls, ["ui.prompt:localhost, SAP.EXAMPLE.COM, 10.0.0.15, kic.internal"]);
+}
+
+function sapProxyBypassReadsOnlyUserLevelNoProxyEntries(): void {
+  type ReadGlobalNoProxyHosts = (configuration: {
+    inspect(section: string): {
+      globalValue?: readonly string[];
+      workspaceValue?: readonly string[];
+      workspaceFolderValue?: readonly string[];
+    } | undefined;
+  }) => readonly string[];
+  const readGlobalNoProxyHosts = (
+    extensionModule as unknown as { readGlobalNoProxyHosts?: ReadGlobalNoProxyHosts }
+  ).readGlobalNoProxyHosts;
+  if (readGlobalNoProxyHosts === undefined) {
+    assert.fail("readGlobalNoProxyHosts is not implemented");
+  }
+
+  assert.deepEqual(readGlobalNoProxyHosts({
+    inspect: () => ({
+      globalValue: ["global.sap.internal"],
+      workspaceValue: ["workspace.sap.internal"],
+      workspaceFolderValue: ["folder.sap.internal"],
+    }),
+  }), ["global.sap.internal"]);
+}
+
 async function authenticationRefreshesModelsBeforeReportingSuccess(): Promise<void> {
   const calls: string[] = [];
   const dependencies: CommandDependencies = {
@@ -359,6 +468,7 @@ async function authenticationRefreshesModelsBeforeReportingSuccess(): Promise<vo
       ensureFirstUse: async () => undefined,
       configure: async () => undefined,
     },
+    sapProxyBypass: { configure: async () => undefined },
     oauth: {
       signIn: async () => { calls.push("oauth.signIn"); },
       completeManualCallback: async () => { calls.push("oauth.manual"); },
@@ -561,7 +671,7 @@ function chatGptRequestOverridesReadCurrentSettingsOnEveryCall(): void {
   values.set("chatgpt.speedMode", "fast");
   assert.deepEqual(resolveOverrides(), {
     reasoningEffort: "high",
-    serviceTier: "fast",
+    serviceTier: "priority",
   });
   values.set("chatgpt.reasoningEffort", "modelDefault");
   values.set("chatgpt.speedMode", "modelDefault");
@@ -666,7 +776,10 @@ export async function runCommandTests(): Promise<void> {
     ["commands register exact independent routes", registersExactCommandsAndRoutesIndependently],
     ["management services preserve route and clear boundaries", managementServicesPreserveRouteAndClearBoundaries],
     ["manager runs first-use proxy setup and allows manual reconfiguration", managerRunsFirstUseProxySetupAndAllowsManualReconfiguration],
+    ["manager routes SAP proxy bypass configuration", managerRoutesSapProxyBypassConfiguration],
     ["proxy onboarding persists only explicit safe choices", proxyOnboardingPersistsOnlyExplicitSafeChoices],
+    ["SAP proxy bypass merges hosts without overwriting existing entries", sapProxyBypassMergesHostsWithoutOverwritingExistingEntries],
+    ["SAP proxy bypass reads only user-level no-proxy entries", sapProxyBypassReadsOnlyUserLevelNoProxyEntries],
     ["authentication refreshes models before reporting success", authenticationRefreshesModelsBeforeReportingSuccess],
     ["ChatGPT catalog services refresh and notify as one operation", chatGptCatalogServicesRefreshAndNotifyAsOneOperation],
     ["persisted ChatGPT catalog restore uses shared discovery and notifies Copilot", persistedCatalogRestoreUsesSharedDiscoveryAndNotifiesCopilot],

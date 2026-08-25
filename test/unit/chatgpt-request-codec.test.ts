@@ -149,14 +149,15 @@ test("uses automatic tool choice and disables parallel calls from model capabili
   assert.equal(body.parallel_tool_calls, false);
 });
 
-test("sends explicit reasoning effort and Fast service tier together", () => {
-  const body = buildResponsesRequest(request, model, {
-    reasoningEffort: "high",
-    serviceTier: "fast",
-  });
+test("maps the Fast setting to the ChatGPT priority service tier", () => {
+  const body = buildResponsesRequest(
+    request,
+    model,
+    resolveChatGptRequestOverrides("high", "fast"),
+  );
 
   assert.deepEqual(body.reasoning, { effort: "high" });
-  assert.equal(body.service_tier, "fast");
+  assert.equal(body.service_tier, "priority");
 });
 
 test("omits reasoning and service tier when no override is configured", () => {
@@ -169,7 +170,7 @@ test("omits reasoning and service tier when no override is configured", () => {
 test("resolves explicit ChatGPT settings without changing model defaults", () => {
   assert.deepEqual(resolveChatGptRequestOverrides("max", "fast"), {
     reasoningEffort: "max",
-    serviceTier: "fast",
+    serviceTier: "priority",
   });
   assert.deepEqual(resolveChatGptRequestOverrides("modelDefault", "modelDefault"), {});
   assert.deepEqual(resolveChatGptRequestOverrides(undefined, undefined), {});

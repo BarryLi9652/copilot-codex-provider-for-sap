@@ -2,7 +2,7 @@
   "name": "codex-copilot-provider-for-sap",
   "displayName": "Codex Copilot Manager for SAP",
   "description": "Use Codex through ChatGPT OAuth or a local Codex App Server in GitHub Copilot Chat, with SAP ABAP tooling support.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publisher": "leonbwang",
   "icon": "resources/icon.png",
   "repository": {
@@ -62,10 +62,10 @@
           "enum": ["modelDefault", "fast"],
           "enumDescriptions": [
             "Use the ChatGPT backend's default service tier.",
-            "Request Fast service when the account and selected model support it."
+            "Request Fast service through the ChatGPT priority tier when the account and selected model support it."
           ],
           "default": "modelDefault",
-          "description": "ChatGPT OAuth response speed. Applied to new requests without reloading VS Code."
+          "description": "ChatGPT OAuth response speed. Fast maps to the ChatGPT priority service tier and applies to new requests without reloading VS Code."
         },
         "copilotCodex.requestTimeoutSeconds": { "type": "number", "default": 600, "minimum": 10 },
         "copilotCodex.toolTimeoutSeconds": { "type": "number", "default": 300, "minimum": 30 },
@@ -103,7 +103,7 @@
     "test": "npm run test:unit && npm run test:integration",
     "check": "npm run typecheck && npm test",
     "package": "npm run check && npm run test:extension && npm run package:vsix",
-    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/codex-copilot-provider-for-sap-0.1.8.vsix",
+    "package:vsix": "node -e \"require('node:fs').mkdirSync('dist',{recursive:true})\" && vsce package --no-dependencies --allow-missing-repository --out dist/codex-copilot-provider-for-sap-0.1.9.vsix",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

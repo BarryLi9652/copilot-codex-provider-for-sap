@@ -19,7 +19,10 @@ export const MANAGER_ACTION_IDS = [
 export const COMMAND_IDS = [MANAGER_COMMAND_ID, ...MANAGER_ACTION_IDS] as const;
 
 export type CommandId = typeof COMMAND_IDS[number];
-export type ManagerActionId = typeof MANAGER_ACTION_IDS[number] | "configureProxy" | "openSettings";
+export type ManagerActionId = typeof MANAGER_ACTION_IDS[number]
+  | "configureProxy"
+  | "configureSapProxyBypass"
+  | "openSettings";
 export type CommandServices = Readonly<Record<CommandId, () => Promise<void>>>;
 
 export const DEFAULT_CHATGPT_PROXY_URL = "http://127.0.0.1:7897";
@@ -43,6 +46,53 @@ export interface ProxySetupUi {
   promptProxyUrl(defaultValue: string): Promise<string | undefined>;
   showInvalidProxy(): Promise<void>;
   showReloadRequired(): Promise<void>;
+}
+
+export interface SapProxyBypassServices {
+  configure(): Promise<void>;
+}
+
+export interface SapProxyBypassStore {
+  getNoProxyHosts(): readonly string[];
+  setNoProxyHosts(value: readonly string[]): Promise<void>;
+}
+
+export interface SapProxyBypassUi {
+  promptNoProxyHosts(defaultValue: string): Promise<string | undefined>;
+  showReloadRequired(): Promise<void>;
+}
+
+export function createSapProxyBypassServices(
+  store: SapProxyBypassStore,
+  ui: SapProxyBypassUi,
+): SapProxyBypassServices {
+  return {
+    configure: async () => {
+      const existing = store.getNoProxyHosts();
+      const merged: string[] = [];
+      const seen = new Set<string>();
+      for (const host of existing) {
+        const key = host.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(host);
+        }
+      }
+      const entered = await ui.promptNoProxyHosts(merged.join(", "));
+      if (entered === undefined) {
+        return;
+      }
+      for (const host of entered.split(/[,\r\n]+/).map((value) => value.trim()).filter(Boolean)) {
+        const key = host.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(host);
+        }
+      }
+      await store.setNoProxyHosts(merged);
+      await ui.showReloadRequired();
+    },
+  };
 }
 
 const normalizeHttpProxyUrl = (value: string): string | undefined => {
@@ -108,6 +158,7 @@ export function createProxySetupServices(
 
 export interface CommandDependencies {
   readonly proxySetup: ProxySetupServices;
+  readonly sapProxyBypass: SapProxyBypassServices;
   readonly oauth: {
     signIn(openExternal: (url: string) => Promise<boolean>): Promise<unknown>;
     completeManualCallback(url: string): Promise<unknown>;
@@ -251,6 +302,10 @@ export function createCommandServices(
       }
       if (selected === "configureProxy") {
         await dependencies.proxySetup.configure();
+        return;
+      }
+      if (selected === "configureSapProxyBypass") {
+        await dependencies.sapProxyBypass.configure();
         return;
       }
       if (selected === "openSettings") {
