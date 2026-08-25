@@ -200,7 +200,7 @@ export class OAuthManager {
 
     let server: LoopbackServerHandle;
     try {
-      server = await this.loopbackServer.start();
+      server = await this.loopbackServer.start(active.state);
       active.server = server;
       active.redirectUri = server.redirectUri;
     } catch (error) {
@@ -822,6 +822,9 @@ export class OAuthManager {
 
   private loopbackError(error: unknown): OAuthError {
     if (error instanceof LoopbackError) {
+      if (error.code === "callback_timeout") {
+        return new OAuthError("callback_timeout", "ChatGPT OAuth callback timed out.", error);
+      }
       const cleanupError =
         error.code === "callback_response_failed"
           ? new OAuthError(
@@ -837,9 +840,6 @@ export class OAuthManager {
         );
       }
       return cleanupError;
-    }
-    if (error instanceof Error && error.message.includes("timed out")) {
-      return new OAuthError("callback_timeout", "ChatGPT OAuth callback timed out.");
     }
     return new OAuthError("callback_closed", "The ChatGPT OAuth callback server closed.");
   }

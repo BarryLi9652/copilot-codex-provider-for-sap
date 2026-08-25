@@ -12,9 +12,10 @@ import {
   type OAuthFetch,
   type OAuthHttpResponse,
 } from "../../src/transports/chatgpt-oauth/oauth-manager.js";
-import type {
-  LoopbackServer,
-  LoopbackServerHandle,
+import {
+  LoopbackError,
+  type LoopbackServer,
+  type LoopbackServerHandle,
 } from "../../src/transports/chatgpt-oauth/loopback-server.js";
 
 const waitForCondition = async (
@@ -117,8 +118,10 @@ class FakeLoopbackHandle implements LoopbackServerHandle {
 
 class FakeLoopbackServer implements LoopbackServer {
   public readonly handles: FakeLoopbackHandle[] = [];
+  public readonly expectedStates: Array<string | undefined> = [];
 
-  public async start(): Promise<LoopbackServerHandle> {
+  public async start(expectedState?: string): Promise<LoopbackServerHandle> {
+    this.expectedStates.push(expectedState);
     const handle = new FakeLoopbackHandle();
     this.handles.push(handle);
     return handle;
@@ -128,6 +131,7 @@ class FakeLoopbackServer implements LoopbackServer {
 class DeferredStartLoopbackServer implements LoopbackServer {
   public starts = 0;
   public readonly handles: FakeLoopbackHandle[] = [];
+  public readonly expectedStates: Array<string | undefined> = [];
   public readonly firstStart: Promise<void>;
   private releaseFirstStart!: () => void;
 
@@ -141,8 +145,9 @@ class DeferredStartLoopbackServer implements LoopbackServer {
     this.releaseFirstStart();
   }
 
-  public async start(): Promise<LoopbackServerHandle> {
+  public async start(expectedState?: string): Promise<LoopbackServerHandle> {
     this.starts += 1;
+    this.expectedStates.push(expectedState);
     const handle = new FakeLoopbackHandle();
     this.handles.push(handle);
     if (this.starts === 1) {
@@ -260,6 +265,7 @@ test("sign-in exchanges the validated code and stores a complete session", async
   }
   const state = new URL(authorizeUrl).searchParams.get("state");
   assert.ok(state);
+  assert.deepEqual(loopback.expectedStates, [state]);
   const result = await (async () => {
     const callback = manager.completeManualCallback(
       `http://localhost:1455/auth/callback?code=authorization-code&state=${encodeURIComponent(state)}`,
@@ -832,7 +838,7 @@ test("loopback callback rejection still awaits close and reports timeout cleanup
   const handle = loopback.handles[0];
   assert.ok(handle);
   handle.closeError = new Error("synthetic close failure");
-  handle.reject(new Error("OAuth callback server timed out."));
+  handle.reject(new LoopbackError("callback_timeout", "OAuth callback server timed out."));
 
   await assert.rejects(
     signIn,
