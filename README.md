@@ -118,14 +118,14 @@ V1 的“深度支持”依赖 Copilot/VS Code 提供的标准工具和审批机
 
 | 设置 | 默认值 | 说明 |
 |---|---:|---|
-| `copilotCodex.local.codexPath` | 空 | Local Codex executable 的绝对路径 |
+| `copilotCodex.local.codexPath` | 空 | Local Codex executable 的绝对路径；修改后需重载 VS Code |
 | `copilotCodex.chatgpt.proxyUrl` | 空 | 仅用于 ChatGPT 登录令牌、模型发现和回复请求的 HTTP(S) 代理；修改后需重载 VS Code |
 | `http.noProxy`（VS Code 内置） | 空数组 | VS Code 共享代理绕过主机；可通过 Manager 的 `Configure SAP Proxy Bypass` 合并配置，修改后需重载 |
 | `copilotCodex.chatgpt.reasoningEffort` | modelDefault | ChatGPT OAuth 思考深度：`modelDefault`、`none`、`low`、`medium`、`high`、`xhigh` 或 `max`；下一轮请求立即生效 |
 | `copilotCodex.chatgpt.speedMode` | modelDefault | ChatGPT OAuth 服务速度：`modelDefault` 或 `fast`；Fast 在私有后端请求中映射为 `priority` service tier，需要账号和模型支持，下一轮请求立即生效 |
-| `copilotCodex.requestTimeoutSeconds` | 600 | HTTP/RPC 请求超时，最小 10 秒 |
-| `copilotCodex.toolTimeoutSeconds` | 300 | Copilot 工具 continuation 超时，最小 30 秒 |
-| `copilotCodex.catalogCacheMinutes` | 5 | 每条 route 独立模型目录缓存时间 |
+| `copilotCodex.requestTimeoutSeconds` | 600 | HTTP/RPC 请求超时，最小 10 秒；修改后需重载 VS Code |
+| `copilotCodex.toolTimeoutSeconds` | 300 | Copilot 工具 continuation 超时，最小 30 秒；修改后需重载 VS Code |
+| `copilotCodex.catalogCacheMinutes` | 5 | 每条 route 独立模型目录缓存时间；修改后需重载 VS Code |
 | `copilotCodex.sapSelectionMaxChars` | 16000 | 活动选区最大字符数 |
 | `copilotCodex.logLevel` | info | `error`、`warn`、`info` 或 `debug` |
 
