@@ -583,6 +583,52 @@ async function chatGptCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<v
   }
 }
 
+async function idempotentExtensionShutdownSharesAndAwaitsCleanup(): Promise<void> {
+  const createDisposer = (extensionModule as unknown as {
+    createIdempotentAsyncDisposer?: (
+      dispose: () => Promise<void>,
+    ) => () => Promise<void>;
+  }).createIdempotentAsyncDisposer;
+  assert.equal(typeof createDisposer, "function");
+  if (createDisposer === undefined) {
+    return;
+  }
+
+  let calls = 0;
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const dispose = createDisposer(async () => {
+    calls += 1;
+    await pending;
+  });
+  const first = dispose();
+  const second = dispose();
+  assert.equal(first, second);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  release();
+  await first;
+
+  const transportCalls: string[] = [];
+  const responsiveCleanup = createDisposer(async () => {
+    await Promise.allSettled([
+      Promise.resolve().then(() => { transportCalls.push("chatgpt"); }),
+      Promise.resolve().then(() => { transportCalls.push("local"); }),
+    ]);
+  });
+  assert.equal(await Promise.race([
+    responsiveCleanup().then(() => "disposed" as const),
+    new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 50)),
+  ]), "disposed");
+  assert.deepEqual(transportCalls.sort(), ["chatgpt", "local"]);
+
+  const deactivation = (extensionModule.deactivate as unknown as () => unknown)();
+  assert.ok(deactivation instanceof Promise);
+  await deactivation;
+}
+
 async function localCatalogServicesRefreshAndNotifyAsOneOperation(): Promise<void> {
   const localModel: CodexModel = {
     id: "local-codex",
@@ -846,6 +892,7 @@ function diagnosticsAreWhitelistedAndRedacted(): void {
 export async function runCommandTests(): Promise<void> {
   const tests: readonly [string, () => void | Promise<void>][] = [
     ["commands register exact independent routes", registersExactCommandsAndRoutesIndependently],
+    ["idempotent extension shutdown shares and awaits cleanup", idempotentExtensionShutdownSharesAndAwaitsCleanup],
     ["management services preserve route and clear boundaries", managementServicesPreserveRouteAndClearBoundaries],
     ["manager runs first-use proxy setup and allows manual reconfiguration", managerRunsFirstUseProxySetupAndAllowsManualReconfiguration],
     ["manager routes SAP proxy bypass configuration", managerRoutesSapProxyBypassConfiguration],

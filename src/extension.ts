@@ -39,6 +39,18 @@ export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] &
   restore(): Promise<number>;
 };
 
+export const createIdempotentAsyncDisposer = (
+  dispose: () => Promise<void>,
+): (() => Promise<void>) => {
+  let operation: Promise<void> | undefined;
+  return () => {
+    operation ??= Promise.resolve().then(dispose);
+    return operation;
+  };
+};
+
+let activeExtensionDisposal: (() => Promise<void>) | undefined;
+
 export const readGlobalNoProxyHosts = (configuration: {
   inspect<T>(section: string): { globalValue?: T } | undefined;
 }): readonly string[] => configuration.inspect<readonly string[]>("noProxy")?.globalValue ?? [];
@@ -234,6 +246,13 @@ export function activate(context: vscode.ExtensionContext): void {
     localProviderCache,
     localModelCache,
   );
+  const disposeExtension = createIdempotentAsyncDisposer(async () => {
+    await Promise.allSettled([
+      chatGptTransport.dispose(),
+      localTransport.dispose(),
+    ]);
+  });
+  activeExtensionDisposal = disposeExtension;
   const proxySetup = createProxySetupServices({
     getProxyUrl: () => configuration.get<string>("chatgpt.proxyUrl", ""),
     setProxyUrl: async (value) => {
@@ -463,8 +482,11 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     diagnosticsOutput,
     logOutput,
-    chatGptTransport,
-    localTransport,
+    {
+      dispose: () => {
+        void disposeExtension().catch(() => undefined);
+      },
+    },
   );
   void restorePersistedChatGptModelCatalog({
     loadSession: () => oauthStore.load(),
@@ -479,4 +501,16 @@ const secondsToMs = (value: number, minimum: number): number =>
 const minutesToMs = (value: number, minimum: number): number =>
   Math.max(minimum, Number.isFinite(value) ? value : minimum) * 60_000;
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  const disposeExtension = activeExtensionDisposal;
+  if (disposeExtension === undefined) {
+    return;
+  }
+  try {
+    await disposeExtension();
+  } finally {
+    if (activeExtensionDisposal === disposeExtension) {
+      activeExtensionDisposal = undefined;
+    }
+  }
+}
