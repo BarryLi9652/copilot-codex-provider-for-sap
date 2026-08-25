@@ -812,6 +812,39 @@ async function countsTokens(): Promise<void> {
     await provider.provideTokenCount(modelInfo, message, cancellation.token),
     Math.ceil(("abc".length + serializedTool.length) / 4),
   );
+
+  const messageWith = (
+    part: vscode.LanguageModelDataPart | vscode.LanguageModelToolResultPart,
+  ): vscode.LanguageModelChatRequestMessage => ({
+    role: vscode.LanguageModelChatMessageRole.User,
+    name: undefined,
+    content: [part],
+  });
+  const smallImage = new vscode.LanguageModelDataPart(new Uint8Array(32_000), "image/png");
+  const largeImage = new vscode.LanguageModelDataPart(new Uint8Array(2_000_000), "image/jpeg");
+  const binary = new vscode.LanguageModelDataPart(new Uint8Array(32_000), "application/pdf");
+  assert.equal(
+    await provider.provideTokenCount(modelInfo, messageWith(smallImage), cancellation.token),
+    256,
+  );
+  assert.equal(
+    await provider.provideTokenCount(modelInfo, messageWith(largeImage), cancellation.token),
+    2_048,
+  );
+  assert.equal(
+    await provider.provideTokenCount(modelInfo, messageWith(binary), cancellation.token),
+    1,
+  );
+
+  const toolResult = new vscode.LanguageModelToolResultPart("image-call", [
+    new vscode.LanguageModelTextPart("ok"),
+    smallImage,
+  ]);
+  const toolResultMetadata = JSON.stringify({ callId: "image-call" });
+  assert.equal(
+    await provider.provideTokenCount(modelInfo, messageWith(toolResult), cancellation.token),
+    Math.ceil((toolResultMetadata.length + "ok".length) / 4) + 256,
+  );
   cancellation.dispose();
 }
 
