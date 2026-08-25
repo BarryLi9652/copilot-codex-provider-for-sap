@@ -1,7 +1,7 @@
 # Copilot Codex Provider for SAP — Reliability and Security Maintenance Design
 
 - Date: 2026-08-25
-- Status: Approved in chat; awaiting written-spec review
+- Status: Approved, including the 2026-08-25 external-review amendments
 - Delivery strategy: Scheme B — one release branch, independently testable TDD batches
 - Source review: `docs/2026-08-25-deep-code-review.md`
 - Baseline: local `main` at `cc7472d`
@@ -44,11 +44,14 @@ This is architectural maintenance rather than a bounded bugfix because it crosse
 5. Define `silent` discovery as non-interactive: it must not open login UI, and an unavailable provider must return no models without a user-facing prompt.
 6. Await asynchronous transport disposal during extension deactivation.
 
-### 3.4 Conditional performance and cleanup work
+### 3.4 Conditional performance work
 
 1. Evaluate reusable HTTP/HTTPS agents for ChatGPT OAuth and transport requests.
-2. Remove state or constants proven unused by static search and tests, including the write-only OAuth session field and stale ABAP tool-name constants.
-3. Remove or replace assertions that cannot become false under the current ownership model, such as `invalidLeaseIdentity`, only when their removal does not weaken a meaningful invariant.
+
+### 3.5 Low-risk cleanup work
+
+1. Remove state or constants proven unused by static search and tests, including the write-only OAuth session field and stale ABAP tool-name constants.
+2. Remove or replace assertions that cannot become false under the current ownership model, such as `invalidLeaseIdentity`, only when their removal does not weaken a meaningful invariant.
 
 ## 4. Explicit exclusions
 
@@ -75,7 +78,22 @@ These invariants are release blockers:
 - All supplied tools continue to be forwarded. Capability recognition may only influence SAP instructions and safe diagnostics.
 - `toolMode = required` continues to mean that at least one supplied dynamic tool must be called during the turn; it never means that a replace tool is mandatory.
 
-## 6. Implementation batches
+## 6. Risk register
+
+| Batch | Risk | Primary regression or side effect |
+|---|---:|---|
+| Process failure recovery | Medium | Incorrect terminal settlement could permit duplicate startup, misclassify `stuck`, or mask the original spawn error. |
+| OAuth cancellation and loopback | Medium | One caller could incorrectly cancel a shared refresh; weak networks could create repeated shared retry waves; rejecting a wrong-state callback without closing the listener extends the port-occupation window. |
+| Local discovery and executable selection | Low | Executable validation could be too strict, or model-change events could be emitted more than once. |
+| Tool-continuation lifecycle | Zero when the gate passes without production changes; medium-high when a RED regression permits a fix | Premature turn release could prevent Copilot tool results from continuing the ABAP write/activation turn. |
+| Redaction and protocol limits | Medium | Redaction could suppress safe diagnostics; an uncalibrated limit could reject legitimate image-bearing tool results or be too high to provide protection. |
+| Diagnostics, token estimation, and shutdown | Medium | A nonresponsive child can delay reload by the bounded termination window; image overestimation can reduce usable context while underestimation can exceed model limits. |
+| Reusable Agent experiment | Medium, conditional on Hard gate 2 | Proxy configuration could be shared across boundaries, connections might not close, or cancellation/shutdown could regress. |
+| Verified dead-code cleanup | Low | A symbol with an unobserved implicit dependency could be removed; compile, static search, and regression tests are required. |
+
+The risk ratings above apply to production changes, not to writing the RED regressions. Process, OAuth, and Local discovery remain separate batches and commits so their different failure profiles are not averaged together.
+
+## 7. Implementation batches
 
 ### Batch 1 — Process failure recovery
 
@@ -101,13 +119,20 @@ Primary production areas:
 
 Required tests:
 
-- Aborting sign-in or refresh aborts the underlying token request and clears any active-flight state.
+- Aborting a sole sign-in or token-exchange owner aborts the underlying request and clears active state.
+- Cancelling one waiter does not abort a shared refresh still awaited by another caller.
+- Concurrent refresh callers in one lifecycle generation produce exactly one token request.
+- A timed-out refresh clears its flight, and a later explicit call creates at most one new shared flight.
+- OAuthManager performs no automatic token retry after timeout.
 - Token requests time out with a typed local timeout error.
 - A callback with the wrong state cannot consume the valid callback opportunity.
+- After a wrong-state callback, the selected callback listener remains bounded by correct callback, explicit cancellation, or the existing callback timeout; fallback selection across ports `1455` and `1457` remains intact.
 - A keep-alive callback client receives completion promptly and the listener closes.
 - PKCE, loopback-only binding, redirect path validation, and secret storage behavior remain unchanged.
 
-Timeout values must be configurable through existing request timeout policy or an internal bounded default; no second conflicting timeout configuration is introduced.
+The refresh flight owns its AbortController and is not owned by the first caller. Each caller may stop waiting with its own signal; the shared request continues while another caller still depends on it. The manager may terminate the flight on lifecycle invalidation, sign-out/disposal, or its own timeout.
+
+OAuth token requests use an internal 60-second upper bound. This is separate from the long-running model response timeout, adds no second user-facing setting, and never triggers an automatic retry. The loopback listener continues to use the existing five-minute callback timeout and the existing `1455`, `1457` fallback ports.
 
 ### Batch 3 — Local model discovery consistency
 
@@ -174,6 +199,8 @@ Required tests:
 
 Limits must be selected from repository fixtures or explicit stress tests. A limit is not accepted merely because it appears in the external review.
 
+Calibration must include image-bearing tool results after conversion to `data:image/...;base64,...`, including base64 expansion and complete JSONL envelope overhead. The evidence records representative P50, P95, and maximum fixture sizes. If the available fixtures cannot justify an aggressive threshold, the batch uses a conservatively high defensive bound rather than rejecting plausible valid payloads.
+
 ### Batch 6 — Diagnostics, token estimation, and shutdown
 
 Primary production areas:
@@ -187,10 +214,15 @@ Required tests:
 
 - `requiredToolMissing` appears in safe diagnostics.
 - Unknown errors are counted or categorized separately without violating `CodexErrorCode` typing.
-- Image/data parts receive a conservative non-zero estimate without counting arbitrary non-image data as images.
-- Extension deactivation awaits idempotent transport disposal and leaves no managed child process running.
+- Image parts receive a MIME-aware, size-bucketed non-zero estimate with documented lower and upper bounds; arbitrary non-image data is not counted as an image.
+- Image estimates cover both underestimation risk and excessive overestimation that could reduce usable external context.
+- Extension deactivation awaits one shared, idempotent cleanup promise and leaves no managed child process running.
+- A normally responsive child does not incur an artificial shutdown delay.
+- A nonresponsive child remains bounded by the existing worst-case termination window of approximately seven seconds: five seconds graceful wait plus two one-second force-kill waits.
 
-### Batch 7 — Conditional network performance experiment and cleanup
+The shutdown policy favors bounded child cleanup over immediately abandoning a managed process. The approximately seven-second delay is a pathological upper bound, not expected behavior for every reload. No new fast-exit process mode is introduced without a failing regression and separate approval.
+
+### Batch 7 — Conditional network performance experiment
 
 Primary production areas are not approved in advance. They may be added only after the performance gate is satisfied and the exact files are reported before implementation.
 
@@ -205,9 +237,17 @@ Reusable Agent production changes are allowed only when all of the following are
 
 If evidence is absent, noisy, or the implementation requires a new framework, no production Agent change is made. The benchmark result records either `gate satisfied → candidate may enter TDD` or `gate not satisfied → no production change`.
 
-Dead-code cleanup may proceed only for symbols proven unused and only in the batch already touching the owning module. It must not change behavior or trigger unrelated refactoring.
+### Batch 8 — Verified dead-code cleanup
 
-## 7. Error handling and observability
+Approved production areas:
+
+- `src/transports/chatgpt-oauth/oauth-manager.ts`
+- `src/transports/app-server/app-server-transport.ts`
+- `src/constants.ts`
+
+Cleanup may remove only symbols proven unused by repository-wide static search, TypeScript compilation, and the full regression suite. This explicitly permits removal of stale constants from `src/constants.ts`, resolving the previous conflict with the "already touched module" rule. It must not change behavior, reorganize modules, or trigger unrelated refactoring.
+
+## 8. Error handling and observability
 
 - Original typed errors remain the primary user-facing failure source; cleanup failures must not overwrite them.
 - Remote error bodies are treated as untrusted. Only safe, bounded categories are surfaced.
@@ -215,7 +255,7 @@ Dead-code cleanup may proceed only for symbols proven unused and only in the bat
 - Diagnostics preserve the existing safe-code design and add a separate representation for unknown failures.
 - No new full tracing or diagnostics architecture is introduced.
 
-## 8. Test and verification strategy
+## 9. Test and verification strategy
 
 Every batch follows strict TDD:
 
@@ -236,7 +276,7 @@ Before release completion, run:
 
 No completion claim or release packaging is valid without fresh command output.
 
-## 9. Commit and rollback structure
+## 10. Commit and rollback structure
 
 Expected commit boundaries:
 
@@ -247,11 +287,11 @@ Expected commit boundaries:
 5. `fix(security): strengthen redaction and protocol limits`
 6. `fix(diagnostics): improve safe reporting and shutdown`
 7. `perf(network): reuse disposable proxy-aware agents` — only if Hard gate 2 permits it
-8. `chore: remove verified dead state` — only where already touched
+8. `chore: remove verified dead state` — limited to the approved Batch 8 files
 
 Each commit must be independently testable and revertible. A failed optional batch is omitted rather than folded into another commit.
 
-## 10. Definition of done
+## 11. Definition of done
 
 The release is complete when:
 
