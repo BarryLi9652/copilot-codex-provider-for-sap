@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { CodexError } from "../../src/core/errors.js";
 import { ResponsesSseParser } from "../../src/transports/chatgpt-oauth/sse-parser.js";
 
 const encoder = new TextEncoder();
@@ -10,6 +11,79 @@ function splitUtf8(value: string, cuts: readonly number[]): Uint8Array[] {
   const points = [0, ...cuts, bytes.byteLength];
   return points.slice(0, -1).map((start, index) => bytes.slice(start, points[index + 1]));
 }
+
+const boundedParser = (maxPendingChars: number): ResponsesSseParser =>
+  new ResponsesSseParser(undefined, { maxPendingChars });
+
+test("bounds unterminated SSE frames and accumulated function arguments", () => {
+  const unterminated = boundedParser(64);
+  assert.throws(
+    () => unterminated.push("x".repeat(65)),
+    (error: unknown) => error instanceof CodexError
+      && error.code === "protocol"
+      && error.action === "parseChatGptSse",
+  );
+
+  const accumulated = boundedParser(64);
+  const argumentFrame = (delta: string): string => [
+    "event: response.function_call_arguments.delta\n",
+    `data: ${JSON.stringify({
+      type: "response.function_call_arguments.delta",
+      item_id: "item-limit",
+      call_id: "call-limit",
+      delta,
+    })}\n\n`,
+  ].join("");
+  assert.deepEqual(accumulated.push(argumentFrame("a".repeat(40))), []);
+  assert.throws(
+    () => accumulated.push(argumentFrame("b".repeat(25))),
+    (error: unknown) => error instanceof CodexError
+      && error.code === "protocol"
+      && error.action === "parseChatGptSse",
+  );
+});
+
+test("maps remote SSE failures to allow-listed typed errors without remote messages", () => {
+  const cases = [
+    [{ status: 401 }, "unauthorized"],
+    [{ status: 403 }, "unauthorized"],
+    [{ status: 429 }, "rateLimited"],
+    [{ code: "rate_limit_exceeded" }, "rateLimited"],
+    [{ status: 408 }, "timeout"],
+    [{ status: 504 }, "timeout"],
+    [{ status: 503 }, "network"],
+    [{ status: 400 }, "protocol"],
+  ] as const;
+
+  for (const [remote, expectedCode] of cases) {
+    const parser = new ResponsesSseParser();
+    assert.throws(
+      () => parser.push([
+        "event: error\n",
+        `data: ${JSON.stringify({ error: { ...remote, message: "private remote failure" } })}\n\n`,
+      ].join("")),
+      (error: unknown) => error instanceof CodexError
+        && error.code === expectedCode
+        && !String(error).includes("private remote failure"),
+    );
+  }
+
+  const failed = new ResponsesSseParser();
+  assert.throws(
+    () => failed.push([
+      "event: response.failed\n",
+      `data: ${JSON.stringify({
+        response: {
+          status: "failed",
+          error: { status: 503, message: "private nested failure" },
+        },
+      })}\n\n`,
+    ].join("")),
+    (error: unknown) => error instanceof CodexError
+      && error.code === "network"
+      && !String(error).includes("private nested failure"),
+  );
+});
 
 test("parses text and tool arguments across arbitrary UTF-8 chunk boundaries", () => {
   const parser = new ResponsesSseParser();
@@ -65,18 +139,31 @@ test("joins multiline data, ignores DONE and unknown events, and emits completio
   assert.deepEqual(events, [{ type: "completed" }]);
 });
 
-test("does not surface malformed or failed payloads as user content", () => {
+test("does not surface malformed payloads and throws a safe typed remote failure", () => {
   const parser = new ResponsesSseParser();
-  const events = parser.push(encoder.encode([
+  assert.deepEqual(parser.push(encoder.encode([
     "event: response.output_text.delta\n",
     "data: not-json\n\n",
+  ].join(""))), []);
+
+  assert.throws(
+    () => parser.push(encoder.encode([
     "event: error\n",
     "data: {\"type\":\"error\",\"error\":{\"code\":\"bad_request\"}}\n\n",
-    "event: response.failed\n",
-    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
-  ].join("")));
+    ].join(""))),
+    (error: unknown) => error instanceof CodexError
+      && error.code === "protocol"
+      && error.action === "parseChatGptSse",
+  );
+});
 
-  assert.deepEqual(events, []);
+test("rejects invalid SSE pending limits", () => {
+  for (const maxPendingChars of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+    assert.throws(
+      () => boundedParser(maxPendingChars),
+      (error: unknown) => error instanceof RangeError,
+    );
+  }
 });
 
 test("reports unknown events without logging payload content", () => {

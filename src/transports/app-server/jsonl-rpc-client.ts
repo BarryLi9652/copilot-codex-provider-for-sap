@@ -20,6 +20,7 @@ export interface JsonlRpcClientStreams {
 
 export interface JsonlRpcClientOptions {
   requestTimeoutMs?: number;
+  maxLineChars?: number;
   onDidTerminate?: (error: CodexError) => void;
 }
 
@@ -47,6 +48,7 @@ interface ActiveServerRequest {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 600_000;
+const DEFAULT_MAX_LINE_CHARS = 33_554_432;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -66,6 +68,7 @@ export class JsonlRpcClient {
   private readonly input: Writable;
   private readonly output: Readable;
   private readonly requestTimeoutMs: number;
+  private readonly maxLineChars: number;
   private readonly terminationCallback: ((error: CodexError) => void) | undefined;
   private readonly terminationHandlers = new Set<(error: CodexError) => void>();
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
@@ -98,11 +101,13 @@ export class JsonlRpcClient {
       this.output = first.output;
       const options = second as JsonlRpcClientOptions | undefined;
       this.requestTimeoutMs = validateTimeout(options);
+      this.maxLineChars = validateMaxLineChars(options);
       this.terminationCallback = options?.onDidTerminate;
     } else {
       this.output = first;
       this.input = second as Writable;
       this.requestTimeoutMs = validateTimeout(third);
+      this.maxLineChars = validateMaxLineChars(third);
       this.terminationCallback = third?.onDidTerminate;
     }
 
@@ -262,6 +267,9 @@ export class JsonlRpcClient {
     }
     this.lineBuffer += decoded;
     this.consumeLines();
+    if (!this.closed && this.lineBuffer.length > this.maxLineChars) {
+      this.terminate(protocolError("parseAppServerMessage", new Error("JSONL line exceeded limit")));
+    }
   };
 
   private readonly handleEnd = (): void => {
@@ -323,6 +331,10 @@ export class JsonlRpcClient {
   }
 
   private handleLine(line: string): void {
+    if (line.length > this.maxLineChars) {
+      this.terminate(protocolError("parseAppServerMessage", new Error("JSONL line exceeded limit")));
+      return;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(line) as unknown;
@@ -643,4 +655,12 @@ function validateTimeout(options: JsonlRpcClientOptions | undefined): number {
     throw new RangeError("requestTimeoutMs must be positive or Infinity");
   }
   return timeout;
+}
+
+function validateMaxLineChars(options: JsonlRpcClientOptions | undefined): number {
+  const maxLineChars = options?.maxLineChars ?? DEFAULT_MAX_LINE_CHARS;
+  if (!Number.isFinite(maxLineChars) || !Number.isInteger(maxLineChars) || maxLineChars <= 0) {
+    throw new RangeError("maxLineChars must be a positive finite integer");
+  }
+  return maxLineChars;
 }
