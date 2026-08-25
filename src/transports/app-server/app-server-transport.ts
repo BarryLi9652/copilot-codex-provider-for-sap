@@ -535,21 +535,13 @@ export class AppServerTransport implements CodexTransport {
           instructions: buildAppServerTurnInstructions(request.instructions, request.toolMode),
         }),
       }, signal);
-      const invalidLeaseIdentity = state.lease !== lease
-        || state.generation !== lease.generation
-        || state.leaseId !== lease.leaseId;
       if (
         state.cleaned
         || state.cleanupStarted
         || this.disposed
         || signal.aborted
-        || invalidLeaseIdentity
       ) {
-        const error = state.failure ?? (
-          invalidLeaseIdentity
-            ? protocolError("turn/start")
-            : cancellationError()
-        );
+        const error = state.failure ?? cancellationError();
         if (!state.cleaned && !state.cleanupStarted) {
           state.turnId = turn.turnId;
           await this.terminateState(state, error, true);

@@ -152,7 +152,6 @@ export class OAuthManager {
   private readonly expirySkewMs: number;
   private readonly tokenTimeoutMs: number;
   private activeSignIn: ActiveSignIn | undefined;
-  private session: OAuthSession | undefined;
   private refreshPromise: RefreshFlight | undefined;
   private storageQueue: Promise<void> = Promise.resolve();
   private lifecycle = 0;
@@ -266,11 +265,9 @@ export class OAuthManager {
     const stored = await this.store.load();
     this.assertGeneration(generation);
     if (!stored) {
-      this.session = undefined;
       throw new OAuthError("auth_required", "ChatGPT authentication is required.");
     }
 
-    this.session = stored;
     const shouldRefresh =
       forceRefresh || stored.expiresAt <= this.now() + this.expirySkewMs;
     if (!shouldRefresh) {
@@ -352,7 +349,6 @@ export class OAuthManager {
     );
     this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     let callbackCleanupError: OAuthError | undefined;
     if (active) {
       const failure = await this.rejectActive(active, cancellation);
@@ -422,7 +418,6 @@ export class OAuthManager {
       this.assertActiveGeneration(active);
       await this.saveIfCurrent(session, active.generation);
       this.assertActiveGeneration(active);
-      this.session = session;
       const closeError = await this.closeActiveServer(active);
       if (closeError !== undefined) {
         throw closeError;
@@ -513,7 +508,6 @@ export class OAuthManager {
     this.assertGeneration(generation);
     await this.saveIfCurrent(session, generation);
     this.assertGeneration(generation);
-    this.session = session;
     return session;
   }
 
@@ -847,7 +841,6 @@ export class OAuthManager {
   private async clearCredentials(): Promise<void> {
     this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     await this.enqueueStorage(() => this.store.clear());
   }
 
@@ -865,7 +858,6 @@ export class OAuthManager {
     this.assertGeneration(generation);
     this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     await this.enqueueStorage(() => this.store.clear());
     this.assertGeneration(generation + 1);
   }
