@@ -397,6 +397,7 @@ export function activate(context: vscode.ExtensionContext): void {
             adtInstalled: sap.adtInstalled,
           },
           lastErrorCodes: diagnostics.snapshot(),
+          unknownErrorCount: diagnostics.unknownErrorCount(),
         }));
         diagnosticsOutput.show(true);
       },

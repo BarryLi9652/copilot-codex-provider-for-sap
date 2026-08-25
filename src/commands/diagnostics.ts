@@ -11,6 +11,7 @@ const SAFE_ERROR_CODES = new Set<CodexErrorCode>([
   "process",
   "incompatible",
   "toolContinuation",
+  "requiredToolMissing",
   "sapContext",
 ]);
 const MAX_ERROR_CODES = 10;
@@ -39,14 +40,20 @@ export interface DiagnosticsSnapshot {
     readonly adtInstalled: boolean;
   };
   readonly lastErrorCodes: readonly CodexErrorCode[];
+  readonly unknownErrorCount: number;
 }
 
 export class DiagnosticsHistory {
   private readonly codes: CodexErrorCode[] = [];
+  private unknownCount = 0;
 
   public record(error: unknown): void {
     const code = readSafeCode(error);
-    if (code === undefined || code === "cancelled") {
+    if (code === "cancelled") {
+      return;
+    }
+    if (code === undefined) {
+      this.unknownCount = Math.min(MAX_ERROR_CODES, this.unknownCount + 1);
       return;
     }
     this.codes.push(code);
@@ -57,10 +64,15 @@ export class DiagnosticsHistory {
 
   public clear(): void {
     this.codes.length = 0;
+    this.unknownCount = 0;
   }
 
   public snapshot(): readonly CodexErrorCode[] {
     return [...this.codes];
+  }
+
+  public unknownErrorCount(): number {
+    return this.unknownCount;
   }
 }
 
@@ -132,6 +144,7 @@ export function buildDiagnosticsReport(snapshot: DiagnosticsSnapshot): string {
       adtInstalled: snapshot.sap.adtInstalled,
     },
     lastErrorCodes: snapshot.lastErrorCodes.filter((code) => SAFE_ERROR_CODES.has(code)),
+    unknownErrorCount: safeCount(snapshot.unknownErrorCount),
   };
   return JSON.stringify(report, undefined, 2);
 }

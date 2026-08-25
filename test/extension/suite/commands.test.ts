@@ -18,6 +18,7 @@ import {
   buildDiagnosticsReport,
   DiagnosticsHistory,
 } from "../../../src/commands/diagnostics.js";
+import { CodexError } from "../../../src/core/errors.js";
 import { ModelCache } from "../../../src/core/model-cache.js";
 import type { CodexModel, CodexRequest, CodexTransport, TransportEvent } from "../../../src/core/types.js";
 import {
@@ -791,6 +792,10 @@ function diagnosticsAreWhitelistedAndRedacted(): void {
   const history = new DiagnosticsHistory();
   history.record({ code: "network" });
   history.record({ code: "process" });
+  history.record(new CodexError("requiredToolMissing"));
+  history.record(new Error("private unknown diagnostics failure"));
+  assert.deepEqual(history.snapshot(), ["network", "process", "requiredToolMissing"]);
+  assert.equal(history.unknownErrorCount(), 1);
   const report = buildDiagnosticsReport({
     extensionVersion: "0.1.0",
     vscodeVersion: "1.131.0",
@@ -806,12 +811,16 @@ function diagnosticsAreWhitelistedAndRedacted(): void {
     },
     sap: { abapFsInstalled: true, adtInstalled: false },
     lastErrorCodes: history.snapshot(),
+    unknownErrorCount: 1,
   });
 
   assert.match(report, /<user>/);
   assert.doesNotMatch(report, /alice|@|access[_ -]?token|cookie|prompt|source|tool.*body|adt:\/\//i);
   assert.match(report, /network/);
   assert.match(report, /process/);
+  assert.match(report, /requiredToolMissing/);
+  assert.match(report, /"unknownErrorCount": 1/);
+  assert.doesNotMatch(report, /private unknown diagnostics failure/);
   assert.match(report, /"processState": "running"/);
   const hostileVersionReport = buildDiagnosticsReport({
     extensionVersion: "0.1.0",
@@ -826,10 +835,12 @@ function diagnosticsAreWhitelistedAndRedacted(): void {
     },
     sap: { abapFsInstalled: false, adtInstalled: false },
     lastErrorCodes: [],
+    unknownErrorCount: 0,
   });
   assert.doesNotMatch(hostileVersionReport, /Bearer|server-version-secret/);
   history.clear();
   assert.deepEqual(history.snapshot(), []);
+  assert.equal(history.unknownErrorCount(), 0);
 }
 
 export async function runCommandTests(): Promise<void> {
