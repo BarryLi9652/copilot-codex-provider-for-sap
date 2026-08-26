@@ -15,7 +15,7 @@ export interface LoopbackServerHandle {
 }
 
 export interface LoopbackServer {
-  start(): Promise<LoopbackServerHandle>;
+  start(expectedState: string): Promise<LoopbackServerHandle>;
 }
 
 export interface LoopbackServerOptions {
@@ -24,6 +24,7 @@ export interface LoopbackServerOptions {
 }
 
 export type LoopbackErrorCode =
+  | "callback_timeout"
   | "callback_close_failed"
   | "callback_response_failed";
 
@@ -69,6 +70,7 @@ const writeResponse = (
 ): void => {
   response.writeHead(status, {
     "cache-control": "no-store",
+    connection: "close",
     "content-type": "text/html; charset=utf-8",
     ...headers,
   });
@@ -117,11 +119,11 @@ export class LoopbackCallbackServer implements LoopbackServer {
     this.timeoutMs = options.timeoutMs ?? CHATGPT_CALLBACK_TIMEOUT_MS;
   }
 
-  public async start(): Promise<LoopbackServerHandle> {
+  public async start(expectedState: string): Promise<LoopbackServerHandle> {
     let lastAddressError: unknown;
     for (const port of this.ports) {
       try {
-        return await this.listen(port);
+        return await this.listen(port, expectedState);
       } catch (error) {
         if (!isAddressInUse(error)) {
           throw error;
@@ -133,7 +135,7 @@ export class LoopbackCallbackServer implements LoopbackServer {
     throw serverError("No OAuth loopback callback port is available.", lastAddressError);
   }
 
-  private listen(port: number): Promise<LoopbackServerHandle> {
+  private listen(port: number, expectedState: string): Promise<LoopbackServerHandle> {
     return new Promise((resolve, reject) => {
       let actualPort: number | undefined;
       let callbackSettled = false;
@@ -299,6 +301,12 @@ export class LoopbackCallbackServer implements LoopbackServer {
           return;
         }
 
+        const states = callbackUrl.searchParams.getAll("state");
+        if (states.length !== 1 || states[0] === "" || states[0] !== expectedState) {
+          writeResponse(response, 400, "Invalid callback", "The OAuth callback state was not valid.");
+          return;
+        }
+
         callbackSettled = true;
         runTerminal(callbackUrl.toString(), undefined, response);
       };
@@ -341,7 +349,10 @@ export class LoopbackCallbackServer implements LoopbackServer {
           close: closeHandle,
         };
         timeout = setTimeout(() => {
-          const error = serverError("OAuth callback server timed out.");
+          const error = new LoopbackError(
+            "callback_timeout",
+            "OAuth callback server timed out.",
+          );
           if (!callbackSettled && !closed) {
             callbackSettled = true;
             runTerminal(undefined, error);

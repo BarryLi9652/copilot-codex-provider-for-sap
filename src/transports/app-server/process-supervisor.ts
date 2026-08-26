@@ -366,6 +366,23 @@ export class ProcessSupervisor {
     this.nextGeneration += 1;
     let record!: ChildRecord;
 
+    const settleBeforeSpawn = (error: CodexError): void => {
+      if (record.spawnSettled) {
+        return;
+      }
+      record.spawnSettled = true;
+      record.exitObserved = true;
+      record.state = "exited";
+      child.removeListener("spawn", onSpawn);
+      child.removeListener("error", onSpawnError);
+      child.removeListener("exit", onExitBeforeSpawn);
+      record.rejectSpawn(error);
+      record.resolveExit();
+      if (this.currentRecord === record) {
+        this.currentRecord = undefined;
+      }
+    };
+
     const onSpawn = (): void => {
       if (record.spawnSettled || record.exitObserved) {
         return;
@@ -377,24 +394,10 @@ export class ProcessSupervisor {
       record.resolveSpawn();
     };
     const onSpawnError = (cause: Error): void => {
-      if (record.spawnSettled) {
-        return;
-      }
-      record.spawnSettled = true;
-      child.removeListener("spawn", onSpawn);
-      child.removeListener("error", onSpawnError);
-      child.removeListener("exit", onExitBeforeSpawn);
-      record.rejectSpawn(processError("spawnCodex", cause));
+      settleBeforeSpawn(processError("spawnCodex", cause));
     };
     const onExitBeforeSpawn = (): void => {
-      if (record.spawnSettled) {
-        return;
-      }
-      record.spawnSettled = true;
-      child.removeListener("spawn", onSpawn);
-      child.removeListener("error", onSpawnError);
-      child.removeListener("exit", onExitBeforeSpawn);
-      record.rejectSpawn(processError("startCodex"));
+      settleBeforeSpawn(processError("startCodex"));
     };
     const onExit = (): void => {
       if (record.exitObserved) {

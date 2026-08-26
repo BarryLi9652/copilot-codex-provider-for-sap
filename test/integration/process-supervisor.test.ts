@@ -53,6 +53,13 @@ class FakeChild extends EventEmitter {
     this.emit("spawn");
   }
 
+  public failSpawn(error = new Error("spawn ENOENT")): void {
+    this.emit("error", error);
+    this.stdout?.emit("close");
+    this.stderr.emit("close");
+    this.emit("close");
+  }
+
   public kill(signal?: NodeJS.Signals | number): boolean {
     this.killCalls.push(signal);
     const shouldExit = this.killMode === "any"
@@ -372,6 +379,30 @@ test("handles a child error as a generation-owned failure and permits one restar
   assert.notEqual(first, second);
   assert.equal(children.length, 2);
   await asFixRoundSupervisor(supervisor).dispose();
+});
+
+test("async spawn failure settles the record and permits a later start", async () => {
+  const firstChild = new FakeChild("never", new PassThrough(), 0, true);
+  const { supervisor, children } = injectedSupervisor((count) =>
+    count === 1 ? firstChild : new FakeChild("any"));
+
+  const firstStart = supervisor.start();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  firstChild.failSpawn();
+
+  await assert.rejects(
+    firstStart,
+    (error: unknown) => error instanceof CodexError
+      && error.code === "process"
+      && error.action === "spawnCodex",
+  );
+  assert.equal(supervisor.state, "stopped");
+  assert.deepEqual(firstChild.killCalls, []);
+
+  const replacement = await supervisor.start();
+  assert.equal(children.length, 2);
+  assert.equal(replacement.isClosed, false);
+  await supervisor.stop();
 });
 
 test("rejects a start that races with stop before spawn completes", async () => {

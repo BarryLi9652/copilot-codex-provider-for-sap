@@ -1,0 +1,16 @@
+{
+  "source": "deterministic image-bearing tool-result envelopes",
+  "measurements": [
+    { "rawBytes": 127111, "jsonlChars": 169673 },
+    { "rawBytes": 1048576, "jsonlChars": 1398293 },
+    { "rawBytes": 4194304, "jsonlChars": 5592597 },
+    { "rawBytes": 8388608, "jsonlChars": 11185001 },
+    { "rawBytes": 16777216, "jsonlChars": 22369813 }
+  ],
+  "p50JsonlChars": 5592597,
+  "p95JsonlChars": 22369813,
+  "maxJsonlChars": 22369813,
+  "formula": "data URL base64 length plus JSON-RPC envelope",
+  "selectedJsonlLimitChars": 33554432,
+  "selectedSsePendingLimitChars": 16777216
+}

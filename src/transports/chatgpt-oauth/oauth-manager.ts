@@ -30,6 +30,7 @@ export interface OAuthRequestInit {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
+  signal?: AbortSignal;
 }
 
 export type OAuthFetch = (
@@ -46,6 +47,7 @@ export interface OAuthManagerOptions {
   loopbackServer?: LoopbackServer;
   now?: () => number;
   expirySkewMs?: number;
+  tokenTimeoutMs?: number;
 }
 
 export type OAuthErrorCode =
@@ -59,7 +61,9 @@ export type OAuthErrorCode =
   | "callback_response_failed"
   | "oauth_failed"
   | "sign_in_in_progress"
+  | "token_request_cancelled"
   | "token_exchange_failed"
+  | "token_request_timeout"
   | "token_response_invalid";
 
 export class OAuthError extends Error {
@@ -78,6 +82,7 @@ interface ActiveSignIn {
   readonly generation: number;
   readonly state: string;
   readonly verifier: string;
+  readonly tokenController: AbortController;
   server: LoopbackServerHandle | undefined;
   redirectUri: string | undefined;
   closePromise: Promise<OAuthError | undefined> | undefined;
@@ -91,7 +96,10 @@ interface ActiveSignIn {
 
 interface RefreshFlight {
   readonly generation: number;
+  readonly controller: AbortController;
   readonly promise: Promise<OAuthSession>;
+  waiters: number;
+  settled: boolean;
 }
 
 const defaultFetch: OAuthFetch = async (url, init) => {
@@ -120,6 +128,8 @@ const constantTimeEqual = (left: string, right: string): boolean => {
 const asError = (value: unknown, fallback: OAuthError): OAuthError =>
   value instanceof OAuthError ? value : fallback;
 
+export const OAUTH_TOKEN_REQUEST_TIMEOUT_MS = 60_000;
+
 const deferred = <T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -140,8 +150,8 @@ export class OAuthManager {
   private readonly loopbackServer: LoopbackServer;
   private readonly now: () => number;
   private readonly expirySkewMs: number;
+  private readonly tokenTimeoutMs: number;
   private activeSignIn: ActiveSignIn | undefined;
-  private session: OAuthSession | undefined;
   private refreshPromise: RefreshFlight | undefined;
   private storageQueue: Promise<void> = Promise.resolve();
   private lifecycle = 0;
@@ -155,12 +165,17 @@ export class OAuthManager {
     this.loopbackServer = options.loopbackServer ?? new LoopbackCallbackServer();
     this.now = options.now ?? Date.now;
     this.expirySkewMs = options.expirySkewMs ?? CHATGPT_EXPIRY_SKEW_MS;
+    this.tokenTimeoutMs = options.tokenTimeoutMs ?? OAUTH_TOKEN_REQUEST_TIMEOUT_MS;
+    if (!Number.isFinite(this.tokenTimeoutMs) || this.tokenTimeoutMs <= 0) {
+      throw new RangeError("tokenTimeoutMs must be positive");
+    }
   }
 
   public async signIn(openExternal: OpenExternal): Promise<OAuthSession> {
     if (this.activeSignIn) {
       throw new OAuthError("sign_in_in_progress", "An OAuth sign-in is already in progress.");
     }
+    this.abortRefreshFlight();
 
     const pair = createPkcePair();
     const state = createOAuthState();
@@ -169,6 +184,7 @@ export class OAuthManager {
       generation: ++this.lifecycle,
       state,
       verifier: pair.verifier,
+      tokenController: new AbortController(),
       server: undefined,
       redirectUri: undefined,
       closePromise: undefined,
@@ -183,7 +199,7 @@ export class OAuthManager {
 
     let server: LoopbackServerHandle;
     try {
-      server = await this.loopbackServer.start();
+      server = await this.loopbackServer.start(active.state);
       active.server = server;
       active.redirectUri = server.redirectUri;
     } catch (error) {
@@ -241,16 +257,17 @@ export class OAuthManager {
     return this.completeCallback(active, url);
   }
 
-  public async getAccessToken(forceRefresh = false): Promise<OAuthCredentials> {
+  public async getAccessToken(
+    forceRefresh = false,
+    signal?: AbortSignal,
+  ): Promise<OAuthCredentials> {
     const generation = this.lifecycle;
     const stored = await this.store.load();
     this.assertGeneration(generation);
     if (!stored) {
-      this.session = undefined;
       throw new OAuthError("auth_required", "ChatGPT authentication is required.");
     }
 
-    this.session = stored;
     const shouldRefresh =
       forceRefresh || stored.expiresAt <= this.now() + this.expirySkewMs;
     if (!shouldRefresh) {
@@ -259,19 +276,69 @@ export class OAuthManager {
 
     let flight = this.refreshPromise;
     if (flight?.generation !== generation) {
-      const refresh = this.refreshSession(stored, generation);
-      flight = { generation, promise: refresh };
-      this.refreshPromise = flight;
+      const controller = new AbortController();
+      const refresh = this.refreshSession(stored, generation, controller.signal);
+      const createdFlight: RefreshFlight = {
+        generation,
+        controller,
+        promise: refresh,
+        waiters: 0,
+        settled: false,
+      };
+      flight = createdFlight;
+      this.refreshPromise = createdFlight;
       void refresh.finally(() => {
-        if (this.refreshPromise === flight) {
+        createdFlight.settled = true;
+        if (this.refreshPromise === createdFlight) {
           this.refreshPromise = undefined;
         }
       }).catch(() => undefined);
     }
 
-    const refreshed = await flight.promise;
+    let refreshed: OAuthSession;
+    try {
+      refreshed = await this.awaitRefresh(flight, signal);
+    } catch (error) {
+      if (error instanceof OAuthError && error.code === "auth_required") {
+        throw error;
+      }
+      this.assertGeneration(generation);
+      throw error;
+    }
     this.assertGeneration(generation);
     return this.credentialsFrom(refreshed);
+  }
+
+  private async awaitRefresh(
+    flight: RefreshFlight,
+    signal: AbortSignal | undefined,
+  ): Promise<OAuthSession> {
+    flight.waiters += 1;
+    try {
+      if (signal === undefined) {
+        return await flight.promise;
+      }
+      if (signal.aborted) {
+        throw new OAuthError("token_request_cancelled", "The ChatGPT OAuth token request was cancelled.");
+      }
+      return await new Promise<OAuthSession>((resolve, reject) => {
+        const onAbort = (): void => {
+          reject(new OAuthError(
+            "token_request_cancelled",
+            "The ChatGPT OAuth token request was cancelled.",
+          ));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        void flight.promise.then(resolve, reject).finally(() => {
+          signal.removeEventListener("abort", onAbort);
+        }).catch(() => undefined);
+      });
+    } finally {
+      flight.waiters -= 1;
+      if (flight.waiters === 0 && !flight.settled && !flight.controller.signal.aborted) {
+        flight.controller.abort();
+      }
+    }
   }
 
   public async signOut(): Promise<void> {
@@ -280,8 +347,8 @@ export class OAuthManager {
       "callback_closed",
       "ChatGPT sign-in was cancelled.",
     );
+    this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     let callbackCleanupError: OAuthError | undefined;
     if (active) {
       const failure = await this.rejectActive(active, cancellation);
@@ -346,11 +413,11 @@ export class OAuthManager {
         active.redirectUri,
         active.verifier,
         active.generation,
+        active.tokenController.signal,
       );
       this.assertActiveGeneration(active);
       await this.saveIfCurrent(session, active.generation);
       this.assertActiveGeneration(active);
-      this.session = session;
       const closeError = await this.closeActiveServer(active);
       if (closeError !== undefined) {
         throw closeError;
@@ -412,6 +479,7 @@ export class OAuthManager {
     redirectUri: string,
     verifier: string,
     generation: number,
+    signal: AbortSignal,
   ): Promise<OAuthSession> {
     const payload = await this.postToken({
       grant_type: "authorization_code",
@@ -419,7 +487,7 @@ export class OAuthManager {
       redirect_uri: redirectUri,
       client_id: CHATGPT_CODEX_PROFILE.clientId,
       code_verifier: verifier,
-    }, generation);
+    }, generation, signal);
     this.assertGeneration(generation);
     return this.sessionFromTokenResponse(payload, true);
   }
@@ -427,42 +495,93 @@ export class OAuthManager {
   private async refreshSession(
     previous: OAuthSession,
     generation: number,
+    signal: AbortSignal,
   ): Promise<OAuthSession> {
     const payload = await this.postToken({
       grant_type: "refresh_token",
       refresh_token: previous.refreshToken,
       client_id: CHATGPT_CODEX_PROFILE.clientId,
-    }, generation);
+    }, generation, signal);
     this.assertGeneration(generation);
 
     const session = this.sessionFromTokenResponse(payload, false, previous);
     this.assertGeneration(generation);
     await this.saveIfCurrent(session, generation);
     this.assertGeneration(generation);
-    this.session = session;
     return session;
   }
 
   private async postToken(
     fields: Record<string, string>,
     generation?: number,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     let response: OAuthHttpResponse;
+    const controller = new AbortController();
+    let timedOut = false;
+    const onParentAbort = (): void => controller.abort();
+    if (signal?.aborted) {
+      onParentAbort();
+    } else {
+      signal?.addEventListener("abort", onParentAbort, { once: true });
+    }
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.tokenTimeoutMs);
+    timeout.unref?.();
     try {
-      response = await this.fetchToken(CHATGPT_CODEX_PROFILE.tokenUrl, {
+      const request = Promise.resolve().then(() => this.fetchToken(CHATGPT_CODEX_PROFILE.tokenUrl, {
         method: "POST",
         headers: {
           accept: "application/json",
           "content-type": "application/x-www-form-urlencoded",
         },
         body: new URLSearchParams(fields).toString(),
+        signal: controller.signal,
+      }));
+      response = await new Promise<OAuthHttpResponse>((resolve, reject) => {
+        const onAbort = (): void => reject(new OAuthError(
+          timedOut ? "token_request_timeout" : "token_request_cancelled",
+          timedOut
+            ? "The ChatGPT OAuth token request timed out."
+            : "The ChatGPT OAuth token request was cancelled.",
+        ));
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        void request.then(resolve, reject).finally(() => {
+          controller.signal.removeEventListener("abort", onAbort);
+        }).catch(() => undefined);
       });
     } catch (error) {
+      if (error instanceof OAuthError) {
+        throw error;
+      }
+      if (timedOut) {
+        throw new OAuthError(
+          "token_request_timeout",
+          "The ChatGPT OAuth token request timed out.",
+          error,
+        );
+      }
+      if (signal?.aborted || controller.signal.aborted) {
+        throw new OAuthError(
+          "token_request_cancelled",
+          "The ChatGPT OAuth token request was cancelled.",
+          error,
+        );
+      }
       throw new OAuthError(
         "token_exchange_failed",
         "The ChatGPT OAuth token request failed.",
         error,
       );
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onParentAbort);
     }
 
     const payload = await this.readJson(response);
@@ -605,6 +724,7 @@ export class OAuthManager {
       return primaryError;
     }
     active.terminal = true;
+    active.tokenController.abort();
     const cleanupError = await this.closeActiveServer(active, primaryError);
     const failure = this.withCleanupFailure(primaryError, cleanupError);
     this.failActive(active, failure);
@@ -696,6 +816,9 @@ export class OAuthManager {
 
   private loopbackError(error: unknown): OAuthError {
     if (error instanceof LoopbackError) {
+      if (error.code === "callback_timeout") {
+        return new OAuthError("callback_timeout", "ChatGPT OAuth callback timed out.", error);
+      }
       const cleanupError =
         error.code === "callback_response_failed"
           ? new OAuthError(
@@ -712,15 +835,12 @@ export class OAuthManager {
       }
       return cleanupError;
     }
-    if (error instanceof Error && error.message.includes("timed out")) {
-      return new OAuthError("callback_timeout", "ChatGPT OAuth callback timed out.");
-    }
     return new OAuthError("callback_closed", "The ChatGPT OAuth callback server closed.");
   }
 
   private async clearCredentials(): Promise<void> {
+    this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     await this.enqueueStorage(() => this.store.clear());
   }
 
@@ -736,9 +856,16 @@ export class OAuthManager {
 
   private async clearCredentialsIfCurrent(generation: number): Promise<void> {
     this.assertGeneration(generation);
+    this.abortRefreshFlight();
     this.lifecycle += 1;
-    this.session = undefined;
     await this.enqueueStorage(() => this.store.clear());
     this.assertGeneration(generation + 1);
+  }
+
+  private abortRefreshFlight(): void {
+    const flight = this.refreshPromise;
+    if (flight !== undefined && !flight.controller.signal.aborted) {
+      flight.controller.abort();
+    }
   }
 }

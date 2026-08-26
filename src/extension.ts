@@ -39,6 +39,18 @@ export type ChatGptModelCatalogServices = CommandDependencies["chatgptModels"] &
   restore(): Promise<number>;
 };
 
+export const createIdempotentAsyncDisposer = (
+  dispose: () => Promise<void>,
+): (() => Promise<void>) => {
+  let operation: Promise<void> | undefined;
+  return () => {
+    operation ??= Promise.resolve().then(dispose);
+    return operation;
+  };
+};
+
+let activeExtensionDisposal: (() => Promise<void>) | undefined;
+
 export const readGlobalNoProxyHosts = (configuration: {
   inspect<T>(section: string): { globalValue?: T } | undefined;
 }): readonly string[] => configuration.inspect<readonly string[]>("noProxy")?.globalValue ?? [];
@@ -62,6 +74,26 @@ export const createChatGptModelCatalogServices = (
     },
   };
 };
+
+export const createLocalModelCatalogServices = (
+  provider: CodexLanguageModelProvider,
+  session: Pick<AppServerSession, "listModels">,
+  providerCache: ModelCache,
+  transportCache: ModelCache,
+) => ({
+  refresh: async (): Promise<number> => {
+    providerCache.clear();
+    transportCache.clear();
+    const models = await session.listModels(true);
+    provider.invalidateModelInformation();
+    return models.length;
+  },
+  clear: (): void => {
+    providerCache.clear();
+    transportCache.clear();
+    provider.invalidateModelInformation();
+  },
+});
 
 export const restorePersistedChatGptModelCatalog = async (options: {
   loadSession(): Promise<unknown | undefined>;
@@ -208,6 +240,23 @@ export function activate(context: vscode.ExtensionContext): void {
     LOCAL_VENDOR_ID,
     { sapContextProvider, modelCache: localProviderCache },
   );
+  const localModelCatalog = createLocalModelCatalogServices(
+    localProvider,
+    localSession,
+    localProviderCache,
+    localModelCache,
+  );
+  const disposeExtension = createIdempotentAsyncDisposer(async () => {
+    try {
+      await Promise.allSettled([
+        chatGptTransport.dispose(),
+        localTransport.dispose(),
+      ]);
+    } finally {
+      chatGptFetch.dispose();
+    }
+  });
+  activeExtensionDisposal = disposeExtension;
   const proxySetup = createProxySetupServices({
     getProxyUrl: () => configuration.get<string>("chatgpt.proxyUrl", ""),
     setProxyUrl: async (value) => {
@@ -320,18 +369,12 @@ export function activate(context: vscode.ExtensionContext): void {
         appServerAccountType = undefined;
       },
       refreshModels: async () => {
-        localProviderCache.clear();
-        localModelCache.clear();
-        await localSession.initialize();
-        const models = await localSession.listModels();
+        const modelCount = await localModelCatalog.refresh();
         const account = await localSession.readAccount();
         appServerAccountType = account.type;
-        return models.length;
+        return modelCount;
       },
-      clearModels: () => {
-        localProviderCache.clear();
-        localModelCache.clear();
-      },
+      clearModels: () => localModelCatalog.clear(),
     },
     continuations: { clear: () => continuationRegistry.dispose() },
     diagnostics: {
@@ -377,6 +420,7 @@ export function activate(context: vscode.ExtensionContext): void {
             adtInstalled: sap.adtInstalled,
           },
           lastErrorCodes: diagnostics.snapshot(),
+          unknownErrorCount: diagnostics.unknownErrorCount(),
         }));
         diagnosticsOutput.show(true);
       },
@@ -442,8 +486,11 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     diagnosticsOutput,
     logOutput,
-    chatGptTransport,
-    localTransport,
+    {
+      dispose: () => {
+        void disposeExtension().catch(() => undefined);
+      },
+    },
   );
   void restorePersistedChatGptModelCatalog({
     loadSession: () => oauthStore.load(),
@@ -458,4 +505,16 @@ const secondsToMs = (value: number, minimum: number): number =>
 const minutesToMs = (value: number, minimum: number): number =>
   Math.max(minimum, Number.isFinite(value) ? value : minimum) * 60_000;
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> {
+  const disposeExtension = activeExtensionDisposal;
+  if (disposeExtension === undefined) {
+    return;
+  }
+  try {
+    await disposeExtension();
+  } finally {
+    if (activeExtensionDisposal === disposeExtension) {
+      activeExtensionDisposal = undefined;
+    }
+  }
+}

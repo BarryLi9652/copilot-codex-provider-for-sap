@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { request, ServerResponse } from "node:http";
+import { Agent, request, ServerResponse, type IncomingHttpHeaders } from "node:http";
 import { createServer, type Server } from "node:net";
 
 import {
@@ -8,15 +8,20 @@ import {
   LoopbackError,
 } from "../../src/transports/chatgpt-oauth/loopback-server.js";
 
-const requestUrl = (url: string, method = "GET"): Promise<{ status: number; body: string }> =>
+const requestUrl = (
+  url: string,
+  method = "GET",
+  agent?: Agent,
+): Promise<{ status: number; body: string; headers: IncomingHttpHeaders }> =>
   new Promise((resolve, reject) => {
-    const clientRequest = request(url, { method }, (response) => {
+    const clientRequest = request(url, { method, agent }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer) => chunks.push(chunk));
       response.on("end", () => {
         resolve({
           status: response.statusCode ?? 0,
           body: Buffer.concat(chunks).toString("utf8"),
+          headers: response.headers,
         });
       });
     });
@@ -43,7 +48,7 @@ const closeNetServer = (server: Server): Promise<void> =>
 
 test("loopback callback accepts only the exact GET path and closes after one callback", async () => {
   const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 2_000 });
-  const handle = await server.start();
+  const handle = await server.start("state-value");
   const redirect = new URL(handle.redirectUri);
 
   assert.equal(redirect.protocol, "http:");
@@ -79,11 +84,52 @@ test("loopback callback accepts only the exact GET path and closes after one cal
   );
 });
 
+test("wrong-state callbacks keep the same listener available for the expected state", async () => {
+  const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 2_000 });
+  const handle = await server.start("expected-state");
+  const agent = new Agent({ keepAlive: true });
+
+  try {
+    const wrongState = await requestUrl(
+      `http://127.0.0.1:${handle.port}/auth/callback?code=ignored&state=wrong-state`,
+      "GET",
+      agent,
+    );
+    assert.equal(wrongState.status, 400);
+    assert.equal(wrongState.headers.connection, "close");
+
+    const correctState = await requestUrl(
+      `http://127.0.0.1:${handle.port}/auth/callback?code=accepted&state=expected-state`,
+      "GET",
+      agent,
+    );
+    assert.equal(correctState.status, 200);
+    assert.equal(correctState.headers.connection, "close");
+    assert.equal(
+      await handle.callback,
+      `http://localhost:${handle.port}/auth/callback?code=accepted&state=expected-state`,
+    );
+    await Promise.race([
+      handle.close(),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("loopback close exceeded 500 ms")), 500);
+      }),
+    ]);
+  } finally {
+    agent.destroy();
+    await handle.close();
+  }
+});
+
 test("loopback callback timeout closes the listener without contacting OAuth", async () => {
   const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 20 });
-  const handle = await server.start();
+  const handle = await server.start("expected-state");
 
-  await assert.rejects(handle.callback, /timed out/i);
+  await assert.rejects(
+    handle.callback,
+    (error: unknown) => error instanceof LoopbackError
+      && (error.code as string) === "callback_timeout",
+  );
   await assert.rejects(
     requestUrl(`http://127.0.0.1:${handle.port}/auth/callback?code=late&state=late`),
   );
@@ -91,7 +137,7 @@ test("loopback callback timeout closes the listener without contacting OAuth", a
 
 test("response-writer failure still closes once and rejects the callback safely", async () => {
   const server = new LoopbackCallbackServer({ ports: [0], timeoutMs: 100 });
-  const handle = await server.start();
+  const handle = await server.start("state");
   const originalWriteHead = ServerResponse.prototype.writeHead;
   let resolveWriterReached!: () => void;
   const writerReached = new Promise<void>((resolve) => {
@@ -168,7 +214,7 @@ test("default production ports fall back from 1455 to 1457", async () => {
     }
 
     try {
-      handle = await new LoopbackCallbackServer({ timeoutMs: 2_000 }).start();
+      handle = await new LoopbackCallbackServer({ timeoutMs: 2_000 }).start("state");
     } catch (error) {
       throw new Error(
         `Production fallback failed to use port 1457 while 1455 was held: ${String(error)}`,

@@ -168,6 +168,82 @@ test("rejects every pending request with a redacted protocol error on malformed 
   clientInput.destroy();
 });
 
+test("bounds unterminated JSONL input while accepting a complete line at the limit", async () => {
+  const createClient = (
+    serverOutput: PassThrough,
+    clientInput: PassThrough,
+    terminations: CodexError[],
+  ): JsonlRpcClient => new JsonlRpcClient(
+    { input: clientInput, output: serverOutput },
+    {
+      requestTimeoutMs: 1_000,
+      maxLineChars: 32,
+      onDidTerminate: (error: CodexError): void => {
+        terminations.push(error);
+      },
+    },
+  );
+
+  const validOutput = new PassThrough();
+  const validInput = new PassThrough();
+  const validTerminations: CodexError[] = [];
+  const validClient = createClient(validOutput, validInput, validTerminations);
+  const method = "x".repeat(18);
+  let dispatched = false;
+  validClient.onServerNotification(method, () => {
+    dispatched = true;
+  });
+  validOutput.write(`${JSON.stringify({ method })}\n`);
+  await nextTick();
+  assert.equal(dispatched, true);
+  assert.equal(validClient.isClosed, false);
+  assert.deepEqual(validTerminations, []);
+  validClient.dispose();
+  validOutput.destroy();
+  validInput.destroy();
+
+  const oversizedOutput = new PassThrough();
+  const oversizedInput = new PassThrough();
+  const oversizedTerminations: CodexError[] = [];
+  const oversizedClient = createClient(oversizedOutput, oversizedInput, oversizedTerminations);
+  oversizedOutput.write("x".repeat(33));
+  await nextTick();
+  assert.equal(oversizedClient.isClosed, true);
+  assert.equal(oversizedTerminations.length, 1);
+  assert.equal(oversizedTerminations[0]?.code, "protocol");
+  oversizedClient.dispose();
+  oversizedOutput.destroy();
+  oversizedInput.destroy();
+
+  const completeOutput = new PassThrough();
+  const completeInput = new PassThrough();
+  const completeTerminations: CodexError[] = [];
+  const completeClient = createClient(completeOutput, completeInput, completeTerminations);
+  completeOutput.write(`${JSON.stringify({ method: "x".repeat(20) })}\n`);
+  await nextTick();
+  assert.equal(completeClient.isClosed, true);
+  assert.equal(completeTerminations[0]?.code, "protocol");
+  completeClient.dispose();
+  completeOutput.destroy();
+  completeInput.destroy();
+});
+
+test("rejects invalid JSONL line limits", () => {
+  for (const maxLineChars of [0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+    const serverOutput = new PassThrough();
+    const clientInput = new PassThrough();
+    assert.throws(
+      () => new JsonlRpcClient(
+        { input: clientInput, output: serverOutput },
+        { maxLineChars },
+      ),
+      (error: unknown) => error instanceof RangeError,
+    );
+    serverOutput.destroy();
+    clientInput.destroy();
+  }
+});
+
 test("retains safe remote JSON-RPC classification metadata without exposing its message", async () => {
   const serverOutput = new PassThrough();
   const clientInput = new PassThrough();

@@ -297,14 +297,28 @@ export class AppServerTransport implements CodexTransport {
   }
 
   public async listModels(
-    _options: { silent: boolean; forceRefresh?: boolean },
+    options: { silent: boolean; forceRefresh?: boolean },
     signal: AbortSignal,
   ): Promise<readonly CodexModel[]> {
     this.throwIfDisposed();
     if (signal.aborted) {
       throw cancellationError();
     }
-    const models = await this.session.listModels();
+    let models: readonly CodexModel[];
+    try {
+      models = await this.session.listModels(options.forceRefresh === true);
+    } catch (error) {
+      if (
+        options.silent
+        && error instanceof CodexError
+        && (error.code === "process"
+          || error.code === "authRequired"
+          || error.code === "incompatible")
+      ) {
+        return [];
+      }
+      throw error;
+    }
     if (signal.aborted) {
       throw cancellationError();
     }
@@ -521,21 +535,13 @@ export class AppServerTransport implements CodexTransport {
           instructions: buildAppServerTurnInstructions(request.instructions, request.toolMode),
         }),
       }, signal);
-      const invalidLeaseIdentity = state.lease !== lease
-        || state.generation !== lease.generation
-        || state.leaseId !== lease.leaseId;
       if (
         state.cleaned
         || state.cleanupStarted
         || this.disposed
         || signal.aborted
-        || invalidLeaseIdentity
       ) {
-        const error = state.failure ?? (
-          invalidLeaseIdentity
-            ? protocolError("turn/start")
-            : cancellationError()
-        );
+        const error = state.failure ?? cancellationError();
         if (!state.cleaned && !state.cleanupStarted) {
           state.turnId = turn.turnId;
           await this.terminateState(state, error, true);
@@ -783,7 +789,14 @@ export class AppServerTransport implements CodexTransport {
           leaseId: state.leaseId,
           ...call,
           respond: (result) => resolve(result),
-          reject,
+          reject: (error) => {
+            reject(error);
+            queueMicrotask(() => {
+              if (!state.cleaned && !state.cleanupStarted) {
+                void this.terminateState(state, error, !state.terminal);
+              }
+            });
+          },
           continue: (signal) => this.consumeState(state, signal),
         });
         state.callIds.add(call.callId);

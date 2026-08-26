@@ -1,7 +1,12 @@
 import type { TransportEvent } from "../../core/types.js";
+import { CodexError, type CodexErrorCode } from "../../core/errors.js";
 
 export interface ResponsesSseLogger {
   event(name: string, metadata?: Record<string, unknown>): void;
+}
+
+export interface ResponsesSseParserOptions {
+  maxPendingChars?: number;
 }
 
 interface FunctionCallState {
@@ -84,6 +89,13 @@ const findUsage = (payload: JsonRecord): JsonRecord | undefined => {
       : undefined;
 };
 
+const DEFAULT_MAX_PENDING_CHARS = 16_777_216;
+const RATE_LIMIT_CODES = new Set([
+  "rate_limit_exceeded",
+  "rate_limit_error",
+  "too_many_requests",
+]);
+
 export class ResponsesSseParser {
   private readonly decoder = new TextDecoder("utf-8", { fatal: true });
   private pending = "";
@@ -92,8 +104,20 @@ export class ResponsesSseParser {
   private decoderFailed = false;
   private readonly functionCalls = new Map<string, FunctionCallState>();
   private readonly emittedFunctionCallIdentities = new Set<string>();
+  private readonly maxPendingChars: number;
 
-  public constructor(private readonly logger?: ResponsesSseLogger) {}
+  public constructor(
+    private readonly logger?: ResponsesSseLogger,
+    options: ResponsesSseParserOptions = {},
+  ) {
+    const maxPendingChars = options.maxPendingChars ?? DEFAULT_MAX_PENDING_CHARS;
+    if (!Number.isFinite(maxPendingChars)
+      || !Number.isInteger(maxPendingChars)
+      || maxPendingChars <= 0) {
+      throw new RangeError("maxPendingChars must be a positive finite integer");
+    }
+    this.maxPendingChars = maxPendingChars;
+  }
 
   public push(chunk: Uint8Array | string): readonly TransportEvent[] {
     if (this.finalized || this.decoderFailed) {
@@ -102,7 +126,9 @@ export class ResponsesSseParser {
 
     if (typeof chunk === "string") {
       this.pending += chunk;
-      return this.drainFrames();
+      const events = this.drainFrames();
+      this.assertPendingLimit();
+      return events;
     }
 
     let decoded = "";
@@ -127,7 +153,9 @@ export class ResponsesSseParser {
     }
 
     this.pending += decoded;
-    return this.drainFrames();
+    const events = this.drainFrames();
+    this.assertPendingLimit();
+    return events;
   }
 
   public finish(): readonly TransportEvent[] {
@@ -151,6 +179,7 @@ export class ResponsesSseParser {
     }
 
     const events = this.drainFrames();
+    this.assertPendingLimit();
     if (this.pending.length > 0) {
       const finalFrame = this.pending;
       this.pending = "";
@@ -250,7 +279,7 @@ export class ResponsesSseParser {
 
     if (eventName === "error" || eventName === "response.failed") {
       this.report("chatgpt.sse.remote_failure", eventName);
-      return [];
+      throw this.remoteFailure(payload);
     }
 
     this.report("chatgpt.sse.unknown_event", eventName);
@@ -280,6 +309,9 @@ export class ResponsesSseParser {
     state.itemId = itemId ?? state.itemId;
     state.callId = callId ?? state.callId;
     state.name = stringValue(payload.name) ?? state.name;
+    if (state.argumentsText.length + payload.delta.length > this.maxPendingChars) {
+      throw this.protocolFailure();
+    }
     state.argumentsText += payload.delta;
 
     if (existing !== undefined && existing.key !== key) {
@@ -417,6 +449,53 @@ export class ResponsesSseParser {
 
     this.completed = true;
     return [{ type: "completed" }];
+  }
+
+  private assertPendingLimit(): void {
+    if (this.pending.length > this.maxPendingChars) {
+      throw this.protocolFailure();
+    }
+  }
+
+  private remoteFailure(payload: unknown): CodexError {
+    const root = isRecord(payload) ? payload : undefined;
+    const response = isRecord(root?.response) ? root.response : undefined;
+    const remote = isRecord(root?.error)
+      ? root.error
+      : isRecord(response?.error)
+        ? response.error
+        : undefined;
+    const status = numberValue(remote?.status)
+      ?? numberValue(response?.status)
+      ?? numberValue(root?.status);
+    const code = stringValue(remote?.code)
+      ?? stringValue(response?.code)
+      ?? stringValue(root?.code);
+    let errorCode: CodexErrorCode;
+    if (status === 401 || status === 403) {
+      errorCode = "unauthorized";
+    } else if (status === 429 || (code !== undefined && RATE_LIMIT_CODES.has(code.toLowerCase()))) {
+      errorCode = "rateLimited";
+    } else if (status === 408 || status === 504) {
+      errorCode = "timeout";
+    } else if (status !== undefined && status >= 500 && status <= 599) {
+      errorCode = "network";
+    } else {
+      errorCode = "protocol";
+    }
+    return this.failure(errorCode);
+  }
+
+  private protocolFailure(): CodexError {
+    return this.failure("protocol");
+  }
+
+  private failure(code: CodexErrorCode): CodexError {
+    this.pending = "";
+    this.functionCalls.clear();
+    this.emittedFunctionCallIdentities.clear();
+    this.finalized = true;
+    return new CodexError(code, { action: "parseChatGptSse" });
   }
 
   private report(name: string, eventName: string | undefined): void {

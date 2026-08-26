@@ -69,6 +69,36 @@ test("searches PATH entries in order before the Windows app execution alias", ()
   assert.equal(locator.resolve(), alias);
 });
 
+test("automatic Windows discovery ignores extensionless codex executables", () => {
+  const fs = new FakeFileSystem();
+  const extensionless = path.win32.normalize("C:\\Tools\\codex");
+  fs.files.add(extensionless);
+  const locator = new ExecutableLocator({
+    env: { PATH: "C:\\Tools" },
+    platform: "win32",
+    fileSystem: fs,
+  });
+
+  assert.throws(
+    () => locator.resolve(),
+    (error: unknown) => error instanceof CodexError && error.code === "process",
+  );
+});
+
+test("explicit absolute Windows extensionless executables remain supported", () => {
+  const fs = new FakeFileSystem();
+  const configured = path.win32.normalize("C:\\Tools\\codex");
+  fs.files.add(configured);
+  const locator = new ExecutableLocator({
+    configuredExecutable: configured,
+    env: {},
+    platform: "win32",
+    fileSystem: fs,
+  });
+
+  assert.equal(locator.resolve(), configured);
+});
+
 test("rejects relative configured executables and configured directories", () => {
   const relative = new ExecutableLocator({
     configuredExecutable: "codex.exe",

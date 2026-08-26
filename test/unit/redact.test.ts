@@ -25,6 +25,50 @@ test("redacts credentials, content, tool payloads, and SAP query strings", () =>
   });
 });
 
+test("redacts exact credential fields and URI userinfo without hiding safe diagnostics", () => {
+  assert.deepEqual(redactMetadata({
+    apiKey: "sk-project-secret",
+    credential: "private-value",
+    authorizationHeader: "Bearer bearer-secret",
+    proxyUrl: "http://user:pass@proxy.example:7897/path?q=1#fragment",
+    detail: "request used Authorization: Bearer bearer-secret",
+    code: "requiredToolMissing",
+    accountType: "chatgpt",
+    modelId: "gpt-test",
+  }), {
+    apiKey: "[REDACTED]",
+    credential: "[REDACTED]",
+    authorizationHeader: "[REDACTED]",
+    proxyUrl: "http://proxy.example:7897/path",
+    detail: "request used Authorization: Bearer [REDACTED]",
+    code: "requiredToolMissing",
+    accountType: "chatgpt",
+    modelId: "gpt-test",
+  });
+});
+
+test("redacts bounded token values in nested arrays without matching ordinary sk text", () => {
+  const cycle: Record<string, unknown> = {
+    values: [
+      "authorization: bearer lower-case-secret",
+      "token=sk-project-nested-secret",
+      "a normal task description",
+      "mask and flask are ordinary words",
+    ],
+  };
+  cycle.self = cycle;
+
+  assert.deepEqual(redactMetadata(cycle), {
+    values: [
+      "authorization: bearer [REDACTED]",
+      "token=[REDACTED]",
+      "a normal task description",
+      "mask and flask are ordinary words",
+    ],
+    self: "[REDACTED]",
+  });
+});
+
 test("logs only a timestamped redacted event and safe CodexError metadata", () => {
   const lines: string[] = [];
   const logger = new SafeLogger(

@@ -454,6 +454,12 @@ export class ChatGptHttpClient {
     if (error instanceof OAuthError && error.code === "auth_required") {
       return new CodexError("authRequired", { action: "signIn", cause: error });
     }
+    if (error instanceof OAuthError && error.code === "token_request_timeout") {
+      return new CodexError("timeout", { cause: error });
+    }
+    if (error instanceof OAuthError && error.code === "token_request_cancelled") {
+      return new CodexError("cancelled", { cause: error });
+    }
     return new CodexError("network", { action: "retry", cause: error });
   }
 }
