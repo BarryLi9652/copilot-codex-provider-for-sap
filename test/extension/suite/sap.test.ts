@@ -335,6 +335,23 @@ function buildsInstructionsFromOnlyCurrentlySuppliedAbapTools(): void {
   assert.match(instructions, /replace_string_in_file/);
   assert.match(instructions, /get_abap_diagnostics/);
   assert.match(instructions, /abap_activate/);
+  assert.match(instructions, /do not use generic command wrappers.*run_vscode_command.*ABAP activation/is);
+  assert.match(instructions, /success=true.*does not prove.*SAP.*activated/is);
+  assert.match(instructions, /ACTIVATED.*backend success.*verification/is);
+  assert.match(instructions, /FAILED.*explicit.*error/is);
+  assert.match(instructions, /UNKNOWN.*evidence.*unavailable/is);
+  assert.match(instructions, /HTTP 400.*lock error.*Project must not be <null>.*stop/is);
+  assert.match(instructions, /no more than three explicitly named.*do not use memory or todo-list tools/is);
+  assert.match(instructions, /user supplies.*object type.*reuse it.*do not search.*unless.*lookup fails/is);
+  assert.match(instructions, /exact Workspace URI.*get_abap_object_workspace_uri.*abap_activate/is);
+  assert.match(instructions, /never construct.*adt:\/\/.*\/sap\/bc\/adt/is);
+  assert.match(instructions, /before calling.*abap_activate.*must call.*get_abap_object_workspace_uri/is);
+  assert.match(instructions, /never pass.*search.*ADT.*\/sap\/bc\/adt.*abap_activate/is);
+  assert.match(instructions, /only.*activation boundary.*does not.*creation.*query.*search.*source read/is);
+  assert.match(instructions, /no verified Workspace URI.*resolver.*not supplied.*do not call.*abap_activate.*UNKNOWN/is);
+  assert.match(instructions, /do not repeat equivalent lookups.*read_file.*get_abap_object_lines/is);
+  assert.match(instructions, /no supplied lock-query tool.*lock precheck.*unavailable/is);
+  assert.match(instructions, /for each object.*activate.*immediately diagnose.*one final batched diagnostic/is);
   assert.doesNotMatch(instructions, /future_abap_tool/);
   assert.match(withoutWriteTool, /no write-capable supplied tool.*do not claim.*modification was completed/i);
 
