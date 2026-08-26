@@ -101,7 +101,7 @@ Detected local prerequisites (read-only inspection):
 
 No account identity, SAP authority, source, callback URL or tool payload was recorded.
 
-## 0.1.9 settings and Manager acceptance
+## 0.2.1 release acceptance
 
 Automated release evidence is recorded only after the final `npm run package` verification. The required regressions are:
 
@@ -114,9 +114,11 @@ Automated release evidence is recorded only after the final `npm run package` ve
 | Command palette | Only `Codex Copilot Manager` is contributed as a visible command |
 | Manager dispatch | Every existing management operation remains registered and the selected action reaches its existing safe handler |
 | SAP proxy bypass | Manager preserves and de-duplicates existing VS Code `http.noProxy` entries; cancelling does not write settings |
+| Activation evidence | Activation uses an exact Workspace URI and reports success only from explicit SAP backend evidence |
+| Activation failure | Lock, HTTP 400 and missing-project failures stop without switching to a generic command wrapper |
 | Safety regression | Local App Server safety, Copilot tool ownership and SAP/ABAP FS boundaries remain unchanged |
 
-Interactive checks after installing the 0.1.9 VSIX:
+Interactive checks after installing the 0.2.1 VSIX:
 
 1. Open `Codex Copilot Manager` from `Ctrl+Shift+P` and verify the ChatGPT OAuth, Local Codex and Extension groups.
 2. Select `Open Settings`, leave both ChatGPT request settings at `modelDefault`, and confirm normal OAuth chat.

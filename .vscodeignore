@@ -11,6 +11,7 @@ test/**
 src/**
 scripts/**
 docs/superpowers/**
+docs/2026-08-25-deep-code-review.md
 .editorconfig
 .gitignore
 .npmrc

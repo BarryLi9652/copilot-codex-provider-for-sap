@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-08-26
+
+- Hardened Local Codex process supervision against asynchronous spawn failures, overlapping start/stop/restart operations, stale child events and bounded termination failures.
+- Added cancellation and time limits to OAuth token operations, preserved the loopback listener after invalid-state callbacks, and aligned Local model refresh and executable discovery with current App Server behavior.
+- Bounded JSONL and SSE buffering, strengthened diagnostic redaction, reported required-tool and unknown failures safely, and released expired tool continuations without weakening Copilot-owned tool execution.
+- Added bounded image token estimates, idempotent awaited extension shutdown and reusable proxy-aware ChatGPT connections to reduce repeated setup overhead.
+- Required exact ABAP FS Workspace URIs and explicit SAP backend evidence for activation; generic command completion and host `success=true` markers no longer count as proof of activation.
+- Bounded small activation-only workflows, stopped on lock/HTTP 400/project errors, and reused verified SAP lookups while preserving object creation, query, source-read and diagnostic behavior.
+- Preserved the safety architecture: the Provider does not execute Copilot tools or modify SAP, Local App Server remains read-only with approvals disabled, and ABAP FS/SAP ADT continue to own SAP operations.
+
 ## 0.1.9 — 2026-08-24
 
 - Fixed ChatGPT OAuth Fast mode by encoding the user-facing `fast` choice as the private backend's `service_tier: priority` value while continuing to omit the field for `modelDefault`.

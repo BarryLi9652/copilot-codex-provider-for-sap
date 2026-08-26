@@ -27,12 +27,12 @@ V1 明确不使用官方 OpenAI API、不要求 API key，也不连接 ADT MCP�
 
 ## 安装 VSIX
 
-1. 构建或取得 `dist/codex-copilot-provider-for-sap-0.1.9.vsix`。
+1. 构建或取得 `dist/codex-copilot-provider-for-sap-0.2.1.vsix`。
 2. 在 VS Code 执行 `Extensions: Install from VSIX...`。
 3. 重载窗口。
 
 ```powershell
-code --install-extension .\dist\codex-copilot-provider-for-sap-0.1.9.vsix
+code --install-extension .\dist\codex-copilot-provider-for-sap-0.2.1.vsix
 ```
 
 ## 快速开始
