@@ -40,6 +40,99 @@ test("frames nested SAP metadata as one escaped JSON data envelope", () => {
   assert.equal(data.diagnostics?.[0]?.message, diagnosticMessage);
 });
 
+test("requires SAP backend evidence before reporting activation success", () => {
+  const instructions = buildSapInstructions({
+    abapFsInstalled: true,
+    adtInstalled: true,
+    activeDocument: {
+      uri: "adt://kic/$TMP/Dictionary/Database Tables/ZDEMO.abap",
+      languageId: "abap",
+      dirty: false,
+    },
+    diagnostics: [],
+  }, ["run_vscode_command", "get_abap_object_info", "get_errors"]);
+
+  assert.match(instructions, /do not use generic command wrappers.*run_vscode_command.*ABAP activation/is);
+  assert.match(instructions, /success=true.*does not prove.*SAP.*activated/is);
+  assert.match(instructions, /ACTIVATED.*backend success.*verification/is);
+  assert.match(instructions, /FAILED.*explicit.*error/is);
+  assert.match(instructions, /UNKNOWN.*evidence.*unavailable/is);
+  assert.match(instructions, /HTTP 400.*lock error.*Project must not be <null>.*stop/is);
+  assert.match(instructions, /do not switch activation tools.*installed extension source/is);
+});
+
+test("bounds planning for small activation-only SAP verification", () => {
+  const instructions = buildSapInstructions({
+    abapFsInstalled: true,
+    adtInstalled: true,
+    activeDocument: {
+      uri: "adt://kic/$TMP/Dictionary/Database Tables/ZDEMO.abap",
+      languageId: "abap",
+      dirty: false,
+    },
+    diagnostics: [],
+  }, [
+    "search_abap_objects",
+    "get_abap_object_info",
+    "get_abap_object_workspace_uri",
+    "get_abap_object_lines",
+    "abap_activate",
+    "get_abap_diagnostics",
+  ]);
+
+  assert.match(instructions, /no more than three explicitly named.*do not use memory or todo-list tools/is);
+  assert.match(instructions, /user supplies.*object type.*reuse it.*do not search.*unless.*lookup fails/is);
+  assert.match(instructions, /exact Workspace URI.*get_abap_object_workspace_uri.*abap_activate/is);
+  assert.match(instructions, /never construct.*adt:\/\/.*\/sap\/bc\/adt/is);
+  assert.match(instructions, /reuse.*object types.*workspace URIs.*do not repeat equivalent lookups/is);
+  assert.match(instructions, /do not read the same source through both.*read_file.*get_abap_object_lines/is);
+  assert.match(instructions, /do not use .*open_object.*full-source reads to infer.*lock.*saved state/is);
+  assert.match(instructions, /no supplied lock-query tool.*lock precheck.*unavailable.*activation result.*lock error/is);
+  assert.match(instructions, /for each object.*activate.*immediately diagnose.*one final batched diagnostic/is);
+});
+
+test("requires a verified workspace URI only at the activation boundary", () => {
+  const instructions = buildSapInstructions({
+    abapFsInstalled: true,
+    adtInstalled: true,
+    activeDocument: {
+      uri: "adt://kic/$TMP/Dictionary/Database Tables/ZDEMO.abap",
+      languageId: "abap",
+      dirty: false,
+    },
+    diagnostics: [],
+  }, [
+    "search_abap_objects",
+    "get_abap_object_workspace_uri",
+    "abap_activate",
+  ]);
+
+  assert.match(
+    instructions,
+    /before calling.*abap_activate.*no already verified.*Workspace URI.*must call.*get_abap_object_workspace_uri/is,
+  );
+  assert.match(
+    instructions,
+    /never pass.*search.*ADT.*\/sap\/bc\/adt.*abap_activate/is,
+  );
+  assert.match(
+    instructions,
+    /supplies.*object type.*get_abap_object_workspace_uri.*directly.*do not search.*lookup fails/is,
+  );
+  assert.match(
+    instructions,
+    /lookup fails.*search.*correct.*object type.*retry.*once/is,
+  );
+  assert.match(
+    instructions,
+    /only.*activation boundary.*does not.*creation.*query.*search.*source read/is,
+  );
+  assert.match(
+    instructions,
+    /no verified Workspace URI.*resolver.*not supplied.*do not call.*abap_activate.*UNKNOWN/is,
+  );
+});
+
 test("hard-bounds final framed instructions after worst-case JSON escape expansion", () => {
   const expansion = "<>[]".repeat(50_000);
   const instructions = buildSapInstructions({
