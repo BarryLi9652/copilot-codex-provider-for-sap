@@ -5,6 +5,7 @@ export const MANAGER_COMMAND_ID = "copilotCodex.manager" as const;
 export const MANAGER_ACTION_IDS = [
   "copilotCodex.chatgpt.signIn",
   "copilotCodex.chatgpt.signInManual",
+  "copilotCodex.chatgpt.importLocalSession",
   "copilotCodex.chatgpt.signOut",
   "copilotCodex.chatgpt.refreshModels",
   "copilotCodex.local.selectExecutable",
@@ -162,6 +163,7 @@ export interface CommandDependencies {
   readonly oauth: {
     signIn(openExternal: (url: string) => Promise<boolean>): Promise<unknown>;
     completeManualCallback(url: string): Promise<unknown>;
+    importLocalSession?(): Promise<void>;
     signOut(): Promise<void>;
     clearSecret(): Promise<void>;
   };
@@ -236,6 +238,14 @@ export function createCommandServices(
       await dependencies.oauth.completeManualCallback(callbackUrl);
       const count = await dependencies.chatgptModels.refresh();
       await ui.showInformation(`Manual ChatGPT callback completed (${count} models).`);
+    }),
+    "copilotCodex.chatgpt.importLocalSession": safe(async () => {
+      if (dependencies.oauth.importLocalSession === undefined) {
+        throw new Error("Importing the local Codex ChatGPT session is unavailable.");
+      }
+      await dependencies.oauth.importLocalSession();
+      const count = await dependencies.chatgptModels.refresh();
+      await ui.showInformation(`Local Codex ChatGPT session imported (${count} models).`);
     }),
     "copilotCodex.chatgpt.signOut": safe(async () => {
       try {

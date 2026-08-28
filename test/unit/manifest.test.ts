@@ -54,11 +54,12 @@ test("manifest contributes model-default ChatGPT reasoning and speed overrides",
   });
 });
 
-test("manifest exposes the Codex Copilot Manager and cache stats commands", async () => {
+test("manifest exposes the Codex Copilot Manager, local-session import, and cache stats commands", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8"));
 
   assert.deepEqual(manifest.contributes.commands, [
     { command: "copilotCodex.manager", title: "Codex Copilot Manager" },
+    { command: "copilotCodex.chatgpt.importLocalSession", title: "Import Local Codex ChatGPT Session" },
     { command: "copilotCodex.cacheStats.show", title: "Show Codex Cache Statistics" },
     { command: "copilotCodex.cacheStats.reset", title: "Reset Codex Cache Statistics" },
   ]);

@@ -18,6 +18,7 @@
     "onCommand:copilotCodex.manager",
     "onCommand:copilotCodex.chatgpt.signIn",
     "onCommand:copilotCodex.chatgpt.signInManual",
+    "onCommand:copilotCodex.chatgpt.importLocalSession",
     "onCommand:copilotCodex.chatgpt.signOut",
     "onCommand:copilotCodex.chatgpt.refreshModels",
     "onCommand:copilotCodex.local.selectExecutable",
@@ -31,6 +32,7 @@
   "contributes": {
     "commands": [
       { "command": "copilotCodex.manager", "title": "Codex Copilot Manager" },
+      { "command": "copilotCodex.chatgpt.importLocalSession", "title": "Import Local Codex ChatGPT Session" },
       { "command": "copilotCodex.cacheStats.show", "title": "Show Codex Cache Statistics" },
       { "command": "copilotCodex.cacheStats.reset", "title": "Reset Codex Cache Statistics" }
     ],

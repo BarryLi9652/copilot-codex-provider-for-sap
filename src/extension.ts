@@ -28,6 +28,7 @@ import { ProcessSupervisor } from "./transports/app-server/process-supervisor";
 import { ToolContinuationRegistry } from "./transports/app-server/tool-continuations";
 import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
+import { readLocalCodexOAuthSession } from "./transports/chatgpt-oauth/local-cli-session";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
 import { createProxyAwareFetch } from "./transports/chatgpt-oauth/proxy-fetch";
 import { CacheStatsTracker } from "./core/cache-stats";
@@ -136,6 +137,7 @@ const MANAGER_QUICK_PICK_ITEMS: readonly ManagerQuickPickItem[] = [
   { label: "ChatGPT OAuth", kind: vscode.QuickPickItemKind.Separator },
   { label: "$(sign-in) Sign In with ChatGPT", action: "copilotCodex.chatgpt.signIn" },
   { label: "$(link) Complete ChatGPT Sign-In Manually", action: "copilotCodex.chatgpt.signInManual" },
+  { label: "$(database-import) Import Local Codex ChatGPT Session", action: "copilotCodex.chatgpt.importLocalSession" },
   { label: "$(sign-out) Sign Out ChatGPT", action: "copilotCodex.chatgpt.signOut" },
   { label: "$(refresh) Refresh ChatGPT Models", action: "copilotCodex.chatgpt.refreshModels" },
   { label: "$(globe) Configure ChatGPT Proxy", action: "configureProxy" },
@@ -349,6 +351,7 @@ export function activate(context: vscode.ExtensionContext): void {
     oauth: {
       signIn: (openExternal) => oauthManager.signIn(openExternal),
       completeManualCallback: (url) => oauthManager.completeManualCallback(url),
+      importLocalSession: async () => oauthStore.save(await readLocalCodexOAuthSession()),
       signOut: () => oauthManager.signOut(),
       clearSecret: () => oauthManager.signOut(),
     },

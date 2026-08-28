@@ -33,6 +33,7 @@ const expectedCommands = [
   "copilotCodex.manager",
   "copilotCodex.chatgpt.signIn",
   "copilotCodex.chatgpt.signInManual",
+  "copilotCodex.chatgpt.importLocalSession",
   "copilotCodex.chatgpt.signOut",
   "copilotCodex.chatgpt.refreshModels",
   "copilotCodex.local.selectExecutable",
