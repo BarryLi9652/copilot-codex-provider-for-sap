@@ -53,6 +53,38 @@ test("tracker reset clears accumulated stats", () => {
   assert.equal(snapshot.cacheRate, undefined);
 });
 
+test("tracker tracks last-turn context usage", () => {
+  const tracker = new CacheStatsTracker("Test");
+  tracker.record({ inputTokens: 1000, cachedTokens: 800, outputTokens: 50 });
+  tracker.record({ inputTokens: 2500, cachedTokens: 2000, outputTokens: 120 });
+
+  const snapshot = tracker.snapshot();
+  // The latest turn's input approximates the session's current context size.
+  assert.equal(snapshot.lastInputTokens, 2500);
+  assert.equal(snapshot.lastOutputTokens, 120);
+});
+
+test("tracker keeps previous last-turn fields when an event omits them", () => {
+  const tracker = new CacheStatsTracker("Test");
+  tracker.record({ inputTokens: 1000, outputTokens: 50 });
+  // A follow-up event carrying only output (e.g. a zero input delta).
+  tracker.record({ outputTokens: 10 });
+
+  const snapshot = tracker.snapshot();
+  assert.equal(snapshot.lastInputTokens, 1000);
+  assert.equal(snapshot.lastOutputTokens, 10);
+});
+
+test("tracker reset clears last-turn context usage", () => {
+  const tracker = new CacheStatsTracker("Test");
+  tracker.record({ inputTokens: 1000, outputTokens: 50 });
+  tracker.reset();
+
+  const snapshot = tracker.snapshot();
+  assert.equal(snapshot.lastInputTokens, undefined);
+  assert.equal(snapshot.lastOutputTokens, undefined);
+});
+
 test("formats tokens and rates for display", () => {
   assert.equal(formatTokens(999), "999");
   assert.equal(formatTokens(1000), "1.0k");

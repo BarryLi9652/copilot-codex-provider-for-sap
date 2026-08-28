@@ -15,6 +15,17 @@ export interface CacheStatsSnapshot {
    * Undefined when no usage has been recorded yet.
    */
   readonly cacheRate: number | undefined;
+  /**
+   * Input tokens of the most recent usage event. Transports report per-turn
+   * totals for input (the full prompt of that turn), so this approximates the
+   * session's current context size. Undefined until an event carries input.
+   */
+  readonly lastInputTokens: number | undefined;
+  /**
+   * Output tokens of the most recent usage event. Undefined until an event
+   * carries output.
+   */
+  readonly lastOutputTokens: number | undefined;
 }
 type ChangeListener = () => void;
 
@@ -30,6 +41,8 @@ export class CacheStatsTracker {
   private cachedTokens = 0;
   private outputTokens = 0;
   private turns = 0;
+  private lastInputTokens: number | undefined;
+  private lastOutputTokens: number | undefined;
 
   public constructor(public readonly label: string) {}
 
@@ -50,6 +63,15 @@ export class CacheStatsTracker {
     this.cachedTokens += usage.cachedTokens ?? 0;
     this.outputTokens += usage.outputTokens ?? 0;
     this.turns += 1;
+    // Each usage event carries the turn's own input tokens (the full prompt
+    // of that turn), so the latest event's input approximates the session's
+    // current context size. Fields the event omits keep the previous value.
+    if (usage.inputTokens !== undefined) {
+      this.lastInputTokens = usage.inputTokens;
+    }
+    if (usage.outputTokens !== undefined) {
+      this.lastOutputTokens = usage.outputTokens;
+    }
     this.notifyChanged();
   }
 
@@ -63,6 +85,8 @@ export class CacheStatsTracker {
       cacheRate: this.inputTokens > 0
         ? Math.min(1, this.cachedTokens / this.inputTokens)
         : undefined,
+      lastInputTokens: this.lastInputTokens,
+      lastOutputTokens: this.lastOutputTokens,
     };
   }
 
@@ -71,6 +95,8 @@ export class CacheStatsTracker {
     this.cachedTokens = 0;
     this.outputTokens = 0;
     this.turns = 0;
+    this.lastInputTokens = undefined;
+    this.lastOutputTokens = undefined;
     this.notifyChanged();
   }
 

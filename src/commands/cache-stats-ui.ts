@@ -60,9 +60,16 @@ export class CacheStatsStatusBar {
         ? formatCacheRate(snapshot.cacheRate)
         : "—";
       item.text = `$(database) Codex·${snapshot.label} ${rate}`;
+      const contextLine = snapshot.lastInputTokens !== undefined
+        ? `- Context (last turn): ${formatTokens(snapshot.lastInputTokens)} in`
+          + `${snapshot.lastOutputTokens !== undefined
+            ? ` + ${formatTokens(snapshot.lastOutputTokens)} out`
+            : ""} tokens\n`
+        : "";
       item.tooltip = new vscode.MarkdownString(
         `**Codex · ${snapshot.label}** (session)\n\n`
         + `- Cache hit rate: **${rate}**\n`
+        + contextLine
         + `- Cached input: ${formatTokens(snapshot.cachedTokens)} tokens\n`
         + `- Total input: ${formatTokens(snapshot.inputTokens)} tokens\n`
         + `- Total output: ${formatTokens(snapshot.outputTokens)} tokens\n`
@@ -87,7 +94,11 @@ export class CacheStatsStatusBar {
       picks.push({
         label: `$(database) Codex · ${s.label}`,
         description: `cache ${formatCacheRate(s.cacheRate ?? 0)} · in ${formatTokens(s.inputTokens)} · out ${formatTokens(s.outputTokens)} · ${s.turns} turns`,
-        detail: `cached ${formatTokens(s.cachedTokens)} of ${formatTokens(s.inputTokens)} input tokens served from the prompt cache`,
+        detail: `cached ${formatTokens(s.cachedTokens)} of ${formatTokens(s.inputTokens)} input tokens served from the prompt cache`
+          + (s.lastInputTokens !== undefined
+            ? ` · context (last turn): ${formatTokens(s.lastInputTokens)} in`
+              + (s.lastOutputTokens !== undefined ? ` + ${formatTokens(s.lastOutputTokens)} out` : "")
+            : ""),
       });
     }
     picks.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
