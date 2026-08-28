@@ -105,8 +105,21 @@ const toToolSpec = (tool: vscode.LanguageModelChatTool): ToolSpec => ({
 });
 
 const toCodexRequestFromInput = (input: ToCodexRequestInput): CodexRequest => {
-  const modelOptions = (input.options as { modelOptions?: Record<string, unknown> }).modelOptions;
-  const reasoningEffort = modelOptions?.reasoningEffort;
+  const options = input.options as unknown as Record<string, unknown>;
+  // Copilot sends the picker-selected effort via `modelOptions.reasoningEffort`
+  // on the direct path, while the agent-host BYOK bridge forwards it as
+  // `configuration.reasoningEffort`; accept all known carriers.
+  const modelOptions = isObject(options.modelOptions) ? options.modelOptions : undefined;
+  const configuration = isObject(options.configuration) ? options.configuration : undefined;
+  const modelConfiguration = isObject(options.modelConfiguration)
+    ? options.modelConfiguration
+    : undefined;
+  const reasoningEffortCandidate = modelOptions?.reasoningEffort
+    ?? modelConfiguration?.reasoningEffort
+    ?? configuration?.reasoningEffort;
+  const reasoningEffort = typeof reasoningEffortCandidate === "string"
+    ? reasoningEffortCandidate
+    : undefined;
   return {
     requestId: input.requestId,
     modelId: input.model.id,
@@ -116,7 +129,7 @@ const toCodexRequestFromInput = (input: ToCodexRequestInput): CodexRequest => {
       ? "required"
       : "auto",
     instructions: input.instructions ?? "",
-    ...(typeof reasoningEffort === "string" ? { reasoningEffort } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
   };
 };
 
