@@ -30,6 +30,8 @@ import { OAuthManager } from "./transports/chatgpt-oauth/oauth-manager";
 import { OAuthStore } from "./transports/chatgpt-oauth/oauth-store";
 import { ChatGptOAuthTransport } from "./transports/chatgpt-oauth/oauth-transport";
 import { createProxyAwareFetch } from "./transports/chatgpt-oauth/proxy-fetch";
+import { CacheStatsTracker } from "./core/cache-stats";
+import { CacheStatsStatusBar } from "./commands/cache-stats-ui";
 import {
   resolveChatGptRequestOverrides,
   type ChatGptRequestOverrides,
@@ -197,6 +199,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const localProviderCache = new ModelCache(catalogCacheMs);
   const chatGptModelCache = new ModelCache(catalogCacheMs);
   const localModelCache = new ModelCache(catalogCacheMs);
+  const chatGptCacheStats = new CacheStatsTracker("OAuth");
+  const localCacheStats = new CacheStatsTracker("Local");
   const chatGptTransport = new ChatGptOAuthTransport(oauthManager, {
     fetch: chatGptFetch,
     timeoutMs: requestTimeoutMs,
@@ -207,7 +211,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const chatGptProvider = new CodexLanguageModelProvider(
     chatGptTransport,
     CHATGPT_VENDOR_ID,
-    { sapContextProvider, modelCache: chatGptProviderCache },
+    { sapContextProvider, modelCache: chatGptProviderCache, cacheStats: chatGptCacheStats },
   );
   const chatGptModelCatalog = createChatGptModelCatalogServices(
     chatGptProvider,
@@ -238,7 +242,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const localProvider = new CodexLanguageModelProvider(
     localTransport,
     LOCAL_VENDOR_ID,
-    { sapContextProvider, modelCache: localProviderCache },
+    { sapContextProvider, modelCache: localProviderCache, cacheStats: localCacheStats },
   );
   const localModelCatalog = createLocalModelCatalogServices(
     localProvider,
@@ -484,6 +488,11 @@ export function activate(context: vscode.ExtensionContext): void {
       LOCAL_VENDOR_ID,
       localProvider,
     ),
+    new CacheStatsStatusBar([chatGptCacheStats, localCacheStats], {
+      output: diagnosticsOutput,
+    }),
+    chatGptCacheStats,
+    localCacheStats,
     diagnosticsOutput,
     logOutput,
     {

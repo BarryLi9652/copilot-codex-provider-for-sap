@@ -380,3 +380,57 @@ test("ignores comment and metadata-only keepalive frames without unknown-event l
   ].join(""))), []);
   assert.deepEqual(reports, []);
 });
+
+test("extracts cached input tokens from response.completed usage", () => {
+  const parser = new ResponsesSseParser();
+  const events = parser.push(encoder.encode([
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{",
+    "\"input_tokens\":1000,",
+    "\"input_tokens_details\":{\"cached_tokens\":800},",
+    "\"output_tokens\":120}}}\n\n",
+  ].join("")));
+
+  assert.deepEqual(events, [
+    {
+      type: "usage",
+      inputTokens: 1000,
+      cachedTokens: 800,
+      outputTokens: 120,
+    },
+    { type: "completed" },
+  ]);
+});
+
+test("extracts cached tokens from the legacy cached_input_tokens field", () => {
+  const parser = new ResponsesSseParser();
+  const events = parser.push(encoder.encode([
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"usage\":{",
+    "\"input_tokens\":500,\"cached_input_tokens\":250,\"output_tokens\":10}}\n\n",
+  ].join("")));
+
+  assert.deepEqual(events, [
+    {
+      type: "usage",
+      inputTokens: 500,
+      cachedTokens: 250,
+      outputTokens: 10,
+    },
+    { type: "completed" },
+  ]);
+});
+
+test("emits usage without cached tokens when the backend omits cache details", () => {
+  const parser = new ResponsesSseParser();
+  const events = parser.push(encoder.encode([
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{",
+    "\"input_tokens\":700,\"output_tokens\":20}}}\n\n",
+  ].join("")));
+
+  assert.deepEqual(events, [
+    { type: "usage", inputTokens: 700, outputTokens: 20 },
+    { type: "completed" },
+  ]);
+});

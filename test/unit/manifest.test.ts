@@ -54,13 +54,14 @@ test("manifest contributes model-default ChatGPT reasoning and speed overrides",
   });
 });
 
-test("manifest exposes one Codex Copilot Manager command", async () => {
+test("manifest exposes the Codex Copilot Manager and cache stats commands", async () => {
   const manifest = JSON.parse(await readFile("package.json", "utf8"));
 
-  assert.deepEqual(manifest.contributes.commands, [{
-    command: "copilotCodex.manager",
-    title: "Codex Copilot Manager",
-  }]);
+  assert.deepEqual(manifest.contributes.commands, [
+    { command: "copilotCodex.manager", title: "Codex Copilot Manager" },
+    { command: "copilotCodex.cacheStats.show", title: "Show Codex Cache Statistics" },
+    { command: "copilotCodex.cacheStats.reset", title: "Reset Codex Cache Statistics" },
+  ]);
 });
 
 test("release metadata uses the new Marketplace identity and names the 0.2.1 VSIX consistently", async () => {

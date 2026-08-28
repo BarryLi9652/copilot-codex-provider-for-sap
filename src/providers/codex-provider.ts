@@ -18,6 +18,7 @@ import {
   resolveModelReasoningEffort,
   type CodexReasoningEffort,
 } from "../core/model-effort.js";
+import { type CacheStatsTracker } from "../core/cache-stats.js";
 import { SapContextProvider } from "../sap/context.js";
 import { buildSapInstructions } from "../sap/instructions.js";
 import { classifySapTools } from "../sap/tool-capabilities.js";
@@ -37,6 +38,7 @@ export interface CodexLanguageModelProviderOptions {
   requestIdFactory?: () => string;
   instructions?: string;
   sapContextProvider?: SapContextProvider;
+  cacheStats?: CacheStatsTracker;
 }
 
 const isCancelledError = (error: unknown): boolean =>
@@ -181,6 +183,7 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
   private readonly requestIdFactory: () => string;
   private readonly instructions: string;
   private readonly sapContextProvider: SapContextProvider;
+  private readonly cacheStats: CacheStatsTracker | undefined;
   public readonly onDidChangeLanguageModelChatInformation =
     this.modelInformationChanged.event;
 
@@ -194,6 +197,7 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
     this.requestIdFactory = resolvedOptions.requestIdFactory ?? randomUUID;
     this.instructions = resolvedOptions.instructions ?? "";
     this.sapContextProvider = resolvedOptions.sapContextProvider ?? new SapContextProvider();
+    this.cacheStats = resolvedOptions.cacheStats;
   }
 
   public invalidateModelInformation(): void {
@@ -275,6 +279,9 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
       for await (const event of this.transport.generate(request, binding.signal)) {
         if (binding.signal.aborted) {
           return;
+        }
+        if (event.type === "usage") {
+          this.cacheStats?.record(event);
         }
         reportTransportEvent(event, progress);
       }

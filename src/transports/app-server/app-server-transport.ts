@@ -80,6 +80,19 @@ interface TurnState {
   readonly registrations: Disposable[];
   readonly callIds: Set<string>;
   readonly callNames: Map<string, string>;
+  /**
+   * Last-seen cumulative thread token usage from
+   * `thread/tokenUsage/updated`. The notification reports thread totals
+   * (cumulative across continuation turns), so usage events are emitted as
+   * deltas against this snapshot to avoid double counting.
+   */
+  lastThreadUsage: { inputTokens: number; cachedTokens: number; outputTokens: number } | undefined;
+  /**
+   * True once `thread/tokenUsage/updated` has been observed for this state.
+   * Used to skip the legacy `turn/usage` notification so a codex version
+   * that emits both never double counts.
+   */
+  threadUsageSeen: boolean;
   readonly surfacedCallIds: Set<string>;
   readonly receivedCallIds: Set<string>;
   readonly preResponseNotifications: PreResponseNotification[];
@@ -511,6 +524,8 @@ export class AppServerTransport implements CodexTransport {
         registrations: [],
         callIds: new Set(),
         callNames: new Map(),
+        lastThreadUsage: undefined,
+        threadUsageSeen: false,
         surfacedCallIds: new Set(),
         receivedCallIds: new Set(),
         preResponseNotifications: [],
@@ -581,6 +596,7 @@ export class AppServerTransport implements CodexTransport {
       "turn/started",
       "item/agentMessage/delta",
       "turn/usage",
+      "thread/tokenUsage/updated",
       "turn/completed",
       "turn/failed",
       "turn/error",
@@ -635,14 +651,51 @@ export class AppServerTransport implements CodexTransport {
       if (!isRecord(params)) {
         return;
       }
+      // Prefer thread/tokenUsage/updated when the codex version emits it;
+      // skip the legacy notification to avoid double counting.
+      if (state.threadUsageSeen) {
+        return;
+      }
       const usage = isRecord(params.usage) ? params.usage : params;
       const inputTokens = numberValue(usage.inputTokens ?? usage.input_tokens);
+      const cachedTokens = numberValue(usage.cachedInputTokens ?? usage.cached_input_tokens);
       const outputTokens = numberValue(usage.outputTokens ?? usage.output_tokens);
-      if (inputTokens !== undefined || outputTokens !== undefined) {
+      if (inputTokens !== undefined || outputTokens !== undefined || cachedTokens !== undefined) {
         state.queue.push({ kind: "event", event: {
           type: "usage",
           ...(inputTokens === undefined ? {} : { inputTokens }),
+          ...(cachedTokens === undefined ? {} : { cachedTokens }),
           ...(outputTokens === undefined ? {} : { outputTokens }),
+        } });
+      }
+      return;
+    }
+    if (method === "thread/tokenUsage/updated") {
+      // codex app-server (>= 0.144) reports cumulative thread token usage here,
+      // including cachedInputTokens. Emit deltas so consumers can simply sum.
+      if (!isRecord(params)) {
+        return;
+      }
+      state.threadUsageSeen = true;
+      const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : undefined;
+      const total = isRecord(tokenUsage?.total) ? tokenUsage?.total : undefined;
+      if (total === undefined) {
+        return;
+      }
+      const inputTokens = numberValue(total.inputTokens ?? total.input_tokens) ?? 0;
+      const cachedTokens = numberValue(total.cachedInputTokens ?? total.cached_input_tokens) ?? 0;
+      const outputTokens = numberValue(total.outputTokens ?? total.output_tokens) ?? 0;
+      const previous = state.lastThreadUsage ?? { inputTokens: 0, cachedTokens: 0, outputTokens: 0 };
+      state.lastThreadUsage = { inputTokens, cachedTokens, outputTokens };
+      const deltaInput = Math.max(0, inputTokens - previous.inputTokens);
+      const deltaCached = Math.max(0, cachedTokens - previous.cachedTokens);
+      const deltaOutput = Math.max(0, outputTokens - previous.outputTokens);
+      if (deltaInput > 0 || deltaCached > 0 || deltaOutput > 0) {
+        state.queue.push({ kind: "event", event: {
+          type: "usage",
+          ...(deltaInput === 0 ? {} : { inputTokens: deltaInput }),
+          ...(deltaCached === 0 ? {} : { cachedTokens: deltaCached }),
+          ...(deltaOutput === 0 ? {} : { outputTokens: deltaOutput }),
         } });
       }
       return;

@@ -30,7 +30,9 @@
   ],
   "contributes": {
     "commands": [
-      { "command": "copilotCodex.manager", "title": "Codex Copilot Manager" }
+      { "command": "copilotCodex.manager", "title": "Codex Copilot Manager" },
+      { "command": "copilotCodex.cacheStats.show", "title": "Show Codex Cache Statistics" },
+      { "command": "copilotCodex.cacheStats.reset", "title": "Reset Codex Cache Statistics" }
     ],
     "configuration": {
       "title": "Copilot Codex Provider for SAP",

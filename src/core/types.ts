@@ -50,7 +50,17 @@ export interface CodexRequest {
 export type TransportEvent =
   | { type: "text-delta"; text: string }
   | { type: "tool-call"; callId: string; name: string; input: unknown }
-  | { type: "usage"; inputTokens?: number; outputTokens?: number }
+  | {
+    type: "usage";
+    inputTokens?: number;
+    /**
+     * Input tokens served from the prompt cache for this turn
+     * (`input_tokens_details.cached_tokens` on the OAuth Responses route,
+     * `tokenUsage.*.cachedInputTokens` deltas on the Local CLI route).
+     */
+    cachedTokens?: number;
+    outputTokens?: number;
+  }
   | { type: "completed" };
 
 export interface CodexTransport {

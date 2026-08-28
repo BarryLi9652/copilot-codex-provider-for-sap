@@ -110,6 +110,7 @@ export type AppServerNotificationMethod =
   | "turn/started"
   | "item/agentMessage/delta"
   | "turn/usage"
+  | "thread/tokenUsage/updated"
   | "turn/completed"
   | "turn/failed"
   | "turn/error";

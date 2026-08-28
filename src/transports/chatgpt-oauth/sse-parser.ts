@@ -89,6 +89,16 @@ const findUsage = (payload: JsonRecord): JsonRecord | undefined => {
       : undefined;
 };
 
+/**
+ * Read cached input tokens from a Responses API usage record:
+ * `input_tokens_details.cached_tokens`, with `cached_input_tokens` as a
+ * fallback for backend variants.
+ */
+const readCachedTokens = (usage: JsonRecord): number | undefined => {
+  const details = isRecord(usage.input_tokens_details) ? usage.input_tokens_details : undefined;
+  return numberValue(details?.cached_tokens) ?? numberValue(usage.cached_input_tokens);
+};
+
 const DEFAULT_MAX_PENDING_CHARS = 16_777_216;
 const RATE_LIMIT_CODES = new Set([
   "rate_limit_exceeded",
@@ -263,10 +273,12 @@ export class ResponsesSseParser {
         if (usage !== undefined) {
           const inputTokens = numberValue(usage.input_tokens);
           const outputTokens = numberValue(usage.output_tokens);
-          if (inputTokens !== undefined || outputTokens !== undefined) {
+          const cachedTokens = readCachedTokens(usage);
+          if (inputTokens !== undefined || outputTokens !== undefined || cachedTokens !== undefined) {
             events.push({
               type: "usage",
               ...(inputTokens === undefined ? {} : { inputTokens }),
+              ...(cachedTokens === undefined ? {} : { cachedTokens }),
               ...(outputTokens === undefined ? {} : { outputTokens }),
             });
           }
