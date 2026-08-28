@@ -56,12 +56,17 @@ test("tracker reset clears accumulated stats", () => {
 test("tracker tracks last-turn context usage", () => {
   const tracker = new CacheStatsTracker("Test");
   tracker.record({ inputTokens: 1000, cachedTokens: 800, outputTokens: 50 });
-  tracker.record({ inputTokens: 2500, cachedTokens: 2000, outputTokens: 120 });
+  tracker.record({
+    inputTokens: 2500,
+    cachedTokens: 2000,
+    outputTokens: 120,
+    contextInputTokens: 9000,
+    contextOutputTokens: 420,
+  });
 
   const snapshot = tracker.snapshot();
-  // The latest turn's input approximates the session's current context size.
-  assert.equal(snapshot.lastInputTokens, 2500);
-  assert.equal(snapshot.lastOutputTokens, 120);
+  assert.equal(snapshot.lastInputTokens, 9000);
+  assert.equal(snapshot.lastOutputTokens, 420);
 });
 
 test("tracker keeps previous last-turn fields when an event omits them", () => {

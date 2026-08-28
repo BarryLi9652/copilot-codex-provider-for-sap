@@ -2,6 +2,8 @@ export interface UsageRecord {
   readonly inputTokens?: number;
   readonly cachedTokens?: number;
   readonly outputTokens?: number;
+  readonly contextInputTokens?: number;
+  readonly contextOutputTokens?: number;
 }
 
 export interface CacheStatsSnapshot {
@@ -63,14 +65,14 @@ export class CacheStatsTracker {
     this.cachedTokens += usage.cachedTokens ?? 0;
     this.outputTokens += usage.outputTokens ?? 0;
     this.turns += 1;
-    // Each usage event carries the turn's own input tokens (the full prompt
-    // of that turn), so the latest event's input approximates the session's
-    // current context size. Fields the event omits keep the previous value.
-    if (usage.inputTokens !== undefined) {
-      this.lastInputTokens = usage.inputTokens;
+    // Local CLI uses delta-based input/output for aggregation but also supplies
+    // full thread totals for the context display. Other transports use their
+    // input/output usage values directly as full current-turn totals.
+    if (usage.contextInputTokens !== undefined || usage.inputTokens !== undefined) {
+      this.lastInputTokens = usage.contextInputTokens ?? usage.inputTokens;
     }
-    if (usage.outputTokens !== undefined) {
-      this.lastOutputTokens = usage.outputTokens;
+    if (usage.contextOutputTokens !== undefined || usage.outputTokens !== undefined) {
+      this.lastOutputTokens = usage.contextOutputTokens ?? usage.outputTokens;
     }
     this.notifyChanged();
   }

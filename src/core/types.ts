@@ -60,6 +60,13 @@ export type TransportEvent =
      */
     cachedTokens?: number;
     outputTokens?: number;
+    /**
+     * Full context totals for the current turn when a transport also emits
+     * delta-based usage. Local CLI's `thread/tokenUsage/updated` is cumulative
+     * for the thread, whereas its input/output event fields are deltas.
+     */
+    contextInputTokens?: number;
+    contextOutputTokens?: number;
   }
   | { type: "completed" };
 

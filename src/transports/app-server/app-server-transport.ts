@@ -711,6 +711,8 @@ export class AppServerTransport implements CodexTransport {
           ...(deltaInput === 0 ? {} : { inputTokens: deltaInput }),
           ...(deltaCached === 0 ? {} : { cachedTokens: deltaCached }),
           ...(deltaOutput === 0 ? {} : { outputTokens: deltaOutput }),
+          contextInputTokens: inputTokens,
+          contextOutputTokens: outputTokens,
         } });
       }
       return;
