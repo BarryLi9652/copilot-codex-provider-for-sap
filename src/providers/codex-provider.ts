@@ -13,6 +13,11 @@ import type {
 import { toCodexRequest } from "./message-adapter.js";
 import { reportTransportEvent } from "./response-adapter.js";
 import { countTokens } from "./token-count.js";
+import {
+  CODEX_REASONING_EFFORTS,
+  resolveModelReasoningEffort,
+  type CodexReasoningEffort,
+} from "../core/model-effort.js";
 import { SapContextProvider } from "../sap/context.js";
 import { buildSapInstructions } from "../sap/instructions.js";
 import { classifySapTools } from "../sap/tool-capabilities.js";
@@ -24,6 +29,7 @@ const PREFLIGHT_CALL_ID_PREFIX = "copilot_codex_preflight_";
 
 type CodexLanguageModelChatInformation = vscode.LanguageModelChatInformation & {
   readonly isBYOK: true;
+  readonly configurationSchema?: Record<string, unknown>;
 };
 
 export interface CodexLanguageModelProviderOptions {
@@ -117,6 +123,43 @@ function waitForCancellation<T>(promise: Promise<T>, signal: AbortSignal): Promi
   });
 }
 
+const EFFORT_LABELS: Readonly<Record<CodexReasoningEffort, string>> = {
+  none: "None",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+};
+
+const EFFORT_DESCRIPTIONS: Readonly<Record<CodexReasoningEffort, string>> = {
+  none: "Disable reasoning for the fastest responses.",
+  low: "Fast responses with lighter reasoning.",
+  medium: "Balance reasoning depth and latency.",
+  high: "Greater reasoning depth for complex problems.",
+  xhigh: "Extra high reasoning depth.",
+  max: "Maximum reasoning depth for the hardest problems.",
+};
+
+const buildReasoningEffortConfigurationSchema = (
+  modelId: string,
+): Record<string, unknown> => {
+  const defaultEffort = resolveModelReasoningEffort(modelId) ?? "medium";
+  return {
+    properties: {
+      reasoningEffort: {
+        type: "string",
+        title: "Thinking (Codex)",
+        enum: [...CODEX_REASONING_EFFORTS],
+        enumItemLabels: CODEX_REASONING_EFFORTS.map((effort) => EFFORT_LABELS[effort]),
+        enumDescriptions: CODEX_REASONING_EFFORTS.map((effort) => EFFORT_DESCRIPTIONS[effort]),
+        default: defaultEffort,
+        group: "navigation",
+      },
+    },
+  };
+};
+
 const mapModel = (model: CodexModel): CodexLanguageModelChatInformation => ({
   id: model.id,
   name: model.name.replace(/^gpt(?:[\s-]+|$)/iu, "Codex ").trim(),
@@ -129,6 +172,7 @@ const mapModel = (model: CodexModel): CodexLanguageModelChatInformation => ({
     imageInput: model.capabilities.imageInput,
     toolCalling: model.capabilities.toolCalling ? MAX_TOOL_COUNT : false,
   },
+  configurationSchema: buildReasoningEffortConfigurationSchema(model.id),
 });
 
 export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvider {

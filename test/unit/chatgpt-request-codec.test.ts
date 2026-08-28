@@ -2,11 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import type { CodexModel, CodexRequest } from "../../src/core/types.js";
-import {
-  buildResponsesRequest,
-  resolveChatGptRequestOverrides,
-  resolveModelReasoningEffort,
-} from "../../src/transports/chatgpt-oauth/request-codec.js";
+import { buildResponsesRequest, resolveChatGptRequestOverrides } from "../../src/transports/chatgpt-oauth/request-codec.js";
+import { resolveModelReasoningEffort } from "../../src/core/model-effort.js";
 
 const model: CodexModel = {
   id: "gpt-5-codex",
@@ -157,7 +154,7 @@ test("maps the Fast setting to the ChatGPT priority service tier", () => {
     resolveChatGptRequestOverrides("high", "fast"),
   );
 
-  assert.deepEqual(body.reasoning, { effort: "high" });
+  assert.deepEqual(body.reasoning, { effort: "high", summary: "auto" });
   assert.equal(body.service_tier, "priority");
 });
 
@@ -197,12 +194,26 @@ test("per-model effort wins over the global reasoning effort setting", () => {
     { ...model, id: "gpt-5.6-sol" },
     resolveChatGptRequestOverrides("low", "modelDefault"),
   );
-  assert.deepEqual(sol.reasoning, { effort: "high" });
+  assert.deepEqual(sol.reasoning, { effort: "high", summary: "auto" });
 
   const other = buildResponsesRequest(
     request,
     { ...model, id: "gpt-5-codex" },
     resolveChatGptRequestOverrides("low", "modelDefault"),
   );
-  assert.deepEqual(other.reasoning, { effort: "low" });
+  assert.deepEqual(other.reasoning, { effort: "low", summary: "auto" });
+});
+
+test("request-scoped effort from the Copilot picker wins over per-model and global settings", () => {
+  const body = buildResponsesRequest(
+    { ...request, reasoningEffort: "xhigh" },
+    { ...model, id: "gpt-5.6-sol" },
+    resolveChatGptRequestOverrides("low", "modelDefault"),
+  );
+  assert.deepEqual(body.reasoning, { effort: "xhigh", summary: "auto" });
+});
+
+test("requests reasoning summary and encrypted reasoning replay (opencode parity)", () => {
+  const body = buildResponsesRequest(request, model);
+  assert.deepEqual(body.include, ["reasoning.encrypted_content"]);
 });

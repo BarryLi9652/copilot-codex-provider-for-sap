@@ -534,6 +534,9 @@ export class AppServerTransport implements CodexTransport {
           supportsImages,
           instructions: buildAppServerTurnInstructions(request.instructions, request.toolMode),
         }),
+        ...(request.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: request.reasoningEffort }),
       }, signal);
       if (
         state.cleaned

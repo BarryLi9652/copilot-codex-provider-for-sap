@@ -104,16 +104,21 @@ const toToolSpec = (tool: vscode.LanguageModelChatTool): ToolSpec => ({
   inputSchema: isObject(tool.inputSchema) ? tool.inputSchema as JsonObject : {},
 });
 
-const toCodexRequestFromInput = (input: ToCodexRequestInput): CodexRequest => ({
-  requestId: input.requestId,
-  modelId: input.model.id,
-  messages: input.messages.map(toCodexMessage),
-  tools: (input.options.tools ?? []).map(toToolSpec),
-  toolMode: input.options.toolMode === vscode.LanguageModelChatToolMode.Required
-    ? "required"
-    : "auto",
-  instructions: input.instructions ?? "",
-});
+const toCodexRequestFromInput = (input: ToCodexRequestInput): CodexRequest => {
+  const modelOptions = (input.options as { modelOptions?: Record<string, unknown> }).modelOptions;
+  const reasoningEffort = modelOptions?.reasoningEffort;
+  return {
+    requestId: input.requestId,
+    modelId: input.model.id,
+    messages: input.messages.map(toCodexMessage),
+    tools: (input.options.tools ?? []).map(toToolSpec),
+    toolMode: input.options.toolMode === vscode.LanguageModelChatToolMode.Required
+      ? "required"
+      : "auto",
+    instructions: input.instructions ?? "",
+    ...(typeof reasoningEffort === "string" ? { reasoningEffort } : {}),
+  };
+};
 
 export function toCodexRequest(input: ToCodexRequestInput): CodexRequest;
 export function toCodexRequest(

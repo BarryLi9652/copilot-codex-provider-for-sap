@@ -39,6 +39,12 @@ export interface CodexRequest {
   tools: readonly ToolSpec[];
   toolMode: "auto" | "required";
   instructions: string;
+  /**
+   * Request-scoped reasoning effort selected in the Copilot model picker
+   * (`modelOptions.reasoningEffort`). Takes priority over per-model defaults
+   * and the global extension setting.
+   */
+  reasoningEffort?: string;
 }
 
 export type TransportEvent =

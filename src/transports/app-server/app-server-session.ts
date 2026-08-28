@@ -97,6 +97,13 @@ export interface AppServerTurnStartParams {
   threadId: string;
   modelId: string;
   input: readonly AppServerUserInput[];
+  /**
+   * Request-scoped reasoning effort from the Copilot model picker, forwarded
+   * as the top-level `effort` field of `turn/start` (verified against codex
+   * app-server 0.144: `turn/start` accepts threadId, model, effort, summary,
+   * and input at the top level).
+   */
+  reasoningEffort?: string;
 }
 
 export type AppServerNotificationMethod =
@@ -385,6 +392,9 @@ export class AppServerSession {
             threadId: params.threadId,
             model: params.modelId,
             input: params.input,
+            ...(params.reasoningEffort === undefined
+              ? {}
+              : { effort: params.reasoningEffort }),
           }, signal);
           this.assertLeaseForStart(record);
           const turnId = readTurnId(response);

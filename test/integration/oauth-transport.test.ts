@@ -398,7 +398,7 @@ test("OAuth transport reads ChatGPT request overrides for every new request", as
 
   assert.equal("reasoning" in (responseBodies[0] ?? {}), false);
   assert.equal("service_tier" in (responseBodies[0] ?? {}), false);
-  assert.deepEqual(responseBodies[1]?.reasoning, { effort: "high" });
+  assert.deepEqual(responseBodies[1]?.reasoning, { effort: "high", summary: "auto" });
   assert.equal(responseBodies[1]?.service_tier, "priority");
 });
 

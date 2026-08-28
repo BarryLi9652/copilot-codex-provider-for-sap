@@ -5,6 +5,10 @@ import type {
   MessagePart,
   ToolResultPart,
 } from "../../core/types.js";
+import {
+  isCodexReasoningEffort,
+  resolveEffectiveReasoningEffort,
+} from "../../core/model-effort.js";
 
 type ResponsesInputItem = Record<string, unknown>;
 
@@ -34,35 +38,6 @@ export function resolveChatGptRequestOverrides(
       : {}),
     ...(speedMode === "fast" ? { serviceTier: "priority" as const } : {}),
   };
-}
-
-/**
- * Per-model reasoning effort overrides.
- * Matched against model-id segments (split on -, _, ., whitespace), so
- * "gpt-5.6-luna" matches the "luna" entry. First match wins over the global
- * `copilotCodex.chatgpt.reasoningEffort` setting.
- */
-const MODEL_REASONING_EFFORT_OVERRIDES: ReadonlyArray<{
-  readonly match: readonly string[];
-  readonly effort: ChatGptReasoningEffort;
-}> = [
-  { match: ["luna", "terra"], effort: "max" },
-  { match: ["sol"], effort: "high" },
-];
-
-export function resolveModelReasoningEffort(
-  modelId: string | undefined,
-): ChatGptReasoningEffort | undefined {
-  if (typeof modelId !== "string" || modelId.length === 0) {
-    return undefined;
-  }
-  const segments = modelId.toLowerCase().split(/[-_.\s]/);
-  for (const entry of MODEL_REASONING_EFFORT_OVERRIDES) {
-    if (entry.match.some((m) => segments.includes(m))) {
-      return entry.effort;
-    }
-  }
-  return undefined;
 }
 
 const toDataUrl = (mimeType: string, data: Uint8Array): string =>
@@ -151,14 +126,23 @@ export function buildResponsesRequest(
   modelMetadata: CodexModel,
   overrides: ChatGptRequestOverrides = {},
 ): Record<string, unknown> {
-  const modelEffort = resolveModelReasoningEffort(modelMetadata.id);
-  const effectiveEffort = modelEffort ?? overrides.reasoningEffort;
+  // Priority: Copilot picker selection (modelOptions) > per-model default
+  // > global `copilotCodex.chatgpt.reasoningEffort` setting.
+  const effectiveEffort = resolveEffectiveReasoningEffort(
+    request.reasoningEffort,
+    modelMetadata.id,
+    overrides.reasoningEffort,
+  );
   return {
     model: modelMetadata.id,
     instructions: request.instructions,
     input: request.messages.flatMap(toMessageItems),
     stream: true,
     store: false,
+    // Matches the Codex CLI / opencode behavior: request reasoning summaries
+    // and encrypted reasoning replay so follow-up turns in a stateless
+    // (`store: false`) conversation can carry reasoning state.
+    include: ["reasoning.encrypted_content"],
     tools: request.tools.map((tool) => ({
       type: "function",
       name: tool.name,
@@ -170,7 +154,7 @@ export function buildResponsesRequest(
     tool_choice: request.toolMode === "required" ? "required" : "auto",
     ...(effectiveEffort === undefined
       ? {}
-      : { reasoning: { effort: effectiveEffort } }),
+      : { reasoning: { effort: effectiveEffort, summary: "auto" } }),
     ...(overrides.serviceTier === undefined
       ? {}
       : { service_tier: overrides.serviceTier }),
