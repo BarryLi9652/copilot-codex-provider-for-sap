@@ -27,6 +27,7 @@ const TRANSPORT_NOTIFICATION_METHODS: readonly AppServerNotificationMethod[] = [
   "turn/started",
   "item/agentMessage/delta",
   "turn/usage",
+  "thread/tokenUsage/updated",
   "turn/completed",
   "turn/failed",
   "turn/error",

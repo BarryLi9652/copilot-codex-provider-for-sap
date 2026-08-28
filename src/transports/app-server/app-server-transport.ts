@@ -674,12 +674,14 @@ export class AppServerTransport implements CodexTransport {
       // codex app-server (>= 0.144) reports cumulative thread token usage here,
       // including cachedInputTokens. Emit deltas so consumers can simply sum.
       if (!isRecord(params)) {
+        this.logger?.event("appServer.usage.invalidNotification");
         return;
       }
       state.threadUsageSeen = true;
       const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : undefined;
       const total = isRecord(tokenUsage?.total) ? tokenUsage?.total : undefined;
       if (total === undefined) {
+        this.logger?.event("appServer.usage.missingTotal");
         return;
       }
       const inputTokens = numberValue(total.inputTokens ?? total.input_tokens) ?? 0;
@@ -690,7 +692,20 @@ export class AppServerTransport implements CodexTransport {
       const deltaInput = Math.max(0, inputTokens - previous.inputTokens);
       const deltaCached = Math.max(0, cachedTokens - previous.cachedTokens);
       const deltaOutput = Math.max(0, outputTokens - previous.outputTokens);
+      this.logger?.event("appServer.usage.updated", {
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+        deltaInput,
+        deltaCached,
+        deltaOutput,
+      });
       if (deltaInput > 0 || deltaCached > 0 || deltaOutput > 0) {
+        this.logger?.event("appServer.usage.emitted", {
+          inputTokens: deltaInput,
+          cachedTokens: deltaCached,
+          outputTokens: deltaOutput,
+        });
         state.queue.push({ kind: "event", event: {
           type: "usage",
           ...(deltaInput === 0 ? {} : { inputTokens: deltaInput }),
