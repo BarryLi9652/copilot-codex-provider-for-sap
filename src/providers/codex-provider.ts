@@ -276,12 +276,32 @@ export class CodexLanguageModelProvider implements vscode.LanguageModelChatProvi
           ),
         ].filter((instructions) => instructions.length > 0).join("\n\n"),
       });
+      let usageInputTokens = 0;
+      let usageCachedTokens = 0;
+      let usageOutputTokens = 0;
       for await (const event of this.transport.generate(request, binding.signal)) {
         if (binding.signal.aborted) {
           return;
         }
         if (event.type === "usage") {
           this.cacheStats?.record(event);
+          if (event.inputTokens !== undefined
+            || event.cachedTokens !== undefined
+            || event.outputTokens !== undefined) {
+            // Transports emit per-turn deltas; Copilot's session usage widget
+            // expects one report per request, so accumulate and re-report the
+            // running totals (the last data part wins on the consumer side).
+            usageInputTokens += event.inputTokens ?? 0;
+            usageCachedTokens += event.cachedTokens ?? 0;
+            usageOutputTokens += event.outputTokens ?? 0;
+            reportTransportEvent({
+              type: "usage",
+              inputTokens: usageInputTokens,
+              cachedTokens: usageCachedTokens,
+              outputTokens: usageOutputTokens,
+            }, progress);
+          }
+          continue;
         }
         reportTransportEvent(event, progress);
       }
