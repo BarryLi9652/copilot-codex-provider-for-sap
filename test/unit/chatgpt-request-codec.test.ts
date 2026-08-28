@@ -5,6 +5,7 @@ import type { CodexModel, CodexRequest } from "../../src/core/types.js";
 import {
   buildResponsesRequest,
   resolveChatGptRequestOverrides,
+  resolveModelReasoningEffort,
 } from "../../src/transports/chatgpt-oauth/request-codec.js";
 
 const model: CodexModel = {
@@ -179,4 +180,29 @@ test("resolves explicit ChatGPT settings without changing model defaults", () =>
 test("ignores malformed ChatGPT request override settings", () => {
   assert.deepEqual(resolveChatGptRequestOverrides("turbo", "ultrafast"), {});
   assert.deepEqual(resolveChatGptRequestOverrides(42, true), {});
+});
+
+test("resolves per-model reasoning effort overrides by model-id segment", () => {
+  assert.equal(resolveModelReasoningEffort("gpt-5.6-luna"), "max");
+  assert.equal(resolveModelReasoningEffort("gpt-5.6-terra"), "max");
+  assert.equal(resolveModelReasoningEffort("gpt-5.6-sol"), "high");
+  assert.equal(resolveModelReasoningEffort("gpt-5-codex"), undefined);
+  assert.equal(resolveModelReasoningEffort(""), undefined);
+  assert.equal(resolveModelReasoningEffort(undefined), undefined);
+});
+
+test("per-model effort wins over the global reasoning effort setting", () => {
+  const sol = buildResponsesRequest(
+    request,
+    { ...model, id: "gpt-5.6-sol" },
+    resolveChatGptRequestOverrides("low", "modelDefault"),
+  );
+  assert.deepEqual(sol.reasoning, { effort: "high" });
+
+  const other = buildResponsesRequest(
+    request,
+    { ...model, id: "gpt-5-codex" },
+    resolveChatGptRequestOverrides("low", "modelDefault"),
+  );
+  assert.deepEqual(other.reasoning, { effort: "low" });
 });

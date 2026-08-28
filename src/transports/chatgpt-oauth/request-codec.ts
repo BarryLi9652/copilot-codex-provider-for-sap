@@ -36,6 +36,35 @@ export function resolveChatGptRequestOverrides(
   };
 }
 
+/**
+ * Per-model reasoning effort overrides.
+ * Matched against model-id segments (split on -, _, ., whitespace), so
+ * "gpt-5.6-luna" matches the "luna" entry. First match wins over the global
+ * `copilotCodex.chatgpt.reasoningEffort` setting.
+ */
+const MODEL_REASONING_EFFORT_OVERRIDES: ReadonlyArray<{
+  readonly match: readonly string[];
+  readonly effort: ChatGptReasoningEffort;
+}> = [
+  { match: ["luna", "terra"], effort: "max" },
+  { match: ["sol"], effort: "high" },
+];
+
+export function resolveModelReasoningEffort(
+  modelId: string | undefined,
+): ChatGptReasoningEffort | undefined {
+  if (typeof modelId !== "string" || modelId.length === 0) {
+    return undefined;
+  }
+  const segments = modelId.toLowerCase().split(/[-_.\s]/);
+  for (const entry of MODEL_REASONING_EFFORT_OVERRIDES) {
+    if (entry.match.some((m) => segments.includes(m))) {
+      return entry.effort;
+    }
+  }
+  return undefined;
+}
+
 const toDataUrl = (mimeType: string, data: Uint8Array): string =>
   `data:${mimeType};base64,${Buffer.from(data).toString("base64")}`;
 
@@ -122,6 +151,8 @@ export function buildResponsesRequest(
   modelMetadata: CodexModel,
   overrides: ChatGptRequestOverrides = {},
 ): Record<string, unknown> {
+  const modelEffort = resolveModelReasoningEffort(modelMetadata.id);
+  const effectiveEffort = modelEffort ?? overrides.reasoningEffort;
   return {
     model: modelMetadata.id,
     instructions: request.instructions,
@@ -137,9 +168,9 @@ export function buildResponsesRequest(
     })),
     parallel_tool_calls: modelMetadata.capabilities.parallelToolCalls,
     tool_choice: request.toolMode === "required" ? "required" : "auto",
-    ...(overrides.reasoningEffort === undefined
+    ...(effectiveEffort === undefined
       ? {}
-      : { reasoning: { effort: overrides.reasoningEffort } }),
+      : { reasoning: { effort: effectiveEffort } }),
     ...(overrides.serviceTier === undefined
       ? {}
       : { service_tier: overrides.serviceTier }),

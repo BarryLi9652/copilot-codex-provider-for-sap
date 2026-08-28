@@ -91,8 +91,8 @@ test("maps the current App Server model shape with safe Copilot defaults", () =>
       name: "GPT-5.6-Sol",
       family: "gpt",
       version: "gpt-5.6-sol",
-      maxInputTokens: 128_000,
-      maxOutputTokens: 16_000,
+      maxInputTokens: 400_000,
+      maxOutputTokens: 64_000,
       capabilities: {
         imageInput: true,
         toolCalling: true,
@@ -101,6 +101,25 @@ test("maps the current App Server model shape with safe Copilot defaults", () =>
       description: "A current App Server model",
     },
   ]);
+});
+
+test("drops models whose explicitly reported token limits are invalid", () => {
+  const models = parseAppServerModels(
+    {
+      data: [
+        {
+          id: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          hidden: false,
+          inputTokenLimit: 0,
+          outputTokenLimit: 0,
+        },
+      ],
+    },
+    { dynamicToolsAvailable: true },
+  );
+
+  assert.deepEqual(models.length, 0);
 });
 
 test("defaults missing legacy input modalities to image support", () => {

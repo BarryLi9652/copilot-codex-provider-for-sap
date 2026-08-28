@@ -6,6 +6,15 @@ type JsonRecord = Record<string, unknown>;
 const DEFAULT_MAX_INPUT_TOKENS = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 16_000;
 
+/**
+ * When app-server does not report token limits (current codex app-server
+ * `model/list` responses omit them), the 128k/16k fallback understates the
+ * real GPT-5.x context window and makes Copilot compact history too early.
+ * Raise the fallback so context management matches real model capability.
+ */
+const MISSING_LIMITS_MAX_INPUT_TOKENS = 400_000;
+const MISSING_LIMITS_MAX_OUTPUT_TOKENS = 64_000;
+
 export interface AppServerCodexModel extends CodexModel {
   description?: string;
 }
@@ -88,15 +97,20 @@ const toModel = (
 
   const id = nonEmptyString(value.id);
   const name = nonEmptyString(value.displayName) ?? nonEmptyString(value.display_name);
+  const reportsTokenLimits =
+    ["inputTokenLimit", "input_token_limit", "maxInputTokens"].some((n) => hasOwn(value, n))
+    || ["outputTokenLimit", "output_token_limit", "maxOutputTokens"].some((n) => hasOwn(value, n));
+  const fallbackInput = reportsTokenLimits ? DEFAULT_MAX_INPUT_TOKENS : MISSING_LIMITS_MAX_INPUT_TOKENS;
+  const fallbackOutput = reportsTokenLimits ? DEFAULT_MAX_OUTPUT_TOKENS : MISSING_LIMITS_MAX_OUTPUT_TOKENS;
   const inputTokens = resolveNumber(
     value,
     ["inputTokenLimit", "input_token_limit", "maxInputTokens"],
-    DEFAULT_MAX_INPUT_TOKENS,
+    fallbackInput,
   );
   const outputTokens = resolveNumber(
     value,
     ["outputTokenLimit", "output_token_limit", "maxOutputTokens"],
-    DEFAULT_MAX_OUTPUT_TOKENS,
+    fallbackOutput,
   );
   const missingFields: string[] = [];
   if (id === undefined) {
